@@ -1362,8 +1362,11 @@ struct GSD3D11Backend::Impl
 
         static const int s_traceLimit = std::getenv("PS2X_GS_TRACE") ? std::atoi(std::getenv("PS2X_GS_TRACE")) : 0;
         static int s_traced = 0;
-        if (s_traced < s_traceLimit)
+        static const uint64_t s_traceFrame = std::getenv("PS2X_GS_TRACE_FRAME") ? std::strtoull(std::getenv("PS2X_GS_TRACE_FRAME"), nullptr, 10) : 0;
+        if (s_traced < s_traceLimit && frameCounter >= s_traceFrame)
         {
+            if (s_traced == 0)
+                std::printf("[gs-trace] start at frame %llu\n", static_cast<unsigned long long>(frameCounter));
             ++s_traced;
             const Vtx &v0 = pending[0];
             std::printf("[gs-trace] #%llu n=%zu fbp=%u psm=%u fbmsk=%08x tme=%d tex=%u/%u psm=%u %ux%u tfx=%u tcc=%u abe=%d alpha=%llx test=%llx "

@@ -1547,6 +1547,81 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
+#if defined(PS2X_NATIVE_HOST)
+    {
+        // PS2X_CALL_TRACE=<substr>[,<substr>...]: log guest calls whose symbol matches (a0-a3, and
+        // argv strings for (this, argc, argv) handlers such as the shell's On*_Tag callbacks).
+        static const char *s_filter = std::getenv("PS2X_CALL_TRACE");
+        if (s_filter && *s_filter)
+        {
+            static std::unordered_map<uint32_t, bool> s_match;
+            static int s_budget = std::getenv("PS2X_CALL_TRACE_MAX") ? std::atoi(std::getenv("PS2X_CALL_TRACE_MAX")) : 4000;
+            auto it = s_match.find(targetPc);
+            if (it == s_match.end())
+            {
+                const char *name = guestSymbolName(targetPc);
+                bool m = false;
+                if (name)
+                {
+                    std::string f(s_filter);
+                    size_t start = 0;
+                    while (start <= f.size())
+                    {
+                        const size_t comma = f.find(',', start);
+                        const std::string part = f.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                        if (!part.empty() && std::strstr(name, part.c_str()))
+                            m = true;
+                        if (comma == std::string::npos)
+                            break;
+                        start = comma + 1;
+                    }
+                }
+                it = s_match.emplace(targetPc, m).first;
+            }
+            if (it->second && s_budget > 0)
+            {
+                --s_budget;
+                const uint32_t a0 = GPR_U32(ctx, 4), a1 = GPR_U32(ctx, 5), a2 = GPR_U32(ctx, 6), a3 = GPR_U32(ctx, 7);
+                std::printf("[call] %s a0=%x a1=%x a2=%x a3=%x", guestSymbolName(targetPc), a0, a1, a2, a3);
+                static const bool s_wide = std::getenv("PS2X_CALL_TRACE_WIDE") != nullptr;
+                if (s_wide)
+                    std::printf(" A0=%llx A1=%llx A2=%llx A3=%llx f12=%08x",
+                                static_cast<unsigned long long>(GPR_U64(ctx, 4)), static_cast<unsigned long long>(GPR_U64(ctx, 5)),
+                                static_cast<unsigned long long>(GPR_U64(ctx, 6)), static_cast<unsigned long long>(GPR_U64(ctx, 7)),
+                                [&]() { uint32_t b; std::memcpy(&b, &ctx->f[12], 4); return b; }());
+                auto str = [&](uint32_t p) -> const char * {
+                    p &= 0x1FFFFFFFu;
+                    if (p == 0u || p >= PS2_RAM_SIZE - 1u)
+                        return nullptr;
+                    const char *s = reinterpret_cast<const char *>(rdram + p);
+                    for (uint32_t i = 0; i < 64u && p + i < PS2_RAM_SIZE; ++i)
+                    {
+                        if (s[i] == 0)
+                            return i > 0 ? s : nullptr;
+                        if (static_cast<unsigned char>(s[i]) < 32u || static_cast<unsigned char>(s[i]) > 126u)
+                            return nullptr;
+                    }
+                    return nullptr;
+                };
+                if (a1 > 0u && a1 < 8u && (a2 & 0x1FFFFFFFu) + a1 * 4u < PS2_RAM_SIZE)
+                {
+                    for (uint32_t i = 0; i < a1; ++i)
+                    {
+                        uint32_t sp;
+                        std::memcpy(&sp, rdram + (a2 & 0x1FFFFFFFu) + i * 4u, 4);
+                        if (const char *sv = str(sp))
+                            std::printf(" argv%u=\"%.40s\"", i, sv);
+                    }
+                }
+                else if (const char *s1 = str(a1))
+                    std::printf(" a1s=\"%.48s\"", s1);
+                else if (const char *s0 = str(a0))
+                    std::printf(" a0s=\"%.48s\"", s0);
+                std::printf("\n");
+            }
+        }
+    }
+#endif
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
@@ -2623,6 +2698,24 @@ void PS2Runtime::run()
                             static_cast<unsigned long long>(m_memory.vifWriteCount()),
                             static_cast<unsigned long long>(gsr.pmode), static_cast<unsigned long long>(gsr.dispfb1),
                             static_cast<unsigned long long>(gsr.display1));
+                if (const char *peek = std::getenv("PS2X_STATUS_PEEK"))
+                {
+                    // PS2X_STATUS_PEEK=<hex addr>[,<hex addr>...]: print guest words each status tick.
+                    std::printf("[peek]");
+                    for (const char *p = peek; *p;)
+                    {
+                        char *end = nullptr;
+                        const uint32_t addr = static_cast<uint32_t>(std::strtoul(p, &end, 16));
+                        if (end == p)
+                            break;
+                        uint32_t v = 0;
+                        if (addr + 4u <= PS2_RAM_SIZE)
+                            std::memcpy(&v, m_memory.getRDRAM() + addr, 4);
+                        std::printf(" %x=%08x", addr, v);
+                        p = (*end == ',') ? end + 1 : end;
+                    }
+                    std::printf("\n");
+                }
                 if (std::getenv("PS2X_SYMBOLS"))
                 {
                     const auto snap = m_eeScheduler->snapshot();

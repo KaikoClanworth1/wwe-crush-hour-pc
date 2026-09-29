@@ -836,6 +836,12 @@ namespace
 
         uint32_t nextU32()
         {
+            if (m_slotIndex < 8u)
+            {
+                const int reg = 4 + static_cast<int>(m_slotIndex); // GPR_U64 evaluates its args twice
+                ++m_slotIndex;
+                return static_cast<uint32_t>(GPR_U64(m_ctx, reg));
+            }
             const uint32_t value = readWordAtSlot(m_slotIndex);
             ++m_slotIndex;
             return value;
@@ -843,7 +849,15 @@ namespace
 
         uint64_t nextU64()
         {
-            // O32 ABI aligns 64-bit variadic values on even 32-bit slots.
+            // EE ABI: every argument register is 64 bits wide and a double/long long occupies a
+            // single register (a0-a3, t0-t3). The old O32-style pairing split doubles across
+            // a2/a3, so every %g/%f printed garbage (Lua number->string, shell script positions).
+            if (m_slotIndex < 8u)
+            {
+                const int reg = 4 + static_cast<int>(m_slotIndex);
+                ++m_slotIndex;
+                return GPR_U64(m_ctx, reg);
+            }
             if ((m_slotIndex & 1u) != 0u)
             {
                 ++m_slotIndex;
