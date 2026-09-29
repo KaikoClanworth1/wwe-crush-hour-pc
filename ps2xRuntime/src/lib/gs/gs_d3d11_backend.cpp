@@ -908,7 +908,8 @@ struct GSD3D11Backend::Impl
         {
             static int s_texDumps = 0;
             static const long s_skipTbp = std::getenv("PS2X_TEX_DUMP_SKIP") ? std::atol(std::getenv("PS2X_TEX_DUMP_SKIP")) : -1;
-            if (s_texDumps < 400 && static_cast<long>(t.tbp0) != s_skipTbp)
+            static const uint64_t s_dumpFrame = std::getenv("PS2X_TEX_DUMP_FRAME") ? std::strtoull(std::getenv("PS2X_TEX_DUMP_FRAME"), nullptr, 10) : 0;
+            if (s_texDumps < 400 && static_cast<long>(t.tbp0) != s_skipTbp && frameCounter >= s_dumpFrame)
             {
                 char path[512];
                 std::snprintf(path, sizeof(path), "%s/tex_%04d_tbp%u_psm%u_cpsm%u_%ux%u.rgba", dumpDir, s_texDumps++,

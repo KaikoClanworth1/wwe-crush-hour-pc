@@ -58,7 +58,9 @@ namespace ps2recomp
                                    "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
                                    ft, fd, fs, fd, fs, ft);
             case COP1_S_SQRT:
-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
+                // EE SQRT.S reads its operand from the ft field (fs is zero in real encodings) and
+                // takes the root of |x| for negative inputs.
+                return fmt::format("ctx->f[{}] = sqrtf(fabsf(ctx->f[{}]));", fd, ft);
             case COP1_S_ABS:
                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
             case COP1_S_MOV:
@@ -74,9 +76,11 @@ namespace ps2recomp
             case COP1_S_FLOOR_W:
                 return fmt::format("{{ int32_t tmp = FPU_FLOOR_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_CVT_W:
-                return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
+                // The EE FPU only rounds toward zero; out-of-range values saturate.
+                return fmt::format("{{ int32_t tmp = ((fabsf(ctx->f[{0}]) >= 2147483648.0f) ? ((ctx->f[{0}]) < 0.0f ? INT32_MIN : INT32_MAX) : (int32_t)(ctx->f[{0}])); std::memcpy(&ctx->f[{1}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_RSQRT:
-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
+                // EE RSQRT.S: fd = fs / sqrt(ft).
+                return fmt::format("ctx->f[{}] = ctx->f[{}] / sqrtf(fabsf(ctx->f[{}]));", fd, fs, ft);
             case COP1_S_ADDA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
             case COP1_S_SUBA:

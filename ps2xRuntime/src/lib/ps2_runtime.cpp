@@ -1618,6 +1618,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 else if (const char *s0 = str(a0))
                     std::printf(" a0s=\"%.48s\"", s0);
                 std::printf("\n");
+                std::fflush(stdout); // tests kill the process; keep the trace
             }
         }
     }
