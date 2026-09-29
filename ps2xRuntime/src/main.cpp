@@ -11,6 +11,7 @@
 #include <iostream>
 #include <string>
 #include <filesystem>
+#include <fstream>
 #include <exception>
 #include <algorithm>
 #include <cstdlib>
@@ -159,6 +160,40 @@ namespace
         }
         return (std::filesystem::current_path() / configuredPath).lexically_normal();
 #else
+        // Portable layout: boot the ELF named by BOOT2 in SYSTEM.CNF next to the executable
+        // (or in a GameFiles subfolder), so the port starts without command-line arguments.
+        {
+            std::filesystem::path exeDir = std::filesystem::current_path();
+            if (argc >= 1 && argv[0] && argv[0][0] != '\0')
+            {
+                std::error_code ec;
+                const auto abs = std::filesystem::absolute(std::filesystem::path(argv[0]), ec);
+                if (!ec)
+                    exeDir = abs.parent_path();
+            }
+            for (const std::filesystem::path &dir : {exeDir, exeDir / "GameFiles", std::filesystem::current_path()})
+            {
+                std::ifstream cnf(dir / "SYSTEM.CNF");
+                std::string line;
+                while (cnf && std::getline(cnf, line))
+                {
+                    const auto key = line.find("BOOT2");
+                    const auto colon = line.find(":\\");
+                    if (key == std::string::npos || colon == std::string::npos)
+                        continue;
+                    std::string name = line.substr(colon + 2);
+                    name = name.substr(0, name.find(';'));
+                    while (!name.empty() && (name.back() == '\r' || name.back() == ' '))
+                        name.pop_back();
+                    const std::filesystem::path elf = dir / name;
+                    if (std::filesystem::exists(elf))
+                    {
+                        std::cout << "Using SYSTEM.CNF boot path " << elf.string() << std::endl;
+                        return elf;
+                    }
+                }
+            }
+        }
         throw std::runtime_error("Unable to determine executable path. Pass the guest ELF as argv[1] or define PS2X_DEFAULT_BOOT_ELF.");
 #endif
     }

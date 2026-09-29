@@ -1,5 +1,10 @@
 #include "Common.h"
 #include "MemoryCard.h"
+#include <cstdlib>
+
+
+// Memory-card calls happen every frame (card presence polling); only log them on request.
+#define MC_LOG(expr)                                                            do                                                                          {                                                                               static const bool s_mcLog = std::getenv("PS2X_MC_LOG") != nullptr;          if (s_mcLog)                                                                    RUNTIME_LOG(expr);                                                  } while (0)
 
 namespace ps2_stubs
 {
@@ -433,10 +438,11 @@ namespace ps2_stubs
         FILE *openMcHostFile(const std::filesystem::path &hostPath, uint32_t flags)
         {
             const uint32_t access = flags & PS2_FIO_O_RDWR;
-            const bool read = (access == PS2_FIO_O_RDONLY) || (access == PS2_FIO_O_RDWR);
-            const bool write = (access == PS2_FIO_O_WRONLY) || (access == PS2_FIO_O_RDWR);
-            const bool append = (flags & PS2_FIO_O_APPEND) != 0u;
             const bool create = (flags & PS2_FIO_O_CREAT) != 0u;
+            // libmc accepts a bare SCE_CREAT (no access bits) and opens the new file read/write.
+            const bool read = (access == PS2_FIO_O_RDONLY) || (access == PS2_FIO_O_RDWR) || (create && access == 0u);
+            const bool write = (access == PS2_FIO_O_WRONLY) || (access == PS2_FIO_O_RDWR) || (create && access == 0u);
+            const bool append = (flags & PS2_FIO_O_APPEND) != 0u;
             const bool truncate = (flags & PS2_FIO_O_TRUNC) != 0u;
 
             std::error_code ec;
@@ -555,7 +561,7 @@ namespace ps2_stubs
             setMcCommandResultLocked(kMcCmdChdir, result);
         }
 
-        RUNTIME_LOG("[MC] Chdir port=" << port << " '" << requestedDir
+        MC_LOG("[MC] Chdir port=" << port << " '" << requestedDir
                                        << "' -> result=" << result << " cwd='" << currentDir << "'");
         writeMcCString(rdram, currentDirAddr, currentDir);
         setReturnS32(ctx, 0);
@@ -842,7 +848,7 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdGetDir, result);
         }
-        RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
+        MC_LOG("[MC] GetDir port=" << port << " '" << rawPath
                                         << "' maxent=" << maxEntries << " -> result=" << result);
         setReturnS32(ctx, 0);
     }
@@ -905,7 +911,7 @@ namespace ps2_stubs
             }
         }
 
-        RUNTIME_LOG("[MC] GetInfo port=" << port << " type=" << cardType
+        MC_LOG("[MC] GetInfo port=" << port << " type=" << cardType
                                          << " free=" << freeBlocks << " format=" << format
                                          << " result=" << result);
         setReturnS32(ctx, 0);
@@ -1040,6 +1046,8 @@ namespace ps2_stubs
             }
             setMcCommandResultLocked(kMcCmdOpen, result);
         }
+        MC_LOG("[MC] Open port=" << port << " '" << path << "' flags=0x" << std::hex << flags << std::dec
+                                      << " -> result=" << result);
         setReturnS32(ctx, 0);
     }
 
@@ -1213,7 +1221,7 @@ namespace ps2_stubs
             return;
         }
 
-        RUNTIME_LOG("[MC] Sync cmd=" << cmd << " result=" << result);
+        MC_LOG("[MC] Sync cmd=" << cmd << " result=" << result);
 
         if (cmdPtr != 0u)
         {

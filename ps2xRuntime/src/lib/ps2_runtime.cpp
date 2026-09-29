@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "runtime/ps2_prof.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -11,6 +12,11 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#include <cstdlib>
+#if defined(PS2X_NATIVE_HOST)
+#include "runtime/gs/gs_d3d11_backend.h"
+#include "runtime/native_seng.h"
+#endif
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
@@ -373,7 +379,86 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+
+#if defined(PS2X_NATIVE_HOST)
+// Debug aid: guest backtraces by scanning the stack for return addresses (PS2X_SYMBOLS = symbols.txt).
+namespace
+{
+    struct GuestSym { uint32_t addr, size; std::string name; };
+    const std::vector<GuestSym> &guestSymbols()
+    {
+        static std::vector<GuestSym> syms = []()
+        {
+            std::vector<GuestSym> out;
+            const char *path = std::getenv("PS2X_SYMBOLS");
+            if (!path)
+                return out;
+            std::ifstream f(path);
+            std::string line;
+            while (std::getline(f, line))
+            {
+                unsigned a = 0, z = 0;
+                char type[16]{}, name[512]{};
+                if (std::sscanf(line.c_str(), "%x %x %15s %511s", &a, &z, type, name) == 4 && std::strcmp(type, "FUNC") == 0)
+                    out.push_back({a, z, name});
+            }
+            std::sort(out.begin(), out.end(), [](const GuestSym &l, const GuestSym &r) { return l.addr < r.addr; });
+            return out;
+        }();
+        return syms;
+    }
+    const char *guestSymbolName(uint32_t addr)
+    {
+        const auto &syms = guestSymbols();
+        auto it = std::upper_bound(syms.begin(), syms.end(), addr, [](uint32_t a, const GuestSym &s) { return a < s.addr; });
+        if (it == syms.begin())
+            return "?";
+        --it;
+        return (addr < it->addr + it->size) ? it->name.c_str() : "?";
+    }
+    void printGuestBacktrace(const uint8_t *rdram, uint32_t pc, uint32_t ra, uint32_t sp)
+    {
+        std::printf("    pc %08x %s\n    ra %08x %s\n", pc, guestSymbolName(pc), ra, guestSymbolName(ra));
+        sp &= 0x01FFFFF0u;
+        int found = 0;
+        for (uint32_t off = 0; off < 0x1000u && found < 14; off += 4)
+        {
+            const uint32_t a = sp + off;
+            if (a + 4 > 0x02000000u)
+                break;
+            uint32_t v;
+            std::memcpy(&v, rdram + a, 4);
+            if (v < 0x00100008u || v >= 0x00480000u || (v & 3u))
+                continue;
+            uint32_t call;
+            std::memcpy(&call, rdram + (v - 8u), 4);
+            if ((call >> 26) != 3u && (call & 0xFC00003Fu) != 9u) // jal / jalr
+                continue;
+            std::printf("    .. %08x %s\n", v, guestSymbolName(v));
+            ++found;
+        }
+    }
+}
+#endif
+
+#if defined(PS2X_NATIVE_HOST)
+struct HostFrameTexture
+{
+};
+static void hostPresentUpload(const std::vector<uint8_t> &buffer, uint32_t width, uint32_t height)
+{
+    if (GSD3D11Backend::IsActive() && GSD3D11Backend::PresentLatchedToHost())
+        return;
+    width = std::clamp<uint32_t>(width, 1u, static_cast<uint32_t>(FB_WIDTH));
+    height = std::clamp<uint32_t>(height, 1u, static_cast<uint32_t>(FB_HEIGHT));
+    ps2host::presentRgba(buffer.data(), width, height, static_cast<uint32_t>(FB_WIDTH) * 4u);
+}
+#define PS2X_FRAME_TEX_T HostFrameTexture
+#else
+#define PS2X_FRAME_TEX_T Texture2D
+#endif
+
+static void UploadFrame(PS2X_FRAME_TEX_T &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -398,6 +483,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+#if defined(PS2X_NATIVE_HOST)
+        hostPresentUpload(s_uploadBuffer, outWidth, outHeight);
+#endif
         return;
     }
 
@@ -414,9 +502,15 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
+#if defined(PS2X_NATIVE_HOST)
+        (void)tex;
+        std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
+        hostPresentUpload(s_uploadBuffer, FB_WIDTH, DEFAULT_DISPLAY_HEIGHT);
+#else
         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
+#endif
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         s_lastWidth = outWidth;
@@ -471,7 +565,12 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
     }
 
+#if !defined(PS2X_NATIVE_HOST)
     UpdateTexture(tex, s_uploadBuffer.data());
+#else
+    (void)tex;
+    hostPresentUpload(s_uploadBuffer, width, height);
+#endif
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
@@ -531,7 +630,7 @@ PS2Runtime::~PS2Runtime()
         requestStop();
         m_iopSubsystem.reset();
         m_iopHost.reset();
-#if defined(PLATFORM_VITA)
+#if defined(PLATFORM_VITA) || defined(PS2X_NATIVE_HOST)
         m_audioBackend.stopAll();
         m_audioBackend.setAudioReady(false);
 #else
@@ -547,10 +646,14 @@ PS2Runtime::~PS2Runtime()
             m_debugUiInitialized = false;
         }
 
+#if defined(PS2X_NATIVE_HOST)
+        ps2host::shutdown();
+#else
         if (IsWindowReady())
         {
             CloseWindow();
         }
+#endif
 
         m_loadedModules.clear();
     }
@@ -566,6 +669,23 @@ PS2Runtime::~PS2Runtime()
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
 {
+#if defined(PS2X_NATIVE_HOST)
+    {
+        std::string upperPath(path);
+        std::transform(upperPath.begin(), upperPath.end(), upperPath.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        if (upperPath.find("SENG.IRX") != std::string::npos && ps2native::NativeSeng::enabled())
+        {
+            // Served natively (see NativeSeng); report a successfully started resident module.
+            ps2x::iop::ModuleLoadResult fake;
+            fake.handled = true;
+            fake.moduleId = 0x5E;
+            fake.startResult = 0;
+            std::cout << "[runtime] SENG.IRX replaced by native XAudio2 sound engine" << std::endl;
+            return fake;
+        }
+    }
+#endif
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
 }
@@ -589,11 +709,27 @@ ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &re
 
 bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 {
+#if defined(PS2X_NATIVE_HOST)
+    if (sid == ps2native::kSengSid && ps2native::NativeSeng::enabled())
+        return true;
+#endif
     return m_iopSubsystem->canBindRpc(sid);
 }
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
+#if defined(PS2X_NATIVE_HOST)
+    if (request.sid == ps2native::kSengSid && ps2native::NativeSeng::enabled())
+    {
+        // Native XAudio2 sound engine replaces SENG.IRX (no IOP emulation for game audio).
+        ps2native::nativeSeng().handleBatch(rdram, request.send.address, request.send.size,
+                                            request.receive.address, request.receive.size);
+        ps2x::iop::RpcResult result;
+        result.handled = true;
+        result.resultAddress = request.receive.address;
+        return result;
+    }
+#endif
     auto scope = m_iopHost->enterCall(ctx, rdram);
     request.callToken = scope.token();
     return m_iopSubsystem->handleRpc(request);
@@ -679,6 +815,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     ps2prof::Scope profScope(ps2prof::kVu1);
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
@@ -697,6 +834,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     ps2prof::Scope profScope(ps2prof::kVu1);
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
@@ -728,7 +866,20 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
-#if defined(PLATFORM_VITA)
+#if defined(PS2X_NATIVE_HOST)
+        ps2host::loadConfig("ps2x_settings.ini");
+        if (!ps2host::init(title))
+        {
+            std::cerr << "Failed to initialize the Direct3D 11 host" << std::endl;
+            return false;
+        }
+        m_audioBackend.setAudioReady(ps2host::audioReady());
+        if (!std::getenv("PS2X_GS_CPU"))
+        {
+            m_gs.setRasterBackend(std::make_unique<GSD3D11Backend>());
+            std::cout << "[runtime] GS: Direct3D 11 hardware renderer" << std::endl;
+        }
+#elif defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
@@ -736,7 +887,9 @@ bool PS2Runtime::initialize(const char *title)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
+#if !defined(PS2X_NATIVE_HOST)
         SetTargetFPS(60);
+#endif
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -2078,6 +2231,27 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
 }
 
+
+// Debug aid: PS2X_EE_WATCH=<hex vaddr> logs guest stores (special-address path) that cover it.
+static void eeWatchStore(const R5900Context *ctx, uint32_t vaddr, uint32_t size, uint64_t lo, uint64_t hi)
+{
+    static const long long s_watch = std::getenv("PS2X_EE_WATCH") ? std::strtoll(std::getenv("PS2X_EE_WATCH"), nullptr, 16) : -1;
+    static int s_count = 0;
+    if (s_watch < 0 || s_count >= 60)
+        return;
+    const uint32_t w = static_cast<uint32_t>(s_watch);
+    if (w < vaddr || w >= vaddr + size)
+        return;
+    ++s_count;
+#if defined(PS2X_NATIVE_HOST)
+    const char *fn = guestSymbolName(ctx ? ctx->pc : 0u);
+#else
+    const char *fn = "?";
+#endif
+    std::printf("[ee-watch] pc=0x%x (%s) addr=0x%x size=%u lo=%016llx hi=%016llx\n", ctx ? ctx->pc : 0u, fn, vaddr, size,
+                static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi));
+}
+
 void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
@@ -2106,6 +2280,7 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
+    eeWatchStore(ctx, vaddr, 4u, value, 0u);
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
     try
     {
@@ -2120,6 +2295,7 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value)
 {
+    eeWatchStore(ctx, vaddr, 8u, value, 0u);
     ps2TraceGuestWrite(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
     try
     {
@@ -2135,6 +2311,7 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
 {
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
+    eeWatchStore(ctx, vaddr, 16u, _parts[0], _parts[1]);
     ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
     try
     {
@@ -2357,16 +2534,23 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
+#if defined(PS2X_NATIVE_HOST)
+    HostFrameTexture frameTex{};
+#else
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+#endif
 
     std::atomic<bool> gameThreadFinished{false};
 
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+#if defined(PS2X_NATIVE_HOST)
+        ps2host::profileCurrentThread();
+#endif
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
@@ -2422,8 +2606,59 @@ void PS2Runtime::run()
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+#if defined(PS2X_NATIVE_HOST)
+        {
+            static const bool s_status = std::getenv("PS2X_STATUS") != nullptr;
+            static double s_nextStatus = 0.0;
+            if (s_status && ps2host::timeSeconds() >= s_nextStatus)
+            {
+                s_nextStatus = ps2host::timeSeconds() + 2.0;
+                const GSRegisters &gsr = m_memory.gs();
+                std::printf("[status] t=%.1f pc=0x%x ra=0x%x vsync=%llu dma=%llu gif=%llu gsw=%llu vif=%llu pmode=0x%llx dispfb1=0x%llx display1=0x%llx\n",
+                            ps2host::timeSeconds(), m_debugPc.load(), m_debugRa.load(),
+                            static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()),
+                            static_cast<unsigned long long>(m_memory.dmaStartCount()),
+                            static_cast<unsigned long long>(m_memory.gifCopyCount()),
+                            static_cast<unsigned long long>(m_memory.gsWriteCount()),
+                            static_cast<unsigned long long>(m_memory.vifWriteCount()),
+                            static_cast<unsigned long long>(gsr.pmode), static_cast<unsigned long long>(gsr.dispfb1),
+                            static_cast<unsigned long long>(gsr.display1));
+                if (std::getenv("PS2X_SYMBOLS"))
+                {
+                    const auto snap = m_eeScheduler->snapshot();
+                    for (const auto &t : snap.threads)
+                    {
+                        std::printf("  thread %d status=%d wait=%d prio=%d\n", t.id, static_cast<int>(t.status),
+                                    static_cast<int>(t.waitReason), t.currentPriority);
+                        printGuestBacktrace(m_memory.getRDRAM(), t.pc, t.ra, t.sp);
+                    }
+                }
+                {
+                    static uint64_t s_lastNs[ps2prof::kCount]{};
+                    static uint64_t s_lastCalls[ps2prof::kCount]{};
+                    std::printf("[prof]");
+                    for (int c = 0; c < ps2prof::kCount; ++c)
+                    {
+                        const uint64_t ns = ps2prof::g_ns[c].load();
+                        const uint64_t calls = ps2prof::g_calls[c].load();
+                        std::printf(" %s=%.0fms/%llu", ps2prof::name(c), (ns - s_lastNs[c]) / 1.0e6,
+                                    static_cast<unsigned long long>(calls - s_lastCalls[c]));
+                        s_lastNs[c] = ns;
+                        s_lastCalls[c] = calls;
+                    }
+                    std::printf("\n");
+                }
+                std::fflush(stdout);
+            }
+        }
+        if (!ps2host::pumpMessages())
+        {
+            RUNTIME_LOG("[run] window close requested, breaking out of loop");
+            requestStop();
+            break;
+        }
         UploadFrame(frameTex, this, presentWidth, presentHeight);
-
+#else
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
@@ -2452,6 +2687,7 @@ void PS2Runtime::run()
             requestStop();
             break;
         }
+#endif
     }
 
     requestStop();
@@ -2465,8 +2701,12 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+#if defined(PS2X_NATIVE_HOST)
+    ps2host::shutdown();
+#else
     UnloadTexture(frameTex);
     CloseWindow();
+#endif
 
     RUNTIME_LOG("[run] exiting loop");
 }

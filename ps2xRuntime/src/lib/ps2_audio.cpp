@@ -1,7 +1,9 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace
@@ -69,6 +71,39 @@ namespace ps2_vag
                 std::vector<int16_t> &outPcm, uint32_t &outSampleRate);
 }
 
+#if defined(PS2X_NATIVE_HOST)
+#include <xaudio2.h>
+
+struct PS2AudioBackend::Impl
+{
+    struct TrackedSound
+    {
+        IXAudio2SourceVoice *voice = nullptr;
+        std::shared_ptr<std::vector<int16_t>> pcm;
+        uint32_t sampleKey = 0;
+    };
+    std::vector<TrackedSound> activeSounds;
+
+    static bool isPlaying(const TrackedSound &t)
+    {
+        if (!t.voice)
+            return false;
+        XAUDIO2_VOICE_STATE st{};
+        t.voice->GetState(&st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+        return st.BuffersQueued > 0;
+    }
+    static void release(TrackedSound &t)
+    {
+        if (t.voice)
+        {
+            t.voice->Stop();
+            t.voice->FlushSourceBuffers();
+            t.voice->DestroyVoice();
+            t.voice = nullptr;
+        }
+    }
+};
+#else
 struct PS2AudioBackend::Impl
 {
     struct TrackedSound
@@ -78,6 +113,7 @@ struct PS2AudioBackend::Impl
     };
     std::vector<TrackedSound> activeSounds;
 };
+#endif
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
 {
@@ -230,6 +266,18 @@ void PS2AudioBackend::pruneFinishedSounds()
 {
 #if defined(PLATFORM_VITA)
     return;
+#elif defined(PS2X_NATIVE_HOST)
+    auto &sounds = m_impl->activeSounds;
+    for (auto it = sounds.begin(); it != sounds.end();)
+    {
+        if (!Impl::isPlaying(*it))
+        {
+            Impl::release(*it);
+            it = sounds.erase(it);
+        }
+        else
+            ++it;
+    }
 #else
     auto &sounds = m_impl->activeSounds;
     auto it = sounds.begin();
@@ -258,6 +306,49 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
     (void)volume;
     (void)isBgm;
     return;
+#elif defined(PS2X_NATIVE_HOST)
+    if (!ps2host::audioReady() || sample.pcm.empty())
+        return;
+    pruneFinishedSounds();
+    auto &sounds = m_impl->activeSounds;
+    for (const auto &t : sounds)
+    {
+        if (t.sampleKey == sampleKey && Impl::isPlaying(t))
+            return;
+    }
+    if (isBgm)
+    {
+        for (auto &t : sounds)
+            Impl::release(t);
+        sounds.clear();
+    }
+    constexpr size_t kMaxConcurrentSounds = 16;
+    while (sounds.size() >= kMaxConcurrentSounds)
+    {
+        Impl::release(sounds.front());
+        sounds.erase(sounds.begin());
+    }
+    WAVEFORMATEX wf{};
+    wf.wFormatTag = WAVE_FORMAT_PCM;
+    wf.nChannels = 1;
+    wf.nSamplesPerSec = sample.sampleRate;
+    wf.wBitsPerSample = 16;
+    wf.nBlockAlign = 2;
+    wf.nAvgBytesPerSec = sample.sampleRate * 2;
+    Impl::TrackedSound t;
+    t.sampleKey = sampleKey;
+    t.pcm = std::make_shared<std::vector<int16_t>>(sample.pcm);
+    if (FAILED(ps2host::xaudio()->CreateSourceVoice(&t.voice, &wf, 0, 4.0f)))
+        return;
+    XAUDIO2_BUFFER buf{};
+    buf.AudioBytes = static_cast<UINT32>(t.pcm->size() * 2);
+    buf.pAudioData = reinterpret_cast<const BYTE *>(t.pcm->data());
+    buf.Flags = XAUDIO2_END_OF_STREAM;
+    t.voice->SubmitSourceBuffer(&buf);
+    t.voice->SetFrequencyRatio(std::clamp(pitch, 0.25f, 4.0f));
+    t.voice->SetVolume(volume);
+    t.voice->Start();
+    sounds.push_back(std::move(t));
 #else
     if (!m_audioReady || sample.pcm.empty())
         return;
@@ -317,6 +408,10 @@ void PS2AudioBackend::stopAll()
     std::lock_guard<std::mutex> lock(m_mutex);
 #if defined(PLATFORM_VITA)
     return;
+#elif defined(PS2X_NATIVE_HOST)
+    for (auto &t : m_impl->activeSounds)
+        Impl::release(t);
+    m_impl->activeSounds.clear();
 #else
     for (auto &t : m_impl->activeSounds)
     {

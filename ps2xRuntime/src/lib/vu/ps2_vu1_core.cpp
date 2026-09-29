@@ -5,9 +5,16 @@
 #include "ps2_vu1_detail.h"
 
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
+namespace { uint64_t g_vuExecCount = 0;
+// Earliest readyCycle of any queued pipeline entry, per unit (kept out of the class header so the
+// PCH is untouched). commitReadyPipelines() is a no-op until the cycle counter reaches it.
+uint64_t g_vuNextCommit[2] = {0, 0};
+uint64_t g_vuStatPairs = 0, g_vuStatCycles = 0, g_vuStatRuns = 0, g_vuStatStall = 0, g_vuStatBudgetHits = 0; }
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -66,6 +73,7 @@ VU1Interpreter::VU1Interpreter(Unit unit)
 
 void VU1Interpreter::resetScheduler()
 {
+    g_vuNextCommit[m_unit == Unit::VU1] = 0;
     m_flagPipeline = {};
     m_fdiv = {};
     m_efu = {};
@@ -533,6 +541,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
     entry->valid = true;
     entry->issueCycle = m_cycle;
     entry->readyCycle = m_cycle + kFmacLatency;
+    g_vuNextCommit[m_unit == Unit::VU1] = std::min(g_vuNextCommit[m_unit == Unit::VU1], m_cycle + kFmacLatency);
     entry->mac = mac;
     entry->status = status;
     entry->extraSticky = extraSticky;
@@ -572,6 +581,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
+            g_vuNextCommit[m_unit == Unit::VU1] = std::min(g_vuNextCommit[m_unit == Unit::VU1], m_cycle + kFmacLatency);
             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
             entry.writesSticky = true;
             return;
@@ -591,6 +601,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
+            g_vuNextCommit[m_unit == Unit::VU1] = std::min(g_vuNextCommit[m_unit == Unit::VU1], m_cycle + kFmacLatency);
             entry.clip = m_workingClip;
             entry.writesClip = true;
             return;
@@ -615,6 +626,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
+            g_vuNextCommit[m_unit == Unit::VU1] = std::min(g_vuNextCommit[m_unit == Unit::VU1], m_cycle + kFmacLatency);
             entry.clip = m_workingClip;
             entry.writesClip = true;
             return;
@@ -629,6 +641,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
     value = normalizeResult(value, ignoredFlags);
     m_fdiv.valid = true;
     m_fdiv.readyCycle = m_cycle + latency;
+    g_vuNextCommit[m_unit == Unit::VU1] = std::min(g_vuNextCommit[m_unit == Unit::VU1], m_cycle + latency);
     m_fdiv.value = value;
     m_fdiv.statusDi = statusDi & 0x30u;
 }
@@ -643,6 +656,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
         {
             entry.valid = true;
             entry.readyCycle = m_cycle + latency;
+            g_vuNextCommit[m_unit == Unit::VU1] = std::min(g_vuNextCommit[m_unit == Unit::VU1], m_cycle + latency);
             entry.value = value;
             // EFU throughput is one cycle shorter than result visibility.
             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
@@ -654,12 +668,23 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
 
 void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
+    {
+        static const long s_watch = std::getenv("PS2X_VU_WATCH") ? std::strtol(std::getenv("PS2X_VU_WATCH"), nullptr, 16) : -1;
+        static int s_watchCount = 0;
+        if (s_watch >= 0 && m_unit == Unit::VU1 && address / 16u == static_cast<uint32_t>(s_watch) && s_watchCount < 40)
+        {
+            ++s_watchCount;
+            std::printf("[vu-watch] exec=%llu pc=0x%x mask=%x words=%08x %08x %08x %08x\n",
+                        static_cast<unsigned long long>(g_vuExecCount), m_state.pc, laneMask, words[0], words[1], words[2], words[3]);
+        }
+    }
     for (PendingStore &store : m_storePipeline)
     {
         if (!store.valid)
         {
             store.valid = true;
             store.readyCycle = m_cycle + 1u;
+            g_vuNextCommit[m_unit == Unit::VU1] = std::min(g_vuNextCommit[m_unit == Unit::VU1], m_cycle + 1u);
             store.address = address;
             store.laneMask = laneMask;
             std::copy(words, words + 4, store.words.begin());
@@ -681,6 +706,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
+            g_vuNextCommit[m_unit == Unit::VU1] = std::min(g_vuNextCommit[m_unit == Unit::VU1], m_cycle + latency);
             write.sequence = ++m_nextWriteSequence;
             write.reg = reg;
             write.laneMask = laneMask;
@@ -707,6 +733,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
+            g_vuNextCommit[m_unit == Unit::VU1] = std::min(g_vuNextCommit[m_unit == Unit::VU1], m_cycle + latency);
             write.sequence = ++m_nextWriteSequence;
             write.reg = reg;
             write.value = value;
@@ -728,6 +755,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
+            g_vuNextCommit[m_unit == Unit::VU1] = std::min(g_vuNextCommit[m_unit == Unit::VU1], m_cycle + latency);
             write.sequence = ++m_nextWriteSequence;
             write.laneMask = laneMask;
             std::copy(value, value + 4, write.value.begin());
@@ -744,10 +772,19 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
 
 void VU1Interpreter::commitReadyPipelines()
 {
+    uint64_t &nextCommit = g_vuNextCommit[m_unit == Unit::VU1];
+    if (m_cycle < nextCommit)
+        return;
+    uint64_t next = ~0ull;
     for (FlagPipelineEntry &entry : m_flagPipeline)
     {
-        if (!entry.valid || entry.readyCycle > m_cycle)
+        if (!entry.valid)
             continue;
+        if (entry.readyCycle > m_cycle)
+        {
+            next = std::min(next, entry.readyCycle);
+            continue;
+        }
 
         if (entry.writesMac)
             m_state.mac = entry.mac;
@@ -765,6 +802,8 @@ void VU1Interpreter::commitReadyPipelines()
         entry = {};
     }
 
+    if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
+        next = std::min(next, m_fdiv.readyCycle);
     if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
     {
         m_state.q = m_fdiv.value;
@@ -775,6 +814,8 @@ void VU1Interpreter::commitReadyPipelines()
 
     for (ScalarPipelineEntry &entry : m_efu)
     {
+        if (entry.valid && entry.readyCycle > m_cycle)
+            next = std::min(next, entry.readyCycle);
         if (entry.valid && entry.readyCycle <= m_cycle)
         {
             m_state.p = entry.value;
@@ -784,8 +825,13 @@ void VU1Interpreter::commitReadyPipelines()
 
     for (PendingStore &store : m_storePipeline)
     {
-        if (!store.valid || store.readyCycle > m_cycle)
+        if (!store.valid)
             continue;
+        if (store.readyCycle > m_cycle)
+        {
+            next = std::min(next, store.readyCycle);
+            continue;
+        }
         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
         {
             uint32_t oldWords[4]{};
@@ -802,8 +848,13 @@ void VU1Interpreter::commitReadyPipelines()
 
     for (PendingVfWrite &write : m_vfWritePipeline)
     {
-        if (!write.valid || write.readyCycle > m_cycle)
+        if (!write.valid)
             continue;
+        if (write.readyCycle > m_cycle)
+        {
+            next = std::min(next, write.readyCycle);
+            continue;
+        }
         for (uint32_t component = 0; component < 4u; ++component)
         {
             if ((write.laneMask & laneForComponent(component)) != 0u &&
@@ -817,8 +868,13 @@ void VU1Interpreter::commitReadyPipelines()
 
     for (PendingViWrite &write : m_viWritePipeline)
     {
-        if (!write.valid || write.readyCycle > m_cycle)
+        if (!write.valid)
             continue;
+        if (write.readyCycle > m_cycle)
+        {
+            next = std::min(next, write.readyCycle);
+            continue;
+        }
         if (m_viLatestWrite[write.reg] == write.sequence)
             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
         write = {};
@@ -826,8 +882,13 @@ void VU1Interpreter::commitReadyPipelines()
 
     for (PendingAccWrite &write : m_accWritePipeline)
     {
-        if (!write.valid || write.readyCycle > m_cycle)
+        if (!write.valid)
             continue;
+        if (write.readyCycle > m_cycle)
+        {
+            next = std::min(next, write.readyCycle);
+            continue;
+        }
         for (uint32_t component = 0; component < 4u; ++component)
         {
             if ((write.laneMask & laneForComponent(component)) != 0u &&
@@ -838,6 +899,7 @@ void VU1Interpreter::commitReadyPipelines()
         }
         write = {};
     }
+    nextCommit = next;
 }
 
 void VU1Interpreter::progressXgkick()
@@ -914,10 +976,37 @@ void VU1Interpreter::progressXgkick()
     }
 }
 
+namespace
+{
+    uint32_t g_vuTraceProgramStart = 0;
+    int g_vuTraceRemaining = -1;
+    uint32_t g_vuTracePc = 0xFFFFFFFFu;
+    int64_t g_vuTraceIndex = -2;
+}
+
 void VU1Interpreter::finishXgkick()
 {
     if (!m_xgkick.active)
         return;
+    {
+        static bool s_reported = false;
+        if (!s_reported && std::getenv("PS2X_VU1_FIND"))
+        {
+            for (uint32_t off = 0; off + 16u <= m_xgkick.totalBytes; off += 16u)
+            {
+                uint64_t lo, hi;
+                std::memcpy(&lo, m_xgkick.packet.data() + off, 8);
+                std::memcpy(&hi, m_xgkick.packet.data() + off + 8, 8);
+                if (lo == 0x4bull && hi == 0x4bull)
+                {
+                    s_reported = true;
+                    std::printf("[vu1-find] exec=%llu program start pc=0x%x kick src=0x%x qword=%u\n", static_cast<unsigned long long>(g_vuExecCount), g_vuTraceProgramStart,
+                                m_xgkick.sourceAddress, off / 16u);
+                    break;
+                }
+            }
+        }
+    }
 
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
@@ -1005,9 +1094,10 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
                     ready = std::max(ready, m_vfReady[access.reg][component]);
             }
         }
-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+        for (uint32_t bits = static_cast<uint32_t>(usage->viRead) & 0xFFFEu; bits != 0u; bits &= bits - 1u)
         {
-            if ((usage->viRead & (1u << reg)) != 0u)
+            const uint32_t reg = static_cast<uint32_t>(std::countr_zero(bits));
+            if (reg < m_viReady.size())
                 ready = std::max(ready, m_viReady[reg]);
         }
         for (uint32_t component = 0; component < 4u; ++component)
@@ -1592,6 +1682,33 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
 {
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
+    g_vuTraceProgramStart = m_state.pc;
+    if (g_vuTracePc == 0xFFFFFFFFu)
+    {
+        const char *t = std::getenv("PS2X_VU1_TRACE_PC");
+        g_vuTracePc = t ? static_cast<uint32_t>(std::strtoul(t, nullptr, 16)) : 0xFFFFFFFEu;
+    }
+    if (m_unit == Unit::VU1)
+        ++g_vuExecCount;
+    if (g_vuTraceIndex == -2)
+    {
+        const char *ti = std::getenv("PS2X_VU1_TRACE_INDEX");
+        g_vuTraceIndex = ti ? std::atoll(ti) : -1;
+    }
+    if (g_vuTraceRemaining < 0 && m_unit == Unit::VU1 &&
+        (m_state.pc == g_vuTracePc || static_cast<int64_t>(g_vuExecCount) == g_vuTraceIndex))
+    {
+        g_vuTraceRemaining = 1500;
+        std::printf("[vu1-trace] begin pc=0x%x top=%u itop=%u\n", m_state.pc, top, itop);
+        for (int r = 0; r < 32; ++r)
+        {
+            uint32_t w[4];
+            std::memcpy(w, m_state.vf[r], 16);
+            std::printf("[vu1-trace]   vf%02d %08x %08x %08x %08x\n", r, w[0], w[1], w[2], w[3]);
+        }
+        for (int r = 0; r < 16; ++r)
+            std::printf("[vu1-trace]   vi%02d %04x\n", r, static_cast<uint32_t>(m_state.vi[r]) & 0xFFFFu);
+    }
     m_state.ebit = false;
     m_state.haltAfterDelaySlot = false;
     m_state.stoppedByD = false;
@@ -1632,14 +1749,54 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
+    const uint64_t statStartCycle = m_cycle;
     bool programEnded = false;
+    struct TraceState
+    {
+        bool active = false;
+        uint32_t pc = 0, upper = 0, lower = 0;
+        float vf[32][4];
+        int32_t vi[16];
+    } trace;
+    auto flushTrace = [&]()
+    {
+        if (!trace.active)
+            return;
+        trace.active = false;
+        std::printf("[vu1-trace] %04x: %08x %08x", trace.pc, trace.upper, trace.lower);
+        for (int r = 1; r < 32; ++r)
+            if (std::memcmp(trace.vf[r], m_state.vf[r], 16) != 0)
+            {
+                uint32_t w[4];
+                std::memcpy(w, m_state.vf[r], 16);
+                std::printf(" vf%d=[%08x %08x %08x %08x]", r, w[0], w[1], w[2], w[3]);
+                std::memcpy(trace.vf[r], m_state.vf[r], 16);
+            }
+        for (int r = 1; r < 16; ++r)
+            if (trace.vi[r] != m_state.vi[r])
+                std::printf(" vi%d=%04x", r, static_cast<uint32_t>(m_state.vi[r]) & 0xFFFFu);
+        std::printf("\n");
+        if (--g_vuTraceRemaining == 0)
+            std::printf("[vu1-trace] end\n");
+    };
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
         commitReadyPipelines();
+        flushTrace();
         if (m_state.pc + 8u > codeSize)
             break;
 
         const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+        float traceBefore[32][4];
+        int32_t traceViBefore[16];
+        const bool tracing = g_vuTraceRemaining > 0 && m_unit == Unit::VU1;
+        const uint32_t tracePc = m_state.pc;
+        if (tracing)
+        {
+            std::memcpy(traceBefore, m_state.vf, sizeof(traceBefore));
+            for (int r = 0; r < 16; ++r)
+                traceViBefore[r] = m_state.vi[r];
+        }
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {
             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
@@ -1658,7 +1815,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             readyCycle = calculatePairReadyCycle(decoded);
         }
         if (m_cycle >= budgetEnd)
+        {
+            ++g_vuStatBudgetHits;
             break;
+        }
+        ++g_vuStatPairs;
 
         uint8_t writtenVi = 0u;
         int32_t oldVi = 0;
@@ -1695,7 +1856,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             execUpper(decoded.upper);
             float immediate = 0.0f;
             std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
-            m_state.i = normalizeOperand(immediate);
+            m_state.i = immediate; // raw bits: microcode loads integer constants via LOI
         }
         else if (decoded.upperVfShadowReg != 0u)
         {
@@ -1723,6 +1884,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
 
         m_viBranchBackupValid = false;
+        if (tracing)
+        {
+            trace.active = true;
+            trace.pc = tracePc;
+            trace.upper = decoded.upper;
+            trace.lower = decoded.lower;
+            std::memcpy(trace.vf, traceBefore, sizeof(traceBefore));
+            std::memcpy(trace.vi, traceViBefore, sizeof(traceViBefore));
+        }
 
         if (hasUpperWrite)
         {
@@ -1833,6 +2003,22 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
+    if (m_unit == Unit::VU1)
+    {
+        static const bool s_stats = std::getenv("PS2X_VU_STATS") != nullptr;
+        ++g_vuStatRuns;
+        g_vuStatCycles += m_cycle - statStartCycle;
+        static auto s_last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (s_stats && now - s_last >= std::chrono::seconds(2))
+        {
+            s_last = now;
+            std::printf("[vu-stats] runs=%llu pairs=%llu cycles=%llu budgetHits=%llu maxCycles=%u\n",
+                        (unsigned long long)g_vuStatRuns, (unsigned long long)g_vuStatPairs,
+                        (unsigned long long)g_vuStatCycles, (unsigned long long)g_vuStatBudgetHits, maxCycles);
+            g_vuStatRuns = g_vuStatPairs = g_vuStatCycles = g_vuStatBudgetHits = 0;
+        }
+    }
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
 }

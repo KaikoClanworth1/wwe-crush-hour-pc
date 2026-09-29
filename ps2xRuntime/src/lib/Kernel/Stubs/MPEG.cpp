@@ -1,4 +1,11 @@
 #include "Common.h"
+#if defined(PS2X_NATIVE_HOST)
+#include "host/win32_host.h"
+#include <xaudio2.h>
+#include <deque>
+#include <unordered_map>
+#endif
+#include "runtime/ps2_prof.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 
@@ -1172,6 +1179,134 @@ namespace ps2_stubs
             }
         }
 
+
+#if defined(PS2X_NATIVE_HOST)
+        // ---- Native PSS movie audio (XAudio2) -------------------------------------------------
+        // PSS audio lives in private_stream_1 PES packets: a 4-byte sub-stream header, then (first
+        // packet) 'SShd' {size, type 1=PCM16, rate, channels, interleave} + 'SSbd' {size}, then
+        // little-endian PCM16 interleaved in `interleave`-byte blocks per channel. Played directly on
+        // the host instead of through the game's IOP audio path (libsdr / sceSdRemote).
+        struct PssAudioStream
+        {
+            bool headerParsed = false;
+            bool pcm = false;
+            uint32_t rate = 48000;
+            uint32_t channels = 2;
+            uint32_t interleave = 512;
+            std::vector<uint8_t> pending;
+            IXAudio2SourceVoice *voice = nullptr;
+            std::deque<std::vector<int16_t>> queued;
+            bool started = false;
+        };
+        std::mutex g_pssAudioMutex;
+        std::unordered_map<uint32_t, PssAudioStream> g_pssAudio;
+
+        void destroyPssAudioLocked(PssAudioStream &a)
+        {
+            if (a.voice)
+            {
+                a.voice->Stop();
+                a.voice->FlushSourceBuffers();
+                a.voice->DestroyVoice();
+                a.voice = nullptr;
+            }
+            a.queued.clear();
+        }
+
+        void stopPssAudio(uint32_t mpegAddr)
+        {
+            std::lock_guard<std::mutex> lock(g_pssAudioMutex);
+            auto it = g_pssAudio.find(mpegAddr);
+            if (it != g_pssAudio.end())
+            {
+                destroyPssAudioLocked(it->second);
+                g_pssAudio.erase(it);
+            }
+        }
+
+        void stopAllPssAudio()
+        {
+            std::lock_guard<std::mutex> lock(g_pssAudioMutex);
+            for (auto &[addr, a] : g_pssAudio)
+                destroyPssAudioLocked(a);
+            g_pssAudio.clear();
+        }
+
+        void feedPssAudio(uint32_t mpegAddr, const uint8_t *payload, size_t size)
+        {
+            if (!ps2host::audioReady() || size <= 4u)
+                return;
+            std::lock_guard<std::mutex> lock(g_pssAudioMutex);
+            PssAudioStream &a = g_pssAudio[mpegAddr];
+            a.pending.insert(a.pending.end(), payload + 4, payload + size);
+            if (!a.headerParsed)
+            {
+                if (a.pending.size() < 32u)
+                    return;
+                if (std::memcmp(a.pending.data(), "SShd", 4) != 0)
+                {
+                    a.pending.clear();
+                    return;
+                }
+                uint32_t type = 0, rate = 0, ch = 0, inter = 0;
+                std::memcpy(&type, a.pending.data() + 8, 4);
+                std::memcpy(&rate, a.pending.data() + 12, 4);
+                std::memcpy(&ch, a.pending.data() + 16, 4);
+                std::memcpy(&inter, a.pending.data() + 20, 4);
+                a.pcm = (type == 1u);
+                a.rate = rate ? rate : 48000u;
+                a.channels = std::clamp<uint32_t>(ch, 1u, 2u);
+                a.interleave = inter ? inter : 512u;
+                a.pending.erase(a.pending.begin(), a.pending.begin() + 32); // SShd(24) + SSbd(8)
+                a.headerParsed = true;
+                if (!a.pcm)
+                    return; // ADPCM movie audio: not used by this game
+                WAVEFORMATEX wf{};
+                wf.wFormatTag = WAVE_FORMAT_PCM;
+                wf.nChannels = static_cast<WORD>(a.channels);
+                wf.nSamplesPerSec = a.rate;
+                wf.wBitsPerSample = 16;
+                wf.nBlockAlign = static_cast<WORD>(2u * a.channels);
+                wf.nAvgBytesPerSec = a.rate * wf.nBlockAlign;
+                if (FAILED(ps2host::xaudio()->CreateSourceVoice(&a.voice, &wf)))
+                    a.voice = nullptr;
+            }
+            if (!a.pcm || !a.voice)
+                return;
+            const size_t block = static_cast<size_t>(a.interleave) * a.channels;
+            while (a.pending.size() >= block)
+            {
+                const size_t frames = a.interleave / 2u;
+                std::vector<int16_t> out(frames * a.channels);
+                for (uint32_t c = 0; c < a.channels; ++c)
+                {
+                    const uint8_t *src = a.pending.data() + static_cast<size_t>(c) * a.interleave;
+                    for (size_t f = 0; f < frames; ++f)
+                    {
+                        int16_t v;
+                        std::memcpy(&v, src + f * 2u, 2);
+                        out[f * a.channels + c] = v;
+                    }
+                }
+                a.pending.erase(a.pending.begin(), a.pending.begin() + static_cast<std::ptrdiff_t>(block));
+                a.queued.push_back(std::move(out));
+                XAUDIO2_BUFFER buf{};
+                buf.AudioBytes = static_cast<UINT32>(a.queued.back().size() * 2u);
+                buf.pAudioData = reinterpret_cast<const BYTE *>(a.queued.back().data());
+                a.voice->SubmitSourceBuffer(&buf);
+            }
+            XAUDIO2_VOICE_STATE st{};
+            a.voice->GetState(&st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+            while (a.queued.size() > st.BuffersQueued)
+                a.queued.pop_front();
+            if (!a.started && st.BuffersQueued > 0)
+            {
+                a.voice->Start();
+                a.started = true;
+            }
+        }
+#endif
+
         void processPssBuffer(uint32_t mpegAddr,
                               MpegPlaybackState &playback,
                               std::vector<MpegStreamCallbackEvent> &callbackEvents,
@@ -1343,6 +1478,10 @@ namespace ps2_stubs
                 {
                     const MpegPesHeader pes = parsePesHeader(buffer.data(), packetEnd);
                     const size_t payloadStart = pes.payloadOffset;
+#if defined(PS2X_NATIVE_HOST)
+                    if (payloadStart < packetEnd)
+                        feedPssAudio(mpegAddr, buffer.data() + payloadStart, packetEnd - payloadStart);
+#endif
                     if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
                     {
                         queueStreamCallbackEvent(
@@ -1476,6 +1615,7 @@ namespace ps2_stubs
                                 size_t size,
                                 std::vector<MpegStreamCallbackEvent> &callbackEvents)
         {
+            ps2prof::Scope profScope(ps2prof::kMpegDecode);
             size_t copied = 0u;
             while (copied < size)
             {
@@ -1620,6 +1760,63 @@ namespace ps2_stubs
             runtime->eeScheduler().queueInvocation(std::move(invocation));
         }
 
+
+        // libmpeg calls the game's sceMpegCbNodata / sceMpegCbBackground callbacks from inside
+        // sceMpegGetPicture whenever the decoder starves; many players (e.g. RenderWare VidTex)
+        // only feed sceMpegDemuxPss from those callbacks. Queue them and wake GetPicture afterwards.
+        constexpr uint32_t kMpegCbNodata = 1u;
+        constexpr uint32_t kMpegCbBackground = 4u;
+
+        bool queueStarvationCallbacks(uint8_t *rdram, R5900Context *callerCtx, PS2Runtime *runtime, uint32_t mpegAddr)
+        {
+            std::vector<MpegRegisteredCallback> toCall;
+            {
+                auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+                if (it == g_mpeg_stub_state.callbacksByMpeg.end())
+                    return false;
+                for (const MpegRegisteredCallback &cb : it->second)
+                    if (!cb.stream && cb.type == kMpegCbNodata)
+                        toCall.push_back(cb);
+                if (toCall.empty())
+                    for (const MpegRegisteredCallback &cb : it->second)
+                        if (!cb.stream && cb.type == kMpegCbBackground)
+                            toCall.push_back(cb);
+            }
+            bool queued = false;
+            for (const MpegRegisteredCallback &cb : toCall)
+            {
+                if (!rdram || !callerCtx || !runtime || cb.func == 0u || !runtime->hasFunction(cb.func))
+                    continue;
+                const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+                if (cbDataAddr == 0u)
+                    continue;
+                if (uint8_t *p = getMemPtr(rdram, cbDataAddr))
+                {
+                    std::memset(p, 0, kMpegCallbackDataSize);
+                    std::memcpy(p, &cb.type, sizeof(uint32_t));
+                }
+                R5900Context callbackCtx = *callerCtx;
+                SET_GPR_U32(&callbackCtx, 4, mpegAddr);
+                SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
+                SET_GPR_U32(&callbackCtx, 6, cb.data);
+                SET_GPR_U32(&callbackCtx, 7, 0u);
+                SET_GPR_U32(&callbackCtx, 29, 0u);
+                SET_GPR_U32(&callbackCtx, 31, 0u);
+                callbackCtx.pc = cb.func;
+                GuestInvocation invocation{};
+                invocation.kind = GuestInvocationKind::RpcCallback;
+                invocation.context = callbackCtx;
+                invocation.onComplete = [runtime, cbDataAddr, mpegAddr](const R5900Context &, R5900Context &)
+                {
+                    runtime->guestFree(cbDataAddr);
+                    runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
+                };
+                runtime->eeScheduler().queueInvocation(std::move(invocation));
+                queued = true;
+            }
+            return queued;
+        }
+
         void dispatchStreamCallbacks(uint8_t *rdram,
                                      R5900Context *ctx,
                                      PS2Runtime *runtime,
@@ -1699,6 +1896,49 @@ namespace ps2_stubs
             const uint32_t outHeight = align16(height);
             const uint32_t macroblockColumns = outWidth / 16u;
 
+            // Output layout experiment: 0 = 16px column strips (default), 1 = macroblock row-major
+            // (each 16x16 MB contiguous), 2 = plain raster.
+            static const int s_layout = []() {
+                const char *v = std::getenv("PS2X_MPEG_LAYOUT");
+                return v ? std::atoi(v) : 0;
+            }();
+            if (s_layout != 0)
+            {
+                const uint32_t mbCols = outWidth / 16u;
+                for (uint32_t y = 0u; y < outHeight; ++y)
+                {
+                    for (uint32_t x = 0u; x < outWidth; ++x)
+                    {
+                        size_t dstIndex;
+                        if (s_layout == 1)
+                        {
+                            const uint32_t mb = (y / 16u) * mbCols + (x / 16u);
+                            dstIndex = static_cast<size_t>(mb) * 256u + (y % 16u) * 16u + (x % 16u);
+                        }
+                        else
+                        {
+                            dstIndex = static_cast<size_t>(y) * outWidth + x;
+                        }
+                        uint8_t *dst = getMemPtr(rdram, destAddr + static_cast<uint32_t>(dstIndex * 4u));
+                        if (!dst)
+                            continue;
+                        if (x < width && y < height)
+                        {
+                            const uint8_t *src = frame.rgba.data() + (static_cast<size_t>(y) * width + x) * 4u;
+                            dst[0] = src[0];
+                            dst[1] = src[1];
+                            dst[2] = src[2];
+                        }
+                        else
+                        {
+                            dst[0] = dst[1] = dst[2] = 0u;
+                        }
+                        dst[3] = 0x80u;
+                    }
+                }
+                return;
+            }
+
             for (uint32_t mbx = 0u; mbx < macroblockColumns; ++mbx)
             {
                 const size_t stripOffset =
@@ -1764,6 +2004,9 @@ namespace ps2_stubs
 
     void resetMpegStubState()
     {
+#if defined(PS2X_NATIVE_HOST)
+        stopAllPssAudio();
+#endif
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         resetMpegStubStateUnlocked();
     }
@@ -2064,6 +2307,9 @@ namespace ps2_stubs
 
     void sceMpegDelete(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+#if defined(PS2X_NATIVE_HOST)
+        stopPssAudio(getRegU32(ctx, 4));
+#endif
         (void)rdram;
 
         const uint32_t mpegAddr = getRegU32(ctx, 4);
@@ -2307,6 +2553,7 @@ namespace ps2_stubs
                     });
                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
                 }
+                queueStarvationCallbacks(rdram, ctx, runtime, mpegAddr);
                 lock.unlock();
                 runtime->eeScheduler().waitExternal(
                     EeWaitReason::Mpeg,
@@ -2408,6 +2655,22 @@ namespace ps2_stubs
 
         if (haveFrame)
         {
+            if (frameCount == 0u || (frameCount % 300u) == 0u)
+                RUNTIME_LOG("[MPEG] picture mpeg=0x" << std::hex << mpegAddr << " dst=0x" << imageAddr << std::dec
+                                                     << " frame=" << frameCount << " size=" << frame.width << "x" << frame.height);
+            if (const char *dumpDir = std::getenv("PS2X_MPEG_DUMP"); dumpDir && (frameCount % 60u) == 30u)
+            {
+                static int s_dumpIndex = 0;
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s/mpeg_%03d_%ux%u.rgba", dumpDir, s_dumpIndex++,
+                              static_cast<unsigned>(frame.width), static_cast<unsigned>(frame.height));
+                if (FILE *f = std::fopen(path, "wb"))
+                {
+                    std::fwrite(frame.rgba.data(), 1, frame.rgba.size(), f);
+                    std::fclose(f);
+                }
+            }
+            ps2prof::Scope profScope(ps2prof::kMpegFrameWrite);
             writeDecodedFrameToGuest(rdram, imageAddr, frame);
         }
         else if (frameCount == 0u)
@@ -2501,6 +2764,9 @@ namespace ps2_stubs
 
     void sceMpegReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+#if defined(PS2X_NATIVE_HOST)
+        stopPssAudio(getRegU32(ctx, 4));
+#endif
         (void)runtime;
         const uint32_t param_1 = getRegU32(ctx, 4);
         {

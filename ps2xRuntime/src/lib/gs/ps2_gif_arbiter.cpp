@@ -1,6 +1,10 @@
-#include "runtime/gs/ps2_gif_arbiter.h"
+﻿#include "runtime/gs/ps2_gif_arbiter.h"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+
+// Path of the packet currently being processed (diagnostics only).
+thread_local GifPathId g_gifCurrentPath = GifPathId::Path3;
 
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
@@ -37,25 +41,34 @@ void GifArbiter::drain()
     if (!m_processFn)
         return;
 
-    std::stable_sort(m_queue.begin(), m_queue.end(),
-                     [](const GifArbiterPacket &a, const GifArbiterPacket &b)
-                     {
-                         // DIRECTHL cannot preempt PATH3 IMAGE transfers.
-                         if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
+    // Packets are processed in submission order. DMA channels are serviced in the order the guest
+    // kicked them, so FIFO matches the hardware result. Re-sorting by path priority moved PATH1
+    // (VU1 XGKICK) draws ahead of PATH3 texture uploads that were queued before them, so
+    // RenderWare's streamed texture cache was overwritten before the draws that used it.
+    static const bool s_priorityOrder = std::getenv("PS2X_GIF_PRIORITY_ORDER") != nullptr;
+    if (s_priorityOrder)
+    {
+        std::stable_sort(m_queue.begin(), m_queue.end(),
+                         [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                          {
-                             if (a.path3Image && b.path2DirectHl)
-                                 return true;
-                             if (a.path2DirectHl && b.path3Image)
-                                 return false;
-                         }
-                         return pathPriority(a.pathId) < pathPriority(b.pathId);
-                     });
+                             // DIRECTHL cannot preempt PATH3 IMAGE transfers.
+                             if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
+                             {
+                                 if (a.path3Image && b.path2DirectHl)
+                                     return true;
+                                 if (a.path2DirectHl && b.path3Image)
+                                     return false;
+                             }
+                             return pathPriority(a.pathId) < pathPriority(b.pathId);
+                         });
+    }
 
     for (size_t i = 0; i < m_queue.size(); ++i)
     {
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
         {
+            g_gifCurrentPath = pkt.pathId;
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
     }

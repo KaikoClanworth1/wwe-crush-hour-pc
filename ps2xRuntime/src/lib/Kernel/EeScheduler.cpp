@@ -1,4 +1,5 @@
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_prof.h"
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
@@ -1800,6 +1801,7 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
+                ps2prof::Scope profScope(ps2prof::kSchedPace);
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
@@ -2036,9 +2038,13 @@ void EeScheduler::waitForEvent()
         }
     }
 
-    const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
-                                               { return !m_events.empty() ||
-                                                        m_stopRequested.load(std::memory_order_acquire); });
+    bool signaled;
+    {
+        ps2prof::Scope profScope(ps2prof::kSchedIdle);
+        signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
+                                        { return !m_events.empty() ||
+                                                 m_stopRequested.load(std::memory_order_acquire); });
+    }
     if (!signaled)
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;

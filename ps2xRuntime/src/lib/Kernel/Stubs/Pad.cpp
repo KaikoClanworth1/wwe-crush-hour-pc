@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Pad.h"
+#include "host/win32_host.h"
 
 namespace ps2_stubs
 {
@@ -14,7 +15,7 @@ namespace ps2_stubs
         constexpr int32_t kPadStateExecCmd = 5;
         constexpr int32_t kPadStateStable = 6;
         constexpr size_t kPadPortCount = 2;
-        constexpr size_t kPadSlotCount = 1;
+        constexpr size_t kPadSlotCount = 4;
 
         constexpr uint16_t kPadBtnSelect = 1u << 0;
         constexpr uint16_t kPadBtnL3 = 1u << 1;
@@ -64,7 +65,7 @@ namespace ps2_stubs
         std::mutex g_padStateMutex;
         bool g_padOverrideEnabled = false;
         PadInputState g_padOverrideState{};
-        PadPortState g_padPorts[kPadPortCount]{};
+        PadPortState g_padPorts[kPadPortCount * kPadSlotCount]{};
         int g_padReadLogCount = 0;
 
         uint8_t axisToByte(float axis)
@@ -82,114 +83,41 @@ namespace ps2_stubs
             }
         }
 
-        int findFirstGamepad()
+        // Host player index for a PS2 (port, slot): port 0/1 = players 1/2,
+        // multitap slots 1..3 on port 0 = players 2..4 (port 1 slot 0 stays player 2).
+        int hostPadIndex(int port, int slot)
         {
-            for (int i = 0; i < 4; ++i)
-            {
-                if (IsGamepadAvailable(i))
-                {
-                    return i;
-                }
-            }
-            return -1;
+            if (slot > 0)
+                return std::min(slot + (port == 0 ? 0 : 1), ps2host::kMaxPads - 1);
+            return port;
         }
 
-        void applyGamepadState(PadInputState &state)
+        void applyHostPadState(PadInputState &state, int port, int slot, bool allowAnalog)
         {
-            if (!IsWindowReady())
+            if (!ps2host::isReady())
             {
                 return;
             }
-
-            const int gamepad = findFirstGamepad();
-            if (gamepad < 0)
+            const ps2host::PadState pad = ps2host::pad(hostPadIndex(port, slot));
+            if (!pad.connected)
             {
                 return;
             }
-
-            // Raylib mapping (PS2 -> raylib buttons/axes):
-            // D-Pad -> LEFT_FACE_*, Cross/Circle/Square/Triangle -> RIGHT_FACE_*
-            // L1/R1 -> TRIGGER_1, L2/R2 -> TRIGGER_2, L3/R3 -> THUMB
-            // Select/Start -> MIDDLE_LEFT/MIDDLE_RIGHT
-            state.lx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
-            state.ly = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
-            state.rx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
-            state.ry = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
-
-            setButton(state, kPadBtnUp, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP));
-            setButton(state, kPadBtnDown, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN));
-            setButton(state, kPadBtnLeft, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT));
-            setButton(state, kPadBtnRight, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT));
-
-            setButton(state, kPadBtnCross, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN));
-            setButton(state, kPadBtnCircle, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT));
-            setButton(state, kPadBtnSquare, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT));
-            setButton(state, kPadBtnTriangle, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP));
-
-            setButton(state, kPadBtnL1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1));
-            setButton(state, kPadBtnR1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1));
-            setButton(state, kPadBtnL2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2));
-            setButton(state, kPadBtnR2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2));
-
-            setButton(state, kPadBtnL3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_THUMB));
-            setButton(state, kPadBtnR3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_THUMB));
-
-            setButton(state, kPadBtnSelect, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT));
-            setButton(state, kPadBtnStart, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT));
+            state.buttons = static_cast<uint16_t>(~pad.buttons);
+            if (allowAnalog || true)
+            {
+                state.lx = pad.lx;
+                state.ly = pad.ly;
+                state.rx = pad.rx;
+                state.ry = pad.ry;
+            }
         }
 
-        void applyKeyboardState(PadInputState &state, bool allowAnalog)
+        bool hostPadConnected(int port, int slot)
         {
-            if (!IsWindowReady())
-            {
-                return;
-            }
-
-            // Keyboard mapping (PS2 -> keys):
-            // D-Pad: arrows, Square/Cross/Circle/Triangle: Z/X/C/V
-            // L1/R1: Q/E, L2/R2: 1/3, Start/Select: Enter/RightShift
-            // L3/R3: LeftCtrl/RightCtrl, Analog left: WASD
-            setButton(state, kPadBtnUp, IsKeyDown(KEY_UP));
-            setButton(state, kPadBtnDown, IsKeyDown(KEY_DOWN));
-            setButton(state, kPadBtnLeft, IsKeyDown(KEY_LEFT));
-            setButton(state, kPadBtnRight, IsKeyDown(KEY_RIGHT));
-
-            setButton(state, kPadBtnSquare, IsKeyDown(KEY_Z));
-            setButton(state, kPadBtnCross, IsKeyDown(KEY_X));
-            setButton(state, kPadBtnCircle, IsKeyDown(KEY_C));
-            setButton(state, kPadBtnTriangle, IsKeyDown(KEY_V));
-
-            setButton(state, kPadBtnL1, IsKeyDown(KEY_Q));
-            setButton(state, kPadBtnR1, IsKeyDown(KEY_E));
-            setButton(state, kPadBtnL2, IsKeyDown(KEY_ONE));
-            setButton(state, kPadBtnR2, IsKeyDown(KEY_THREE));
-
-            setButton(state, kPadBtnStart, IsKeyDown(KEY_ENTER));
-            setButton(state, kPadBtnSelect, IsKeyDown(KEY_RIGHT_SHIFT));
-            setButton(state, kPadBtnL3, IsKeyDown(KEY_LEFT_CONTROL));
-            setButton(state, kPadBtnR3, IsKeyDown(KEY_RIGHT_CONTROL));
-
-            if (!allowAnalog)
-            {
-                return;
-            }
-
-            float ax = 0.0f;
-            float ay = 0.0f;
-            if (IsKeyDown(KEY_D))
-                ax += 1.0f;
-            if (IsKeyDown(KEY_A))
-                ax -= 1.0f;
-            if (IsKeyDown(KEY_S))
-                ay += 1.0f;
-            if (IsKeyDown(KEY_W))
-                ay -= 1.0f;
-
-            if (ax != 0.0f || ay != 0.0f)
-            {
-                state.lx = axisToByte(ax);
-                state.ly = axisToByte(ay);
-            }
+            if (!ps2host::isReady())
+                return port == 0 && slot == 0;
+            return ps2host::pad(hostPadIndex(port, slot)).connected;
         }
 
         void resetPadStateLocked()
@@ -210,7 +138,7 @@ namespace ps2_stubs
             {
                 return nullptr;
             }
-            return &g_padPorts[port];
+            return &g_padPorts[port * kPadSlotCount + slot];
         }
 
         void initializePadPortLocked(PadPortState &portState, uint32_t dmaAddr)
@@ -310,8 +238,7 @@ namespace ps2_stubs
                 }
                 else
                 {
-                    applyGamepadState(state);
-                    applyKeyboardState(state, portState.analogMode);
+                    applyHostPadState(state, port, slot, portState.analogMode);
                 }
             }
 
@@ -458,7 +385,8 @@ namespace ps2_stubs
         PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
                                                            static_cast<int>(getRegU32(ctx, 5)));
         int32_t state = kPadStateDisconnected;
-        if (portState && portState->open)
+        if (portState && portState->open &&
+            hostPadConnected(static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5))))
         {
             if (portState->transientState != 0u)
             {
@@ -643,27 +571,6 @@ namespace ps2_stubs
             return;
         }
 
-        PS2_IF_AGRESSIVE_LOGS({
-            if (g_padReadLogCount < 48)
-            {
-                const int gamepad = findFirstGamepad();
-                const bool gamepadStartPressed =
-                    (gamepad >= 0) && IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT);
-                const bool startPressed = (data[2] != 0xFFu || data[3] != 0xFFu ||
-                                           IsKeyDown(KEY_ENTER) || gamepadStartPressed);
-                if (startPressed)
-                {
-                    const uint32_t guestButtons =
-                        (static_cast<uint32_t>(static_cast<uint8_t>(data[2] ^ 0xFFu)) << 8) |
-                        static_cast<uint32_t>(static_cast<uint8_t>(data[3] ^ 0xFFu));
-                    std::printf("[padread] port=%d slot=%d data2=0x%02x data3=0x%02x guestButtons=0x%04x enter=%d gamepadStart=%d\n",
-                                port, slot, data[2], data[3], guestButtons,
-                                IsKeyDown(KEY_ENTER) ? 1 : 0, gamepadStartPressed ? 1 : 0);
-                    ++g_padReadLogCount;
-                }
-            }
-        });
-
         setReturnS32(ctx, 1);
     }
 
@@ -694,8 +601,15 @@ namespace ps2_stubs
 
     void scePadSetActDirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        const int slot = static_cast<int>(getRegU32(ctx, 5));
+        const uint8_t *act = getConstMemPtr(rdram, getRegU32(ctx, 6));
+        if (act && ps2host::isReady())
+        {
+            // Default DualShock actuator alignment: [0] = small motor (on/off), [1] = large motor (0..255).
+            ps2host::setVibration(hostPadIndex(port, slot), act[0] ? 1u : 0u, act[1]);
+        }
         setReturnS32(ctx, 1);
     }
 

@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
@@ -883,6 +885,14 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         writeRegisterUnlocked(GS_REG_PRIM, lo & 0x7FF);
         break;
     case 0x01:
+    {
+        static int s_rgbaTrace = std::getenv("PS2X_RGBA_TRACE") ? std::atoi(std::getenv("PS2X_RGBA_TRACE")) : 0;
+        if (s_rgbaTrace > 0)
+        {
+            --s_rgbaTrace;
+            std::printf("[rgba-trace] lo=%016llx hi=%016llx\n", static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi));
+        }
+    }
         m_curR = static_cast<uint8_t>(lo & 0xFF);
         m_curG = static_cast<uint8_t>((lo >> 32) & 0xFF);
         m_curB = static_cast<uint8_t>(hi & 0xFF);

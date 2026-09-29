@@ -413,21 +413,65 @@ namespace
         }
 
         std::memset(dst, 0, byteCount);
-        std::ifstream file(path, std::ios::binary);
-        if (!file.is_open())
+
+        // Keep a few host files open: streamed reads (movies, audio) hit the same file thousands
+        // of times and reopening it per sector dominated frame time.
+        struct CachedHostFile
+        {
+            std::filesystem::path path;
+            FILE *file = nullptr;
+            uint64_t lastUse = 0;
+        };
+        static std::mutex s_cacheMutex;
+        static CachedHostFile s_cache[8];
+        static uint64_t s_useCounter = 0;
+
+        std::lock_guard<std::mutex> cacheLock(s_cacheMutex);
+        CachedHostFile *slot = nullptr;
+        for (CachedHostFile &entry : s_cache)
+        {
+            if (entry.file && entry.path == path)
+            {
+                slot = &entry;
+                break;
+            }
+        }
+        if (!slot)
+        {
+            slot = &s_cache[0];
+            for (CachedHostFile &entry : s_cache)
+            {
+                if (!entry.file)
+                {
+                    slot = &entry;
+                    break;
+                }
+                if (entry.lastUse < slot->lastUse)
+                    slot = &entry;
+            }
+            if (slot->file)
+                std::fclose(slot->file);
+            slot->file = nullptr;
+#if defined(_WIN32)
+            slot->file = _wfopen(path.c_str(), L"rb");
+#else
+            slot->file = std::fopen(path.string().c_str(), "rb");
+#endif
+            slot->path = path;
+            if (!slot->file)
+            {
+                g_lastCdError = -1;
+                return false;
+            }
+        }
+        slot->lastUse = ++s_useCounter;
+
+        if (_fseeki64(slot->file, static_cast<long long>(offsetBytes), SEEK_SET) != 0)
         {
             g_lastCdError = -1;
             return false;
         }
-
-        file.seekg(static_cast<std::streamoff>(offsetBytes), std::ios::beg);
-        if (!file.good())
-        {
-            g_lastCdError = -1;
-            return false;
-        }
-
-        file.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(byteCount));
+        std::fread(dst, 1, byteCount, slot->file);
         g_lastCdError = 0;
         return true;
     }

@@ -303,7 +303,9 @@ namespace ps2_stubs
     {
         (void)rdram;
         const uint32_t reqSize = getRegU32(ctx, 4);
-        setReturnU32(ctx, runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u);
+        const uint32_t addr = runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u;
+        RUNTIME_LOG("[IOPHEAP] alloc size=0x" << std::hex << reqSize << " -> 0x" << addr << std::dec);
+        setReturnU32(ctx, addr);
     }
 
     void sceSifAllocSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -354,7 +356,9 @@ namespace ps2_stubs
     {
         (void)rdram;
         const uint32_t addr = getRegU32(ctx, 4);
-        setReturnS32(ctx, runtime && runtime->freeIopMemory(addr) ? 0 : -1);
+        const bool ok = runtime && runtime->freeIopMemory(addr);
+        RUNTIME_LOG("[IOPHEAP] free 0x" << std::hex << addr << std::dec << (ok ? " ok" : " FAILED"));
+        setReturnS32(ctx, ok ? 0 : -1);
     }
 
     void sceSifFreeSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

@@ -1302,6 +1302,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             }
 
             const uint32_t channelBase = address & 0xFFFFFF00;
+            extern int g_p3Trace;
+            if (g_p3Trace > 0 && (channelBase == 0x1000A000u || channelBase == 0x10009000u))
+            {
+                --g_p3Trace;
+                std::printf("[p3] kick %s chcr=%x\n", channelBase == 0x1000A000u ? "GIF" : "VIF1", value);
+            }
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
@@ -1919,6 +1925,8 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
     return causes;
 }
 
+int g_p3Trace = std::getenv("PS2X_P3_TRACE") ? std::atoi(std::getenv("PS2X_P3_TRACE")) : 0;
+
 void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
 {
     if (m_path3Masked || m_path3MaskedFifo.empty())
@@ -1950,9 +1958,42 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     if (pathId == GifPathId::Path3)
     {
+        if (g_p3Trace > 0)
+        {
+            --g_p3Trace;
+            uint64_t tagLo = 0;
+            std::memcpy(&tagLo, data, 8);
+            std::printf("[p3] pkt %s size=%u flg=%u nloop=%u\n", m_path3Masked ? "MASKED" : "direct", sizeBytes,
+                        static_cast<unsigned>((tagLo >> 58) & 3u), static_cast<unsigned>(tagLo & 0x7FFFu));
+        }
         if (m_path3Masked)
         {
-            m_path3MaskedFifo.emplace_back(data, data + sizeBytes);
+            // Queue whole GIF packets (tag chains ending in EOP). While masked, the GIF DMA stalls at
+            // packet boundaries, and each brief VIF1 MSKPATH3 unmask lets one packet through.
+            uint32_t pos = 0u, start = 0u;
+            while (pos + 16u <= sizeBytes)
+            {
+                uint64_t tagLo = 0;
+                std::memcpy(&tagLo, data + pos, sizeof(tagLo));
+                const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+                const bool eop = ((tagLo >> 15) & 1u) != 0u;
+                const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 3u);
+                uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+                if (nreg == 0u)
+                    nreg = 16u;
+                uint64_t qw = flg == 0u ? static_cast<uint64_t>(nloop) * nreg
+                                        : flg == 1u ? (static_cast<uint64_t>(nloop) * nreg + 1u) / 2u
+                                                    : nloop;
+                pos += 16u;
+                pos = static_cast<uint32_t>(std::min<uint64_t>(sizeBytes, pos + qw * 16u));
+                if (eop)
+                {
+                    m_path3MaskedFifo.emplace_back(data + start, data + pos);
+                    start = pos;
+                }
+            }
+            if (start < sizeBytes)
+                m_path3MaskedFifo.emplace_back(data + start, data + sizeBytes);
             return;
         }
         flushMaskedPath3Packets(false);

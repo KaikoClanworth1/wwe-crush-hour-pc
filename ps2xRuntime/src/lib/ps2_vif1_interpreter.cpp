@@ -1,5 +1,8 @@
+﻿#include <cstdlib>
+#include <cstdio>
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "runtime/gs/ps2_gif_arbiter.h"
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -386,8 +389,37 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             // VIF command docs: MSKPATH3 uses IMMEDIATE bit 15.
             const bool wasMasked = m_path3Masked;
             m_path3Masked = (imm & 0x8000u) != 0u;
+            {
+                extern int g_p3Trace;
+                if (g_p3Trace > 0)
+                {
+                    --g_p3Trace;
+                    std::printf("[p3] mskpath3 %d (queued=%zu)\n", m_path3Masked ? 1 : 0, m_path3MaskedFifo.size());
+                }
+            }
             if (wasMasked && !m_path3Masked)
-                flushMaskedPath3Packets();
+            {
+                static const bool s_releaseAll = std::getenv("PS2X_P3_RELEASE_ALL") != nullptr;
+                if (s_releaseAll)
+                    flushMaskedPath3Packets();
+                else if (!m_path3MaskedFifo.empty())
+                {
+                    // Hardware: PATH3 resumes and the following re-mask takes effect at the next
+                    // packet boundary, so an unmask/mask pair releases exactly one GIF packet.
+                    std::vector<uint8_t> packet = std::move(m_path3MaskedFifo.front());
+                    m_path3MaskedFifo.erase(m_path3MaskedFifo.begin());
+                    if (packet.size() >= 16u)
+                    {
+                        if (m_gifArbiter)
+                        {
+                            m_gifArbiter->submit(GifPathId::Path3, packet.data(), static_cast<uint32_t>(packet.size()), false);
+                            m_gifArbiter->drain();
+                        }
+                        else if (m_gifPacketCallback)
+                            m_gifPacketCallback(packet.data(), static_cast<uint32_t>(packet.size()));
+                    }
+                }
+            }
             continue;
         }
         else if (opcode == VIF_MARK)
@@ -398,10 +430,27 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
         {
+            // Left unmasked, PATH3 keeps streaming; FLUSHA waits for it.
+            if (opcode == VIF_FLUSHA && !m_path3Masked && !m_path3MaskedFifo.empty())
+                flushMaskedPath3Packets();
+            extern int g_p3Trace;
+            if (g_p3Trace > 0 && opcode == VIF_FLUSHA)
+            {
+                --g_p3Trace;
+                std::printf("[p3] flusha\n");
+            }
             continue;
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
+            {
+                extern int g_p3Trace;
+                if (g_p3Trace > 0)
+                {
+                    --g_p3Trace;
+                    std::printf("[p3] mscal %x\n", imm);
+                }
+            }
             uint32_t startPC = (uint32_t)imm * 8u;
 
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
@@ -766,6 +815,40 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         lanes[field] = writeVal;
                     }
 
+                    {
+                        static int s_unpackTrace = std::getenv("PS2X_UNPACK_TRACE") ? std::atoi(std::getenv("PS2X_UNPACK_TRACE")) : 0;
+                        static int s_constTrace = std::getenv("PS2X_VU_CONST_TRACE") ? 400 : 0;
+                        if (s_constTrace > 0 && destVec >= 0x3FAu && srcVec)
+                        {
+                            --s_constTrace;
+                            long long ee = (srcVec >= m_rdram && srcVec < m_rdram + PS2_RAM_SIZE) ? (long long)(srcVec - m_rdram) : -1;
+                            if (ee < 0 && srcVec >= m_scratchpad && srcVec < m_scratchpad + PS2_SCRATCHPAD_SIZE)
+                                ee = 0x70000000ll + (long long)(srcVec - m_scratchpad);
+                            std::printf("[vu-const] vec=0x%x vn=%u vl=%u ee=0x%llx -> %08x %08x %08x %08x\n", destVec, vn, vl, ee,
+                                        lanes[0], lanes[1], lanes[2], lanes[3]);
+                            if (destVec == 0x3FBu && lanes[1] == 0u && lanes[3] == 0u && lanes[0] != 0u)
+                            {
+                                static int s_searches = 0;
+                                if (s_searches++ < 3)
+                                {
+                                    for (uint32_t a = 0; a + 16u <= PS2_RAM_SIZE; a += 4u)
+                                        if (std::memcmp(m_rdram + a, srcVec, 16) == 0)
+                                            std::printf("[vu-const]   found in rdram at 0x%x\n", a);
+                                    for (uint32_t a = 0; a + 16u <= PS2_SCRATCHPAD_SIZE; a += 4u)
+                                        if (std::memcmp(m_scratchpad + a, srcVec, 16) == 0)
+                                            std::printf("[vu-const]   found in spr at 0x%x\n", 0x70000000u + a);
+                                }
+                            }
+                        }
+                        if (s_unpackTrace > 0 && vl == 2u && vn == 3u)
+                        {
+                            --s_unpackTrace;
+                            std::printf("[unpack-trace] V4_8 usn=%d mask=%d mode=%u src=%02x%02x%02x%02x -> %08x %08x %08x %08x addr=%u\n",
+                                        zeroExtend ? 1 : 0, maskEnable ? 1 : 0, vif1_regs.mode,
+                                        srcVec ? srcVec[0] : 0, srcVec ? srcVec[1] : 0, srcVec ? srcVec[2] : 0, srcVec ? srcVec[3] : 0,
+                                        lanes[0], lanes[1], lanes[2], lanes[3], destVec);
+                        }
+                    }
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
                 }
             }

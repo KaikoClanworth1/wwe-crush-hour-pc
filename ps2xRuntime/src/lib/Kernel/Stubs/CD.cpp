@@ -1,5 +1,7 @@
-#include "Common.h"
+﻿#include "Common.h"
 #include "CD.h"
+#include <cstdlib>
+#include <limits>
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 
@@ -79,20 +81,36 @@ namespace ps2_stubs
                 return;
             }
 
-            const uint64_t tick = currentCdStreamTick(runtime);
-            if (tick <= g_cdStreamTiming.lastVSyncTick)
+            // The data lives on the host disk: by default deliver streamed sectors immediately
+            // (PS2X_CD_STREAM_TIMING=1 restores disc-speed pacing). Paced production can deadlock
+            // games that poll sceCdStRead from inside MPEG callbacks, where VSync cannot advance.
+            static const bool s_pacedStreaming = [] {
+                const char *v = std::getenv("PS2X_CD_STREAM_TIMING");
+                return v && *v == '1';
+            }();
+
+            uint64_t elapsedProduction = 0u;
+            if (!s_pacedStreaming)
             {
-                return;
+                elapsedProduction = std::numeric_limits<uint32_t>::max();
             }
+            else
+            {
+                const uint64_t tick = currentCdStreamTick(runtime);
+                if (tick <= g_cdStreamTiming.lastVSyncTick)
+                {
+                    return;
+                }
 
-            const uint64_t elapsedTicks = tick - g_cdStreamTiming.lastVSyncTick;
-            g_cdStreamTiming.lastVSyncTick = tick;
+                const uint64_t elapsedTicks = tick - g_cdStreamTiming.lastVSyncTick;
+                g_cdStreamTiming.lastVSyncTick = tick;
 
-            // 59.94 Hz field clock: sectors = fields * sectors/s * 1001 / 60000.
-            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * kNtScFieldsPerSecondDenominator;
-            const uint64_t accumulated = g_cdStreamTiming.productionRemainder + elapsedTicks * unitsPerTick;
-            const uint64_t elapsedProduction = accumulated / kNtScFieldsPerSecondNumerator;
-            g_cdStreamTiming.productionRemainder = accumulated % kNtScFieldsPerSecondNumerator;
+                // 59.94 Hz field clock: sectors = fields * sectors/s * 1001 / 60000.
+                const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * kNtScFieldsPerSecondDenominator;
+                const uint64_t accumulated = g_cdStreamTiming.productionRemainder + elapsedTicks * unitsPerTick;
+                elapsedProduction = accumulated / kNtScFieldsPerSecondNumerator;
+                g_cdStreamTiming.productionRemainder = accumulated % kNtScFieldsPerSecondNumerator;
+            }
             if (elapsedProduction == 0u)
             {
                 return;
@@ -825,7 +843,7 @@ namespace ps2_stubs
                 const bool hitStreamEnd = g_cdStreamingEndLbn != 0xFFFFFFFFu && g_cdStreamingLbn >= g_cdStreamingEndLbn;
                 notifyMpegCdStreamDataProduced(static_cast<uint32_t>(readBytes), hitStreamEnd);
 
-                if (g_cdStReadTraceCount < 32u)
+                if (g_cdStReadTraceCount < 32u && std::getenv("PS2X_CD_LOG"))
                 {
                     std::cerr << "[sceCdStRead] requested=" << state.requestedSectors
                               << " accumulated=" << state.sectorsRead
