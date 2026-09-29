@@ -540,6 +540,16 @@ struct GSD3D11Backend::Impl
             y1 = std::min(rt.upY1, rt.h - 1u);
         }
         const uint32_t hh = y1 - y0 + 1u;
+        {
+            static int s_log = std::getenv("PS2X_RT_UPLOAD_LOG") ? 200 : 0;
+            if (s_log > 0)
+            {
+                --s_log;
+                std::printf("[rt-upload] fbp=%u fbw=%u psm=%u %ux%u rows=%u-%u reason=%s lastUpload=%u\n", rt.fbpBlock, rt.fbw, rt.psm,
+                            rt.w, rt.h, y0, y1, syncReason ? syncReason : "?", lastUploadDbp);
+                std::fflush(stdout);
+            }
+        }
         std::vector<uint32_t> pixels;
         decodeFrame(rt.fbpBlock, rt.fbw, rt.psm, rt.w, hh, pixels, y0);
         ComPtr<ID3D11Texture2D> staging;
@@ -1199,7 +1209,13 @@ struct GSD3D11Backend::Impl
         const auto &c = st.context;
 
         const uint32_t fbpBlock = framePageBaseToBlock(c.frame.fbp);
-        const uint32_t needH = std::min<uint32_t>(2048u, static_cast<uint32_t>(c.scissor.y1) + 1u);
+        // Size by what is actually drawn: a full-VRAM scissor would otherwise grow the frame buffer
+        // over the texture area, and every texture upload then forces an RT re-upload.
+        float maxY = 0.0f;
+        for (const Vtx &v : pending)
+            maxY = std::max(maxY, v.y);
+        const uint32_t drawnH = static_cast<uint32_t>(std::max(0.0f, std::ceil(maxY))) + 1u;
+        const uint32_t needH = std::min<uint32_t>({2048u, static_cast<uint32_t>(c.scissor.y1) + 1u, drawnH});
         RenderTarget *rt = getRt(fbpBlock, c.frame.fbw, c.frame.psm, needH);
         if (!rt)
         {

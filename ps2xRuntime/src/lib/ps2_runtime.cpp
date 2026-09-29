@@ -2309,6 +2309,23 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 
 // Debug aid: PS2X_EE_WATCH=<hex vaddr> logs guest stores (special-address path) that cover it.
+// Frame limiter threshold used by the patched ps2_wait_for_vsync (tools/patch_60fps.py): number of
+// VSyncs a game frame waits for. 1 = 60 fps when TargetFPS >= 60 (PS2X_FPS30=1 restores 30 fps).
+extern "C" uint32_t ps2x_frame_vsync_threshold()
+{
+    static const uint32_t s_threshold = []() -> uint32_t
+    {
+        if (const char *v = std::getenv("PS2X_FPS30"); v && *v && *v != '0')
+            return 2u;
+#if defined(PS2X_NATIVE_HOST)
+        return ps2host::config().targetFps >= 60u ? 1u : 2u;
+#else
+        return 2u;
+#endif
+    }();
+    return s_threshold;
+}
+
 static void eeWatchStore(const R5900Context *ctx, uint32_t vaddr, uint32_t size, uint64_t lo, uint64_t hi)
 {
     static const long long s_watch = std::getenv("PS2X_EE_WATCH") ? std::strtoll(std::getenv("PS2X_EE_WATCH"), nullptr, 16) : -1;
