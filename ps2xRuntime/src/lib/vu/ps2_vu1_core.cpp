@@ -17,6 +17,7 @@ uint64_t g_vuNextCommit[2] = {0, 0};
 uint64_t g_vuStatPairs = 0, g_vuStatCycles = 0, g_vuStatRuns = 0, g_vuStatStall = 0, g_vuStatBudgetHits = 0; }
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <filesystem>
 #include <limits>
 #include <ps2_log.h>
@@ -1674,6 +1675,64 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
     m_stopRequested = true;
 }
 
+namespace ps2vu1n { extern uint64_t g_nativeRuns, g_nativeFallbacks, g_nativeMisses; }
+bool ps2vu1nTryRun(VU1State &state, uint8_t *vuData, uint32_t dataSize, PS2Memory *memory,
+                   uint64_t codeHash, uint32_t maxCycles, bool &ended);
+
+namespace
+{
+    // Identifies the resident VU1 microcode image (rehashed only when MPG changes it) and, with
+    // PS2X_VU_DUMP=<dir>, writes each distinct image + entry point for the offline VU1 recompiler.
+    uint64_t g_vu1CodeGen = ~0ull;
+    uint64_t g_vu1CodeHash = 0;
+    uint64_t g_vu1HashChanges = 0;
+
+    void noteVu1Program(const uint8_t *code, uint32_t size, uint64_t generation, uint32_t pc)
+    {
+        if (generation != g_vu1CodeGen)
+        {
+            g_vu1CodeGen = generation;
+            uint64_t h = 1469598103934665603ull;
+            for (uint32_t i = 0; i < size; i += 8)
+            {
+                uint64_t w;
+                std::memcpy(&w, code + i, 8);
+                h = (h ^ w) * 1099511628211ull;
+                h ^= h >> 29;
+            }
+            if (h != g_vu1CodeHash)
+                ++g_vu1HashChanges;
+            g_vu1CodeHash = h;
+        }
+        static const char *s_dumpDir = std::getenv("PS2X_VU_DUMP");
+        if (!s_dumpDir || !*s_dumpDir)
+            return;
+        static std::vector<std::pair<uint64_t, uint32_t>> s_seen;
+        static std::vector<uint64_t> s_images;
+        const auto key = std::make_pair(g_vu1CodeHash, pc);
+        if (std::find(s_seen.begin(), s_seen.end(), key) != s_seen.end())
+            return;
+        s_seen.push_back(key);
+        char path[1024];
+        if (std::find(s_images.begin(), s_images.end(), g_vu1CodeHash) == s_images.end())
+        {
+            s_images.push_back(g_vu1CodeHash);
+            std::snprintf(path, sizeof(path), "%s/vu1_%016llx.bin", s_dumpDir, static_cast<unsigned long long>(g_vu1CodeHash));
+            if (FILE *f = std::fopen(path, "wb"))
+            {
+                std::fwrite(code, 1, size, f);
+                std::fclose(f);
+            }
+        }
+        std::snprintf(path, sizeof(path), "%s/vu1_entries.txt", s_dumpDir);
+        if (FILE *f = std::fopen(path, "a"))
+        {
+            std::fprintf(f, "%016llx %04x\n", static_cast<unsigned long long>(g_vu1CodeHash), pc);
+            std::fclose(f);
+        }
+    }
+}
+
 void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint8_t *vuData, uint32_t dataSize,
                              GS &gs, PS2Memory *memory,
@@ -1683,6 +1742,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
     g_vuTraceProgramStart = m_state.pc;
+    if (m_unit == Unit::VU1 && memory)
+        noteVu1Program(vuCode, codeSize, memory->getVU1CodeGeneration(), m_state.pc);
     if (g_vuTracePc == 0xFFFFFFFFu)
     {
         const char *t = std::getenv("PS2X_VU1_TRACE_PC");
@@ -1722,6 +1783,21 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
+    if (m_unit == Unit::VU1 && memory && g_vuTraceRemaining < 0)
+    {
+        bool ended = false;
+        if (ps2vu1nTryRun(m_state, vuData, dataSize, memory, g_vu1CodeHash, maxCycles, ended))
+        {
+            ++g_vuStatRuns;
+            if (ended)
+            {
+                m_state.ebit = false;
+                m_state.haltAfterDelaySlot = false;
+                m_state.branchPending = false;
+                return;
+            }
+        }
+    }
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -1734,6 +1810,24 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.itop = itop;
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
+    if (m_unit == Unit::VU1 && memory && g_vuTraceRemaining < 0 && !m_state.branchPending &&
+        !m_state.ebit && !m_state.haltAfterDelaySlot && !pipelinesPending())
+    {
+        // MSCNT: continue where the previous program stopped (RenderWare runs every batch this way).
+        noteVu1Program(vuCode, codeSize, memory->getVU1CodeGeneration(), m_state.pc);
+        bool ended = false;
+        if (ps2vu1nTryRun(m_state, vuData, dataSize, memory, g_vu1CodeHash, maxCycles, ended))
+        {
+            ++g_vuStatRuns;
+            if (ended)
+            {
+                m_state.ebit = false;
+                m_state.haltAfterDelaySlot = false;
+                m_state.branchPending = false;
+                return;
+            }
+        }
+    }
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -2013,9 +2107,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (s_stats && now - s_last >= std::chrono::seconds(2))
         {
             s_last = now;
-            std::printf("[vu-stats] runs=%llu pairs=%llu cycles=%llu budgetHits=%llu maxCycles=%u\n",
+            std::printf("[vu-stats] runs=%llu pairs=%llu cycles=%llu budgetHits=%llu maxCycles=%u codeChanges=%llu native=%llu fallback=%llu miss=%llu hash=%016llx\n",
                         (unsigned long long)g_vuStatRuns, (unsigned long long)g_vuStatPairs,
-                        (unsigned long long)g_vuStatCycles, (unsigned long long)g_vuStatBudgetHits, maxCycles);
+                        (unsigned long long)g_vuStatCycles, (unsigned long long)g_vuStatBudgetHits, maxCycles,
+                        (unsigned long long)g_vu1HashChanges, (unsigned long long)ps2vu1n::g_nativeRuns,
+                        (unsigned long long)ps2vu1n::g_nativeFallbacks, (unsigned long long)ps2vu1n::g_nativeMisses,
+                        (unsigned long long)g_vu1CodeHash);
+            g_vu1HashChanges = 0;
+            ps2vu1n::g_nativeRuns = ps2vu1n::g_nativeFallbacks = ps2vu1n::g_nativeMisses = 0;
             g_vuStatRuns = g_vuStatPairs = g_vuStatCycles = g_vuStatBudgetHits = 0;
         }
     }

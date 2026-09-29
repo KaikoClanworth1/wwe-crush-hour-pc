@@ -34,6 +34,12 @@ endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ReleaseMode.cmake")
 
+# Native Windows host: Win32 + Direct3D 11 + XAudio2 + XInput (no raylib).
+option(PS2X_NATIVE_HOST "Use the native Win32/D3D11/XAudio2/XInput host instead of raylib" ${WIN32})
+if(PS2X_NATIVE_HOST)
+    set(PS2X_ENABLE_DEBUG_UI OFF CACHE BOOL "" FORCE)
+endif()
+
 set(PS2X_IS_VITA OFF)
 
 if((CMAKE_C_COMPILER MATCHES "arm-vita-eabi") OR
@@ -65,6 +71,8 @@ if(PS2X_IS_VITA)
     endif()
 
     include("${PS2X_VITASDK}/share/vita.cmake" REQUIRED)
+elseif(PS2X_NATIVE_HOST)
+    include(FetchContent)
 else()
     include(FetchContent)
     set(FETCHCONTENT_QUIET FALSE)
@@ -234,6 +242,8 @@ if(PS2X_IS_VITA)
         c
         pthread
     )
+elseif(PS2X_NATIVE_HOST)
+    target_link_libraries(ps2_host_backend INTERFACE d3d11 dxgi d3dcompiler xaudio2 xinput winmm)
 else()
     target_link_libraries(ps2_host_backend INTERFACE raylib)
 
@@ -396,6 +406,21 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
+if(PS2X_NATIVE_HOST)
+    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/gs/gs_d3d11_backend.cpp src/lib/audio/native_seng.cpp)
+
+    # Private so the (huge) recompiled runner target is not rebuilt when host code changes.
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_NATIVE_HOST=1 NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# Statically recompiled VU1 microcode (tools/vu1_recomp.py -> <game dir>/../vu1/vu1_native.cpp).
+target_sources(ps2_runtime PRIVATE src/lib/vu/vu1_native_glue.cpp)
+set(PS2X_VU1_NATIVE_SRC "${PS2X_GAME_DIR}/../vu1/vu1_native.cpp")
+if(PS2X_GAME_DIR AND EXISTS "${PS2X_VU1_NATIVE_SRC}")
+    target_sources(ps2_runtime PRIVATE "${PS2X_VU1_NATIVE_SRC}")
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_VU1_NATIVE=1)
+endif()
+
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2_RUNTIME_LOGS=1
@@ -437,9 +462,15 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
-file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
-)
+set(PS2X_GAME_DIR "" CACHE PATH "Directory holding recompiler output (cpp + headers); empty = src/runner")
+
+if(PS2X_GAME_DIR)
+    file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS "${PS2X_GAME_DIR}/*.cpp")
+else()
+    file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
+    )
+endif()
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
@@ -475,9 +506,14 @@ if(PS2X_ENABLE_RUNNER_PCH)
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
     )
 
+    if(PS2X_GAME_DIR)
+        set(PS2X_GENERATED_HEADER_DIR "${PS2X_GAME_DIR}")
+    else()
+        set(PS2X_GENERATED_HEADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    endif()
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        "${PS2X_GENERATED_HEADER_DIR}/ps2_recompiled_functions.h"
+        "${PS2X_GENERATED_HEADER_DIR}/ps2_recompiled_stubs.h")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()
@@ -511,6 +547,10 @@ target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
 )
+
+if(PS2X_GAME_DIR)
+    target_include_directories(ps2EntryRunner PRIVATE "${PS2X_GAME_DIR}")
+endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
@@ -572,8 +612,13 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     endif()
 endif()
 
-# Work around WinAPI vs raylib symbol clash for CloseWindow on x64
 if(MSVC)
+    # Map file lets tools/prof_report.py resolve sampled addresses to functions.
+    target_link_options(ps2EntryRunner PRIVATE "/MAP")
+endif()
+
+# Work around WinAPI vs raylib symbol clash for CloseWindow on x64
+if(MSVC AND NOT PS2X_NATIVE_HOST)
     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
 endif()
 

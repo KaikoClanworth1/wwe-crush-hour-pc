@@ -306,6 +306,8 @@ struct GSD3D11Backend::Impl
         ComPtr<ID3D11ShaderResourceView> srv;
         bool gpuDirty = false;
         bool needsUpload = false;
+        // Native rows whose VRAM contents changed since the last upload (inclusive).
+        uint32_t upY0 = 0xFFFFFFFFu, upY1 = 0u;
         // Native pixel rows written on the GPU since the last sync (inclusive range).
         uint32_t dirtyY0 = 0xFFFFFFFFu, dirtyY1 = 0u;
         uint64_t lastUse = 0;
@@ -470,7 +472,7 @@ struct GSD3D11Backend::Impl
     }
 
     void blit(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, float dstW, float dstH,
-              float u0, float v0, float us, float vs_, bool linear)
+              float u0, float v0, float us, float vs_, bool linear, float dstX = 0.0f, float dstY = 0.0f)
     {
         D3D11_MAPPED_SUBRESOURCE m{};
         if (SUCCEEDED(ctx->Map(blitCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
@@ -479,9 +481,9 @@ struct GSD3D11Backend::Impl
             std::memcpy(m.pData, r, sizeof(r));
             ctx->Unmap(blitCb.Get(), 0);
         }
-        D3D11_VIEWPORT vp{0, 0, dstW, dstH, 0, 1};
+        D3D11_VIEWPORT vp{dstX, dstY, dstW, dstH, 0, 1};
         ctx->RSSetViewports(1, &vp);
-        D3D11_RECT sc{0, 0, static_cast<LONG>(dstW), static_cast<LONG>(dstH)};
+        D3D11_RECT sc{static_cast<LONG>(dstX), static_cast<LONG>(dstY), static_cast<LONG>(dstX + dstW), static_cast<LONG>(dstY + dstH)};
         ctx->RSSetScissorRects(1, &sc);
         ctx->RSSetState(raster.Get());
         ctx->OMSetRenderTargets(1, &dst, nullptr);
@@ -504,14 +506,15 @@ struct GSD3D11Backend::Impl
     }
 
     // Decode a frame-buffer region of local memory to RGBA8 (alpha normalized as a/128).
-    void decodeFrame(uint32_t fbpBlock, uint32_t fbw, uint8_t psm, uint32_t w, uint32_t h, std::vector<uint32_t> &out)
+    void decodeFrame(uint32_t fbpBlock, uint32_t fbw, uint8_t psm, uint32_t w, uint32_t h, std::vector<uint32_t> &out,
+                     uint32_t y0 = 0u)
     {
         out.assign(static_cast<size_t>(w) * h, 0u);
         const uint32_t readPsm = is16(psm) ? psm : (is24(psm) ? GS_PSM_CT24 : GS_PSM_CT32);
         for (uint32_t y = 0; y < h; ++y)
             for (uint32_t x = 0; x < w; ++x)
             {
-                uint32_t c = mem.ReadVram(readPsm, fbpBlock, fbw, x, y);
+                uint32_t c = mem.ReadVram(readPsm, fbpBlock, fbw, x, y0 + y);
                 uint32_t a;
                 if (is16(psm))
                 {
@@ -529,17 +532,27 @@ struct GSD3D11Backend::Impl
 
     void uploadRtFromVram(RenderTarget &rt)
     {
+        // Only the rows invalidated since the last upload (whole target for a fresh one).
+        uint32_t y0 = 0u, y1 = rt.h - 1u;
+        if (rt.needsUpload && rt.upY0 != 0xFFFFFFFFu)
+        {
+            y0 = std::min(rt.upY0, rt.h - 1u);
+            y1 = std::min(rt.upY1, rt.h - 1u);
+        }
+        const uint32_t hh = y1 - y0 + 1u;
         std::vector<uint32_t> pixels;
-        decodeFrame(rt.fbpBlock, rt.fbw, rt.psm, rt.w, rt.h, pixels);
+        decodeFrame(rt.fbpBlock, rt.fbw, rt.psm, rt.w, hh, pixels, y0);
         ComPtr<ID3D11Texture2D> staging;
-        if (!createTexture(rt.w, rt.h, D3D11_BIND_SHADER_RESOURCE, staging))
+        if (!createTexture(rt.w, hh, D3D11_BIND_SHADER_RESOURCE, staging))
             return;
         ctx->UpdateSubresource(staging.Get(), 0, nullptr, pixels.data(), rt.w * 4u, 0);
         ComPtr<ID3D11ShaderResourceView> srv;
         dev->CreateShaderResourceView(staging.Get(), nullptr, &srv);
-        blit(srv.Get(), rt.rtv.Get(), static_cast<float>(rt.w * scale), static_cast<float>(rt.h * scale),
-             0, 0, 1, 1, false);
+        blit(srv.Get(), rt.rtv.Get(), static_cast<float>(rt.w * scale), static_cast<float>(hh * scale),
+             0, 0, 1, 1, false, 0.0f, static_cast<float>(y0 * scale));
         rt.needsUpload = false;
+        rt.upY0 = 0xFFFFFFFFu;
+        rt.upY1 = 0u;
         ++statUploads;
     }
 
@@ -643,8 +656,21 @@ struct GSD3D11Backend::Impl
         {
             uint32_t a, b;
             rtPageSpan(rt, a, b);
-            if (spansOverlap(first, last, a, b))
-                rt.needsUpload = true;
+            if (!spansOverlap(first, last, a, b))
+                continue;
+            uint32_t pw, ph;
+            pageSize(rt.psm, pw, ph);
+            const uint32_t pagesPerRow = std::max<uint32_t>(1u, (rt.fbw * 64u + pw - 1u) / pw);
+            const uint32_t basePage = rt.fbpBlock / 32u;
+            const uint32_t lo = std::max(first, basePage) - basePage;
+            const uint32_t hi = std::min(last, b) - basePage;
+            const uint32_t rowY0 = (lo / pagesPerRow) * ph;
+            const uint32_t rowY1 = (hi / pagesPerRow + 1u) * ph - 1u;
+            if (rowY0 >= rt.h)
+                continue;
+            rt.needsUpload = true;
+            rt.upY0 = std::min(rt.upY0, rowY0);
+            rt.upY1 = std::max(rt.upY1, std::min(rowY1, rt.h - 1u));
         }
     }
 

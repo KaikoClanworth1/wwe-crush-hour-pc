@@ -8,6 +8,7 @@
 #endif
 #include <windows.h>
 #include <timeapi.h>
+#include <tlhelp32.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi1_3.h>
@@ -794,6 +795,7 @@ float4 ps_main(VsOut i) : SV_Target
         std::thread g_profThread;
         HANDLE g_profTarget = nullptr;
         std::string g_profPath;
+        std::unordered_map<std::string, uint64_t> g_profStacks;
     }
 
     void profileCurrentThread()
@@ -817,17 +819,48 @@ float4 ps_main(VsOut i) : SV_Target
                     std::fprintf(f, "base %llx samples %llu\n", (unsigned long long)base, (unsigned long long)samples);
                     for (const auto &[rip, n] : hist)
                         std::fprintf(f, "%llx %llu\n", (unsigned long long)rip, (unsigned long long)n);
+                    for (const auto &[stack, n] : g_profStacks)
+                        std::fprintf(f, "S %llu%s\n", (unsigned long long)n, stack.c_str());
                     std::fclose(f);
                 }
             };
             auto lastDump = std::chrono::steady_clock::now();
             while (g_profRun.load())
             {
-                if (SuspendThread(g_profTarget) != static_cast<DWORD>(-1))
+                // PS2X_PROFILE_ALL=1 samples every thread of the process (guest threads run on their own
+                // host threads, so the game thread alone mostly shows hand-off waits).
+                static const bool s_all = std::getenv("PS2X_PROFILE_ALL") != nullptr;
+                static std::vector<HANDLE> s_threads;
+                static auto s_lastEnum = std::chrono::steady_clock::time_point{};
+                if (s_all && std::chrono::steady_clock::now() - s_lastEnum > std::chrono::milliseconds(500))
+                {
+                    s_lastEnum = std::chrono::steady_clock::now();
+                    for (HANDLE h : s_threads)
+                        CloseHandle(h);
+                    s_threads.clear();
+                    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                    if (snap != INVALID_HANDLE_VALUE)
+                    {
+                        THREADENTRY32 te{};
+                        te.dwSize = sizeof(te);
+                        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
+                        {
+                            if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId())
+                                continue;
+                            if (HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID))
+                                s_threads.push_back(h);
+                        }
+                        CloseHandle(snap);
+                    }
+                }
+                std::vector<HANDLE> targets = s_all ? s_threads : std::vector<HANDLE>{g_profTarget};
+                for (HANDLE target : targets)
+                {
+                if (SuspendThread(target) != static_cast<DWORD>(-1))
                 {
                     CONTEXT c{};
                     c.ContextFlags = CONTEXT_FULL;
-                    if (GetThreadContext(g_profTarget, &c))
+                    if (GetThreadContext(target, &c))
                     {
                         // Attribute samples outside the exe to the first caller frame inside it.
                         const uint64_t modBase = base;
@@ -854,10 +887,39 @@ float4 ps_main(VsOut i) : SV_Target
                         }
                         if (c.Rip < modBase || c.Rip >= modEnd)
                             attributed = (u.Rip >= modBase && u.Rip < modEnd) ? (u.Rip | 0x8000000000000000ull) : 0x7FFFFFFFFFFFFFFFull;
+                        // No allocation while the target is suspended (it may hold the heap lock).
+                        uint64_t frames[10];
+                        int nframes = 0;
+                        CONTEXT w = (c.Rip >= modBase && c.Rip < modEnd) ? c : u;
+                        for (; nframes < 10 && w.Rip >= modBase && w.Rip < modEnd; ++nframes)
+                        {
+                            frames[nframes] = w.Rip;
+                            DWORD64 imageBase = 0;
+                            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(w.Rip, &imageBase, nullptr);
+                            if (!fn)
+                            {
+                                ++nframes;
+                                break;
+                            }
+                            PVOID handlerData = nullptr;
+                            DWORD64 establisher = 0;
+                            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, w.Rip, fn, &w, &handlerData, &establisher, nullptr);
+                        }
+                        ResumeThread(target);
                         ++hist[attributed];
+                        std::string key;
+                        for (int i = 0; i < nframes; ++i)
+                        {
+                            char buf[24];
+                            std::snprintf(buf, sizeof(buf), " %llx", static_cast<unsigned long long>(frames[i]));
+                            key += buf;
+                        }
+                        ++g_profStacks[key];
                         ++samples;
+                        continue;
                     }
-                    ResumeThread(g_profTarget);
+                    ResumeThread(target);
+                }
                 }
                 Sleep(1);
                 if (std::chrono::steady_clock::now() - lastDump > std::chrono::seconds(5))
