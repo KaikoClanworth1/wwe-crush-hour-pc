@@ -1,4 +1,4 @@
-#include "ps2recomp/ps2_recompiler.h"
+﻿#include "ps2recomp/ps2_recompiler.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/types.h"
 #include "ps2recomp/elf_parser.h"
@@ -6,6 +6,7 @@
 #include "ps2_runtime_calls.h"
 #include <iostream>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <algorithm>
 #include <stdexcept>
@@ -108,6 +109,7 @@ namespace ps2recomp
             output << "#include <ps2_recompiled_stubs.h>\n";
             output << "#include \"ps2_syscalls.h\"\n";
             output << "#include \"ps2_stubs.h\"\n";
+            output << "extern \"C\" bool ps2x_cpcond0(PS2Runtime *runtime); // BC0F/BC0T\n";
             output << "#ifdef _DEBUG\n";
             output << "#include \"ps2_log.h\"\n";
             output << "#endif\n";
@@ -2261,6 +2263,19 @@ namespace ps2recomp
 
     bool PS2Recompiler::writeToFile(const std::string &path, const std::string &content)
     {
+        // Leave identical files untouched so incremental builds only recompile what changed.
+        {
+            std::ifstream existing(path);
+            if (existing)
+            {
+                std::string current((std::istreambuf_iterator<char>(existing)), std::istreambuf_iterator<char>());
+                if (current == content)
+                {
+                    return true;
+                }
+            }
+        }
+
         std::ofstream file(path);
         if (!file)
         {

@@ -2367,6 +2367,17 @@ void ps2DumpBranchRing()
 }
 #endif
 
+// COP0 condition for BC0F/BC0T (CPCOND0): true when every DMA channel selected in D_PCR.CPC has its
+// D_STAT channel-end bit set. Games spin on it (bc0f loop) while a DMA transfer is running.
+extern void ps2AsyncDmaApplyCompletions();
+extern "C" bool ps2x_cpcond0(PS2Runtime *runtime)
+{
+    ps2AsyncDmaApplyCompletions();
+    const uint32_t pcr = runtime->memory().readIORegister(0x1000E020u);
+    const uint32_t stat = runtime->memory().readIORegister(0x1000E010u);
+    return ((~pcr | stat) & 0x3FFu) == 0x3FFu;
+}
+
 extern "C" uint32_t ps2x_frame_vsync_threshold()
 {
     static const uint32_t s_threshold = []() -> uint32_t

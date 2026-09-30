@@ -48,7 +48,8 @@ namespace ps2recomp
             ss << "#include <ps2_recompiled_functions.h>\n";
             ss << "#include <ps2_recompiled_stubs.h>\n\n";
             ss << "#include \"ps2_syscalls.h\"\n";
-            ss << "#include \"ps2_stubs.h\"\n\n";
+            ss << "#include \"ps2_stubs.h\"\n";
+            ss << "extern \"C\" bool ps2x_cpcond0(PS2Runtime *runtime); // BC0F/BC0T\n\n";
             ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
             ss << "#include \"ps2_log.h\"\n";
             ss << "#endif\n\n";

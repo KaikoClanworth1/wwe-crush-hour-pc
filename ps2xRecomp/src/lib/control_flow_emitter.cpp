@@ -426,6 +426,14 @@ namespace ps2recomp
             default:
                 return "false";
             }
+        case OPCODE_COP0:
+            if (m_branchInst.rs == COP0_BC)
+            {
+                // BC0F/BC0T test CPCOND0 (D_PCR-selected DMA channels finished), e.g. DMA wait loops.
+                const uint8_t bcCond = static_cast<uint8_t>(m_branchInst.rt);
+                return (bcCond == 0u || bcCond == 2u) ? "!ps2x_cpcond0(runtime)" : "ps2x_cpcond0(runtime)";
+            }
+            break;
         case OPCODE_COP1:
             if (m_branchInst.rs == COP1_BC)
             {
