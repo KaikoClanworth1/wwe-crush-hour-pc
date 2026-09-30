@@ -47,6 +47,10 @@ namespace
     thread_local bool t_dmaWorker = false;
     std::vector<uint8_t> g_chainPool;    // recycled VIF1 chain gather buffer (synchronous mode)
     std::vector<uint8_t> g_gifChainPool; // same for the GIF channel (the per-frame PATH3 texture stream)
+    // Async mode: chain buffers travel with the job; the worker hands them back here so the EE does not
+    // regrow multi-MB vectors on every kick.
+    std::mutex g_asyncChainPoolM;
+    std::vector<std::vector<uint8_t>> g_asyncChainPool;
     thread_local bool t_asyncKick = false; // processPendingTransfers() called for a VIF1/GIF CHCR kick
 
     bool asyncDmaEnabled()
@@ -1518,6 +1522,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         chainBuf = std::move(g_gifChainPool);
                         chainBuf.clear();
                     }
+                    else if (asyncDmaEnabled())
+                    {
+                        std::lock_guard poolLock(g_asyncChainPoolM);
+                        if (!g_asyncChainPool.empty())
+                        {
+                            chainBuf = std::move(g_asyncChainPool.back());
+                            g_asyncChainPool.pop_back();
+                            chainBuf.clear();
+                        }
+                    }
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -2165,6 +2179,13 @@ void PS2Memory::processPendingTransfers()
             g_async.jobs.emplace_back([run, gif = std::move(gif), vif0 = std::move(vif0), vif1 = std::move(vif1)]() mutable
             {
                 const uint32_t bits = run(gif, vif0, vif1);
+                {
+                    std::lock_guard poolLock(g_asyncChainPoolM);
+                    for (auto *list : {&gif, &vif0, &vif1})
+                        for (auto &t : *list)
+                            if (t.chainData.capacity() != 0u && g_asyncChainPool.size() < 16u)
+                                g_asyncChainPool.push_back(std::move(t.chainData));
+                }
                 std::lock_guard doneLock(g_async.doneM);
                 g_async.doneChannels.push_back(bits);
                 extern std::atomic<uint64_t> g_asyncDone;
