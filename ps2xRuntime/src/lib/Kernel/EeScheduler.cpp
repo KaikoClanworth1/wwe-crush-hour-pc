@@ -89,6 +89,30 @@ namespace
     // re-enables it (EnableDmac). Matters once DMA completes asynchronously (PS2X_ASYNC_DMA).
     uint32_t g_latchedDmacCauses = 0u;
     bool g_dmacDispatchNow = false; // delivering a delayed DMAC interrupt (bypass the delay)
+
+    // Debug: ring of scheduler events (invocation start/finish, thread switches) dumped when a thread
+    // jumps to a missing target. evt: 'S' start invocation, 'F' finish, 'T' thread switch.
+    struct SchedEvt { char evt; int thread; int kind; uint32_t invPc; uint32_t threadPc; uint32_t threadSp; uint32_t threadRa; };
+    SchedEvt g_schedRing[128];
+    uint32_t g_schedRingPos = 0;
+    void schedRecord(char evt, int thread, int kind, uint32_t invPc, const R5900Context &base)
+    {
+        const R5900Context *cp = &base;
+        g_schedRing[g_schedRingPos++ & 127u] = {evt, thread, kind, invPc, base.pc, GPR_U32(cp, 29), GPR_U32(cp, 31)};
+    }
+    void schedDump()
+    {
+        std::printf("[sched-ring] last scheduler events (oldest first): evt thread kind invPc | base pc sp ra\n");
+        for (uint32_t i = 0; i < 128u; ++i)
+        {
+            const SchedEvt &e = g_schedRing[(g_schedRingPos + i) & 127u];
+            if (!e.evt)
+                continue;
+            std::printf("  %c t=%d k=%d inv=%08x | pc=%08x sp=%08x ra=%08x\n", e.evt, e.thread, e.kind, e.invPc, e.threadPc,
+                        e.threadSp, e.threadRa);
+        }
+        std::fflush(stdout);
+    }
 }
 
 void ps2AsyncDmaSetNotifier(std::function<void()> fn); // ps2_memory.cpp
@@ -206,6 +230,7 @@ void EeScheduler::run()
                 {
                     SET_GPR_U32(&invocation.context, 29, invocationStackTop());
                 }
+                schedRecord('S', owner->id, static_cast<int>(invocation.kind), invocation.context.pc, owner->context);
                 owner->invocations.push_back(std::move(invocation));
             }
         }
@@ -248,6 +273,7 @@ void EeScheduler::run()
             {
                 GuestInvocation completed = std::move(running->invocations.back());
                 running->invocations.pop_back();
+                schedRecord('F', running->id, static_cast<int>(completed.kind), completed.context.pc, running->context);
                 if (completed.onComplete)
                 {
                     try
@@ -278,10 +304,23 @@ void EeScheduler::run()
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
+            {
+                static int s_hijackLog = std::getenv("PS2X_HIJACK_LOG") ? 200 : 0;
+                if (s_hijackLog > 0 && invocation.kind != GuestInvocationKind::Interrupt &&
+                    (context.cop0_status & 0x10000u) == 0u)
+                {
+                    --s_hijackLog;
+                    const R5900Context *cp = &context;
+                    std::printf("[ee] non-interrupt invocation kind=%d pc=0x%x runs on thread %d inside DI (pc=0x%x ra=0x%x)\n",
+                                static_cast<int>(invocation.kind), invocation.context.pc, running->id, context.pc,
+                                GPR_U32(cp, 31));
+                }
+            }
             if (getRegU32(&invocation.context, 29) == 0u)
             {
                 SET_GPR_U32(&invocation.context, 29, invocationStackTop());
             }
+            schedRecord('S', running->id, static_cast<int>(invocation.kind), invocation.context.pc, running->context);
             running->invocations.push_back(std::move(invocation));
             continue;
         }
@@ -294,6 +333,7 @@ void EeScheduler::run()
             }
             else
             {
+                schedDump();
                 m_runtime.reportMissingFunction(m_rdram,
                                                 &context,
                                                 context.pc,
@@ -1195,13 +1235,17 @@ uint32_t EeScheduler::invocationStackTop()
     {
         return existing->second;
     }
-    constexpr uint32_t kInvocationStackSize = 0x4000u;
+    // 16 KB overflowed: the MPEG streaming callback chain (MpegNodata -> strFileVidtexRead) ran
+    // 0x4040 bytes deep and wrote into the neighbouring invocation stack.
+    constexpr uint32_t kInvocationStackSize = 0x8000u;
     const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
     if (top == 0u)
     {
         throw std::runtime_error("EE invocation stack space exhausted");
     }
     m_invocationStackTops.emplace(key, top);
+    std::printf("[ee] invocation stack thread=%d depth=%zu top=0x%x (%zu total)\n", owner->id, depth, top,
+                m_invocationStackTops.size());
     return top;
 }
 

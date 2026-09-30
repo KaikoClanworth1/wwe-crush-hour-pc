@@ -579,12 +579,31 @@ static void UploadFrame(PS2X_FRAME_TEX_T &tex, PS2Runtime *rt, uint32_t &outWidt
 // Interrupt/callback invocation stacks are carved downward from here. The top of RAM holds the
 // game's main-thread stack (crt0: _stack = 0x1FF0000, _stack_size = 0x10000 for this title), so
 // keep clear of it; handlers running on top of live main-thread frames corrupted saved $ra.
+// Interrupt/callback invocation stacks (16 KB per guest thread and nesting depth). On a PS2 the
+// kernel runs INTC/DMAC handlers on its own memory; the game owns all RAM from its ELF up to _stack
+// and allocates thread stacks at the top (the MPEG thread's sits at 0x1FEBxxx). Stacks carved below
+// 0x1FF0000 overlapped those, so a DMA handler overwrote saved return addresses and the main thread
+// jumped into the heap (0x8a80c0) and froze. Use the unused EE kernel range 0x20000-0x80000 instead
+// (the runtime's syscall table mirror ends near 0x12400). PS2X_CALLBACK_STACK_HIGH=1: old placement.
+static bool callbackStacksHigh()
+{
+    static const bool s_high = std::getenv("PS2X_CALLBACK_STACK_HIGH") != nullptr;
+    return s_high;
+}
+
 static uint32_t asyncCallbackStackCeiling()
 {
+    if (!callbackStacksHigh())
+        return 0x00080000u;
     uint32_t reserve = 0x10000u;
     if (const char *v = std::getenv("PS2X_MAIN_STACK_RESERVE"))
         reserve = static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
     return PS2_RAM_SIZE - std::min<uint32_t>(reserve, 0x80000u);
+}
+
+static uint32_t asyncCallbackStackFloor(uint32_t highFloor)
+{
+    return callbackStacksHigh() ? highFloor : 0x00020000u;
 }
 
 
@@ -614,7 +633,7 @@ PS2Runtime::PS2Runtime()
     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+    m_asyncCallbackStackFloor = asyncCallbackStackFloor(std::min(kGuestHeapHardLimit, PS2_RAM_SIZE));
     m_asyncCallbackStackTop = asyncCallbackStackCeiling();
 }
 
@@ -1137,7 +1156,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
         const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
+        m_asyncCallbackStackFloor = asyncCallbackStackFloor(std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE));
         m_asyncCallbackStackTop = asyncCallbackStackCeiling();
     }
 
@@ -1526,6 +1545,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 #if defined(PS2X_NATIVE_HOST)
     {
         extern void ps2RecordBranch(uint32_t source, uint32_t target, uint32_t ra, uint32_t sp);
+        extern uint8_t *g_dbgRdram;
+        g_dbgRdram = rdram;
         ps2RecordBranch(sourcePc, targetPc, GPR_U32(ctx, 31), GPR_U32(ctx, 29));
     }
 #endif
@@ -2346,8 +2367,56 @@ namespace
 }
 void ps2RecordBranch(uint32_t source, uint32_t target, uint32_t ra, uint32_t sp)
 {
+    // PS2X_RING_SKIP=lo-hi (hex): don't record transfers from/to that code range (e.g. a polling loop
+    // that would otherwise flush everything interesting out of the ring).
+    static uint32_t s_skipLo = 0, s_skipHi = 0;
+    static const bool s_skipInit = []()
+    {
+        if (const char *v = std::getenv("PS2X_RING_SKIP"))
+        {
+            char *end = nullptr;
+            s_skipLo = static_cast<uint32_t>(std::strtoul(v, &end, 16));
+            if (end && *end == '-')
+                s_skipHi = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16));
+        }
+        return true;
+    }();
+    (void)s_skipInit;
+    if (s_skipHi && ((source >= s_skipLo && source < s_skipHi) || (target >= s_skipLo && target < s_skipHi)))
+        return;
     g_branchRing[g_branchRingPos++ & 63u] = {source, target, ra, sp};
+
+    // PS2X_STACKSCAN=lo-hi:value (hex): after every transfer, report the first time <value> appears
+    // as a word in guest memory [lo,hi) (finds who writes a bad return address into a stack frame).
+    extern uint8_t *g_dbgRdram;
+    static uint32_t s_scanLo = 0, s_scanHi = 0, s_scanVal = 0;
+    static bool s_scanDone = false;
+    static const bool s_scanInit = []()
+    {
+        if (const char *v = std::getenv("PS2X_STACKSCAN"))
+            std::sscanf(v, "%x-%x:%x", &s_scanLo, &s_scanHi, &s_scanVal);
+        return true;
+    }();
+    (void)s_scanInit;
+    if (s_scanHi && !s_scanDone && g_dbgRdram)
+    {
+        for (uint32_t a = s_scanLo & ~3u; a + 4 <= s_scanHi; a += 4)
+        {
+            uint32_t w;
+            std::memcpy(&w, g_dbgRdram + a, 4);
+            if (w == s_scanVal)
+            {
+                s_scanDone = true;
+                std::printf("[stackscan] 0x%x appeared at 0x%x; this transfer %08x -> %08x (%s -> %s) ra=%08x sp=%08x\n", s_scanVal,
+                            a, source, target, guestSymbolName(source), guestSymbolName(target), ra, sp);
+                extern void ps2DumpBranchRing();
+                ps2DumpBranchRing();
+                break;
+            }
+        }
+    }
 }
+uint8_t *g_dbgRdram = nullptr;
 void ps2DumpBranchRing()
 {
     static int s_dumps = 0;

@@ -6,6 +6,13 @@
 // Path of the packet currently being processed (diagnostics only).
 thread_local GifPathId g_gifCurrentPath = GifPathId::Path3;
 
+namespace
+{
+    // Recycled packet buffers: every GS packet (VU1 XGKICK output, PATH3 texture uploads) is copied
+    // into the queue, and allocating a fresh vector for each one cost several % of the frame.
+    thread_local std::vector<std::vector<uint8_t>> t_packetPool;
+}
+
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
 {
@@ -31,8 +38,12 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
+    if (!t_packetPool.empty())
+    {
+        pkt.data = std::move(t_packetPool.back());
+        t_packetPool.pop_back();
+    }
+    pkt.data.assign(data, data + sizeBytes);
     m_queue.push_back(std::move(pkt));
 }
 
@@ -72,6 +83,9 @@ void GifArbiter::drain()
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
     }
+    for (auto &pkt : m_queue)
+        if (t_packetPool.size() < 512u && pkt.data.capacity() <= (4u << 20))
+            t_packetPool.push_back(std::move(pkt.data));
     m_queue.clear();
 }
 

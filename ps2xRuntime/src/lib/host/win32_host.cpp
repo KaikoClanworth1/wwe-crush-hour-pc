@@ -965,6 +965,11 @@ float4 ps_main(VsOut i) : SV_Target
                 }
             };
             auto lastDump = std::chrono::steady_clock::now();
+            // PS2X_PROFILE_SEC=<s>: start sampling that long after launch (e.g. once the menu is up).
+            static const double s_profStart = std::getenv("PS2X_PROFILE_SEC") ? std::atof(std::getenv("PS2X_PROFILE_SEC")) : 0.0;
+            const auto profBoot = std::chrono::steady_clock::now();
+            while (g_profRun.load() && std::chrono::duration<double>(std::chrono::steady_clock::now() - profBoot).count() < s_profStart)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             while (g_profRun.load())
             {
                 // PS2X_PROFILE_ALL=1 samples every thread of the process (guest threads run on their own

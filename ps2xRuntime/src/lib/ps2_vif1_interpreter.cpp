@@ -418,6 +418,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         else if (m_gifPacketCallback)
                             m_gifPacketCallback(packet.data(), static_cast<uint32_t>(packet.size()));
                     }
+                    extern void ps2ReturnPath3Buffer(std::vector<uint8_t> &&b);
+                    ps2ReturnPath3Buffer(std::move(packet));
                 }
             }
             continue;

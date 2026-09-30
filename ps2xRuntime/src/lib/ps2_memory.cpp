@@ -43,7 +43,8 @@ namespace
     };
     AsyncDma g_async;
     thread_local bool t_dmaWorker = false;
-    std::vector<uint8_t> g_chainPool; // recycled VIF1 chain gather buffer (synchronous mode)
+    std::vector<uint8_t> g_chainPool;    // recycled VIF1 chain gather buffer (synchronous mode)
+    std::vector<uint8_t> g_gifChainPool; // same for the GIF channel (the per-frame PATH3 texture stream)
     thread_local bool t_asyncKick = false; // processPendingTransfers() called for a VIF1/GIF CHCR kick
 
     bool asyncDmaEnabled()
@@ -1508,6 +1509,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         chainBuf = std::move(g_chainPool);
                         chainBuf.clear();
                     }
+                    else if (channelBase == 0x1000A000u && !asyncDmaEnabled())
+                    {
+                        chainBuf = std::move(g_gifChainPool);
+                        chainBuf.clear();
+                    }
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -2175,6 +2181,9 @@ void PS2Memory::processPendingTransfers()
     for (auto &t : m_pendingVif1Transfers)
         if (t.chainData.capacity() > g_chainPool.capacity())
             g_chainPool = std::move(t.chainData);
+    for (auto &t : m_pendingGifTransfers)
+        if (t.chainData.capacity() > g_gifChainPool.capacity())
+            g_gifChainPool = std::move(t.chainData);
     m_pendingGifTransfers.clear();
     m_pendingVif0Transfers.clear();
     m_pendingVif1Transfers.clear();
@@ -2197,6 +2206,28 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
 
 int g_p3Trace = std::getenv("PS2X_P3_TRACE") ? std::atoi(std::getenv("PS2X_P3_TRACE")) : 0;
 
+// Recycled buffers for masked PATH3 packets (the per-frame texture stream is ~80 packets / 2.6 MB).
+namespace
+{
+    thread_local std::vector<std::vector<uint8_t>> g_p3BufPool; // per thread: safe with the async DMA worker
+}
+std::vector<uint8_t> ps2TakePath3Buffer(const uint8_t *begin, const uint8_t *end)
+{
+    std::vector<uint8_t> b;
+    if (!g_p3BufPool.empty())
+    {
+        b = std::move(g_p3BufPool.back());
+        g_p3BufPool.pop_back();
+    }
+    b.assign(begin, end);
+    return b;
+}
+void ps2ReturnPath3Buffer(std::vector<uint8_t> &&b)
+{
+    if (g_p3BufPool.size() < 256u && b.capacity() <= (4u << 20))
+        g_p3BufPool.push_back(std::move(b));
+}
+
 void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
 {
     if (m_path3Masked || m_path3MaskedFifo.empty())
@@ -2210,10 +2241,11 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
             m_gifPacketCallback(packetData, packetSize);
     };
 
-    for (const auto &packet : m_path3MaskedFifo)
+    for (auto &packet : m_path3MaskedFifo)
     {
         if (packet.size() >= 16u)
             emit(packet.data(), static_cast<uint32_t>(packet.size()));
+        ps2ReturnPath3Buffer(std::move(packet));
     }
     m_path3MaskedFifo.clear();
 
@@ -2259,12 +2291,12 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
                 pos = static_cast<uint32_t>(std::min<uint64_t>(sizeBytes, pos + qw * 16u));
                 if (eop)
                 {
-                    m_path3MaskedFifo.emplace_back(data + start, data + pos);
+                    m_path3MaskedFifo.push_back(ps2TakePath3Buffer(data + start, data + pos));
                     start = pos;
                 }
             }
             if (start < sizeBytes)
-                m_path3MaskedFifo.emplace_back(data + start, data + sizeBytes);
+                m_path3MaskedFifo.push_back(ps2TakePath3Buffer(data + start, data + sizeBytes));
             return;
         }
         flushMaskedPath3Packets(false);
