@@ -83,10 +83,21 @@ EeScheduler::~EeScheduler()
     requestStop();
 }
 
+namespace
+{
+    // D_STAT channel bits latch while the cause is disabled; the interrupt is raised when the game
+    // re-enables it (EnableDmac). Matters once DMA completes asynchronously (PS2X_ASYNC_DMA).
+    uint32_t g_latchedDmacCauses = 0u;
+}
+
+void ps2AsyncDmaSetNotifier(std::function<void()> fn); // ps2_memory.cpp
+void ps2AsyncDmaApplyCompletions();
+
 void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
 {
     m_executorThread = std::this_thread::get_id();
     m_rdram = rdram;
+    ps2AsyncDmaSetNotifier([this]() { postEvent(EeEvent{EeEventType::Dmac, 0u, 0u}); });
     m_readyQueues = {};
     m_threads.clear();
     m_semaphores.clear();
@@ -107,6 +118,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_dmacTailOrder = 1000;
     m_enabledIntcMask = 0xFFFFFFFFu;
     m_enabledDmacMask = 0xFFFFFFFFu;
+    g_latchedDmacCauses = 0u;
     m_currentThreadId = 0;
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
@@ -255,7 +267,13 @@ void EeScheduler::run()
             continue;
         }
 
-        if (!m_pendingInvocations.empty() && running->invocations.empty())
+        // Interrupt handlers are held while the interrupted code runs with interrupts disabled (DI
+        // clears Status.EIE): RenderWare edits its DMA packet queue inside DI/EI sections, and the
+        // DMA-end handler walks the same queue.
+        const bool interruptHeld = !m_pendingInvocations.empty() &&
+                                   m_pendingInvocations.front().kind == GuestInvocationKind::Interrupt &&
+                                   (context.cop0_status & 0x10000u) == 0u;
+        if (!m_pendingInvocations.empty() && running->invocations.empty() && !interruptHeld)
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
@@ -287,6 +305,11 @@ void EeScheduler::run()
             continue;
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
+        {
+            extern void ps2RecordBranch(uint32_t source, uint32_t target, uint32_t ra, uint32_t sp);
+            const R5900Context *cp = &context;
+            ps2RecordBranch(0xEEEEEEEEu, context.pc, GPR_U32(cp, 31), GPR_U32(cp, 29));
+        }
 
         if (checkpointDue(kGuestDispatchCycles))
         {
@@ -1249,6 +1272,11 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
         {
             mask &= ~(1u << cause);
         }
+        if (dmac && enabled && (g_latchedDmacCauses & (1u << cause)) != 0u)
+        {
+            g_latchedDmacCauses &= ~(1u << cause);
+            dispatchIrq(true, cause);
+        }
     }
     return KE_OK;
 }
@@ -1259,6 +1287,8 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
+        if (dmac)
+            g_latchedDmacCauses |= 1u << cause;
         return;
     }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
@@ -1911,6 +1941,9 @@ void EeScheduler::processEvent(const EeEvent &event)
         dispatchIrq(false, 3u);
         break;
     case EeEventType::Dmac:
+        // Async DMA worker finished a kick: apply channel completion and run DMAC handlers here.
+        ps2AsyncDmaApplyCompletions();
+        m_runtime.drainCompletedDmacHandlers(m_runtime.memory().getRDRAM());
         break;
     case EeEventType::Alarm:
     {

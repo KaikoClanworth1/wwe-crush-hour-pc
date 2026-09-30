@@ -1518,11 +1518,21 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         {
             if (sizeBytes - offset < 4u)
                 return;
-            uint32_t value = 0u;
-            std::memcpy(&value, data + offset, sizeof(value));
-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
-            offset += 4u;
-            advancePixel(1u);
+            // Write the rest of the current row in one go (no per-pixel div/mod or state update).
+            const uint32_t rowLeft = rrw - (m_transferState.copiedPixels % rrw);
+            const uint32_t avail = (sizeBytes - offset) / 4u;
+            const uint32_t pixelsLeft = m_transferState.totalPixels - m_transferState.copiedPixels;
+            const uint32_t n = std::min(std::min(rowLeft, avail), pixelsLeft);
+            const auto writeFn = m_writeVramFuncs[dpsm & 0x3Fu];
+            const uint32_t x0 = m_transferState.x, y0 = m_transferState.y;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                uint32_t value = 0u;
+                std::memcpy(&value, data + offset + i * 4u, sizeof(value));
+                writeFn(m_vram, dbp, dbw, x0 + i, y0, value);
+            }
+            offset += n * 4u;
+            advancePixel(n);
             break;
         }
         case GS_PSM_CT24:

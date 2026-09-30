@@ -576,6 +576,18 @@ static void UploadFrame(PS2X_FRAME_TEX_T &tex, PS2Runtime *rt, uint32_t &outWidt
     s_hasUploadedFrame = true;
 }
 
+// Interrupt/callback invocation stacks are carved downward from here. The top of RAM holds the
+// game's main-thread stack (crt0: _stack = 0x1FF0000, _stack_size = 0x10000 for this title), so
+// keep clear of it; handlers running on top of live main-thread frames corrupted saved $ra.
+static uint32_t asyncCallbackStackCeiling()
+{
+    uint32_t reserve = 0x10000u;
+    if (const char *v = std::getenv("PS2X_MAIN_STACK_RESERVE"))
+        reserve = static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+    return PS2_RAM_SIZE - std::min<uint32_t>(reserve, 0x80000u);
+}
+
+
 PS2Runtime::PS2Runtime()
 {
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
@@ -603,7 +615,7 @@ PS2Runtime::PS2Runtime()
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
     m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackTop = asyncCallbackStackCeiling();
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -1126,7 +1138,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
         const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
         m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackTop = asyncCallbackStackCeiling();
     }
 
     LoadedModule module;
@@ -1344,6 +1356,12 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                                        GuestBranchKind kind,
                                        const char *debugName)
 {
+#if defined(PS2X_NATIVE_HOST)
+    {
+        extern void ps2DumpBranchRing();
+        ps2DumpBranchRing();
+    }
+#endif
     const MissingFunctionPolicy policy = missingFunctionPolicy();
     const bool firstReport = !m_missingFunctionReported.exchange(true, std::memory_order_acq_rel);
 
@@ -1505,6 +1523,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+#if defined(PS2X_NATIVE_HOST)
+    {
+        extern void ps2RecordBranch(uint32_t source, uint32_t target, uint32_t ra, uint32_t sp);
+        ps2RecordBranch(sourcePc, targetPc, GPR_U32(ctx, 31), GPR_U32(ctx, 29));
+    }
+#endif
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
@@ -2311,6 +2335,38 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 // Debug aid: PS2X_EE_WATCH=<hex vaddr> logs guest stores (special-address path) that cover it.
 // Frame limiter threshold used by the patched ps2_wait_for_vsync (tools/patch_60fps.py): number of
 // VSyncs a game frame waits for. 1 = 60 fps when TargetFPS >= 60 (PS2X_FPS30=1 restores 30 fps).
+#if defined(PS2X_NATIVE_HOST)
+// Last guest control transfers (calls via dispatchGuestBranch; scheduler dispatches have source
+// 0xEEEEEEEE), dumped when a branch lands on an unknown address.
+namespace
+{
+    struct BranchRec { uint32_t source, target, ra, sp; };
+    BranchRec g_branchRing[64];
+    uint32_t g_branchRingPos = 0;
+}
+void ps2RecordBranch(uint32_t source, uint32_t target, uint32_t ra, uint32_t sp)
+{
+    g_branchRing[g_branchRingPos++ & 63u] = {source, target, ra, sp};
+}
+void ps2DumpBranchRing()
+{
+    static int s_dumps = 0;
+    if (s_dumps++ >= 2)
+        return;
+    std::printf("[branch-ring] last guest transfers (oldest first):\n");
+    for (uint32_t i = 0; i < 64u; ++i)
+    {
+        const BranchRec &r = g_branchRing[(g_branchRingPos + i) & 63u];
+        if (!r.target)
+            continue;
+        std::printf("  %08x %-40.40s -> %08x %-40.40s ra=%08x sp=%08x\n", r.source,
+                    r.source == 0xEEEEEEEEu ? "<scheduler>" : guestSymbolName(r.source), r.target,
+                    guestSymbolName(r.target), r.ra, r.sp);
+    }
+    std::fflush(stdout);
+}
+#endif
+
 extern "C" uint32_t ps2x_frame_vsync_threshold()
 {
     static const uint32_t s_threshold = []() -> uint32_t
@@ -2642,7 +2698,8 @@ void PS2Runtime::run()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
 #if defined(PS2X_NATIVE_HOST)
-        ps2host::profileCurrentThread();
+        if (!std::getenv("PS2X_PROFILE_WORKER"))
+            ps2host::profileCurrentThread();
 #endif
         try
         {
@@ -2716,6 +2773,19 @@ void PS2Runtime::run()
                             static_cast<unsigned long long>(m_memory.vifWriteCount()),
                             static_cast<unsigned long long>(gsr.pmode), static_cast<unsigned long long>(gsr.dispfb1),
                             static_cast<unsigned long long>(gsr.display1));
+                {
+                    extern uint64_t ps2Vif1KickCount();
+                    static uint64_t s_lastKicks = 0;
+                    const uint64_t kicks = ps2Vif1KickCount();
+                    std::printf("[frames] vif1kicks=%llu rate=%.1f/s\n", static_cast<unsigned long long>(kicks),
+                                static_cast<double>(kicks - s_lastKicks) / 2.0);
+                    s_lastKicks = kicks;
+                    extern void ps2AsyncDmaStats(uint64_t &, uint64_t &, uint64_t &);
+                    uint64_t sub = 0, done = 0, applied = 0;
+                    ps2AsyncDmaStats(sub, done, applied);
+                    std::printf("[async] submitted=%llu done=%llu applied=%llu\n", (unsigned long long)sub,
+                                (unsigned long long)done, (unsigned long long)applied);
+                }
                 if (const char *peek = std::getenv("PS2X_STATUS_PEEK"))
                 {
                     // PS2X_STATUS_PEEK=<hex addr>[,<hex addr>...]: print guest words each status tick.

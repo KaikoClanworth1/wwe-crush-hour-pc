@@ -1583,12 +1583,8 @@ void GSD3D11Backend::Reset()
 
 void GSD3D11Backend::Submit(const GSPrimitiveBatch &batch)
 {
-    ps2prof::Scope profScope(ps2prof::kGsSubmit);
-    std::unique_lock<std::recursive_mutex> lock(ps2host::d3dLock(), std::defer_lock);
-    {
-        ps2prof::Scope waitScope(ps2prof::kGsLockWait);
-        lock.lock();
-    }
+    // Called per primitive batch (~500k/s): no timing scopes here, they cost more than the work.
+    std::lock_guard<std::recursive_mutex> lock(ps2host::d3dLock());
     if (!m_impl->initGpu() || batch.vertexCount == 0u)
         return;
     m_impl->submit(batch);
