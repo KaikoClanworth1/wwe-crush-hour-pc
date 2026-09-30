@@ -149,7 +149,7 @@ namespace ps2vu1n
         }
     }
 
-    uint64_t g_nativeRuns = 0, g_nativeFallbacks = 0, g_nativeMisses = 0;
+    uint64_t g_nativeRuns = 0, g_nativeFallbacks = 0, g_nativeMisses = 0, g_nativeCycles = 0;
 }
 
 // Returns true when the native program ran; `ended` tells whether it reached the E-bit (false =
@@ -196,6 +196,7 @@ bool ps2vu1nTryRun(VU1State &state, uint8_t *vuData, uint32_t dataSize, PS2Memor
         }
     }
     state.cycles += c.cyc > maxCycles ? maxCycles : c.cyc;
+    g_nativeCycles += c.cyc;
     flushAll(c);
     ++g_nativeRuns;
     if (r == kFallback)

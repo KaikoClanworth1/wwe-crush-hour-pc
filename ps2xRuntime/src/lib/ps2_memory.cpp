@@ -1306,7 +1306,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             if (g_p3Trace > 0 && (channelBase == 0x1000A000u || channelBase == 0x10009000u))
             {
                 --g_p3Trace;
-                std::printf("[p3] kick %s chcr=%x\n", channelBase == 0x1000A000u ? "GIF" : "VIF1", value);
+                std::printf("[p3] kick %s chcr=%x madr=%x qwc=%x tadr=%x\n", channelBase == 0x1000A000u ? "GIF" : "VIF1", value,
+                            m_ioRegisters[channelBase + 0x10], m_ioRegisters[channelBase + 0x20], m_ioRegisters[channelBase + 0x30]);
+                std::fflush(stdout);
             }
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];

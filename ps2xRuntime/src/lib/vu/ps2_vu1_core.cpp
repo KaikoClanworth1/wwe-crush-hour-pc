@@ -1675,7 +1675,7 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
     m_stopRequested = true;
 }
 
-namespace ps2vu1n { extern uint64_t g_nativeRuns, g_nativeFallbacks, g_nativeMisses; }
+namespace ps2vu1n { extern uint64_t g_nativeRuns, g_nativeFallbacks, g_nativeMisses, g_nativeCycles; }
 bool ps2vu1nTryRun(VU1State &state, uint8_t *vuData, uint32_t dataSize, PS2Memory *memory,
                    uint64_t codeHash, uint32_t maxCycles, bool &ended);
 
@@ -1733,6 +1733,91 @@ namespace
     }
 }
 
+namespace
+{
+    // PS2X_VU1_VERIFY=1: run the native program on a snapshot (no GIF output), then the interpreter
+    // on the same input (its results are kept), and report register/memory mismatches.
+    template <typename InterpFn>
+    bool vu1VerifyNative(VU1State &st, uint8_t *mem, uint32_t size, uint64_t hash, uint32_t maxCycles, InterpFn &&interp)
+    {
+        static const bool s_on = std::getenv("PS2X_VU1_VERIFY") != nullptr;
+        if (!s_on)
+            return false;
+        const VU1State saved = st;
+        const std::vector<uint8_t> m0(mem, mem + size);
+        const uint32_t entry = st.pc;
+        bool ended = false;
+        if (!ps2vu1nTryRun(st, mem, size, nullptr, hash, maxCycles, ended) || !ended)
+        {
+            st = saved;
+            std::memcpy(mem, m0.data(), size);
+            return false;
+        }
+        const VU1State nat = st;
+        const std::vector<uint8_t> m1(mem, mem + size);
+        st = saved;
+        std::memcpy(mem, m0.data(), size);
+        interp();
+
+        static int s_reports = 0;
+        static uint64_t s_checked = 0, s_bad = 0;
+        ++s_checked;
+        std::string diff;
+        char buf[160];
+        for (int r = 1; r < 32; ++r)
+            if (std::memcmp(nat.vf[r], st.vf[r], 16) != 0 && diff.size() < 600)
+            {
+                uint32_t a[4], b[4];
+                std::memcpy(a, nat.vf[r], 16);
+                std::memcpy(b, st.vf[r], 16);
+                std::snprintf(buf, sizeof(buf), " vf%d n=[%08x %08x %08x %08x] i=[%08x %08x %08x %08x]", r, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+                diff += buf;
+            }
+        for (int r = 1; r < 16; ++r)
+            if ((nat.vi[r] & 0xFFFF) != (st.vi[r] & 0xFFFF))
+            {
+                std::snprintf(buf, sizeof(buf), " vi%d n=%04x i=%04x", r, nat.vi[r] & 0xFFFF, st.vi[r] & 0xFFFF);
+                diff += buf;
+            }
+        if (std::memcmp(nat.acc, st.acc, 16) != 0)
+            diff += " acc";
+        if (nat.pc != st.pc)
+        {
+            std::snprintf(buf, sizeof(buf), " pc n=%x i=%x", nat.pc, st.pc);
+            diff += buf;
+        }
+        uint32_t memDiff = 0, firstQw = 0xFFFFFFFFu;
+        for (uint32_t q = 0; q < size; q += 16)
+            if (std::memcmp(m1.data() + q, mem + q, 16) != 0)
+            {
+                if (firstQw == 0xFFFFFFFFu)
+                    firstQw = q / 16;
+                ++memDiff;
+            }
+        if (memDiff)
+        {
+            uint32_t a[4], b[4];
+            std::memcpy(a, m1.data() + firstQw * 16, 16);
+            std::memcpy(b, mem + firstQw * 16, 16);
+            std::snprintf(buf, sizeof(buf), " mem %u qw first=%x n=[%08x %08x %08x %08x] i=[%08x %08x %08x %08x]", memDiff, firstQw,
+                          a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+            diff += buf;
+        }
+        if (!diff.empty())
+        {
+            ++s_bad;
+            if (s_reports < 60)
+            {
+                ++s_reports;
+                std::printf("[vu1-verify] %016llx entry=%04x (%llu/%llu bad)%s\n", static_cast<unsigned long long>(hash), entry,
+                            static_cast<unsigned long long>(s_bad), static_cast<unsigned long long>(s_checked), diff.c_str());
+                std::fflush(stdout);
+            }
+        }
+        return true;
+    }
+}
+
 void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint8_t *vuData, uint32_t dataSize,
                              GS &gs, PS2Memory *memory,
@@ -1785,6 +1870,9 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][3] = 1.0f;
     if (m_unit == Unit::VU1 && memory && g_vuTraceRemaining < 0)
     {
+        if (vu1VerifyNative(m_state, vuData, dataSize, g_vu1CodeHash, maxCycles,
+                            [&]() { run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles); }))
+            return;
         bool ended = false;
         if (ps2vu1nTryRun(m_state, vuData, dataSize, memory, g_vu1CodeHash, maxCycles, ended))
         {
@@ -1815,6 +1903,9 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     {
         // MSCNT: continue where the previous program stopped (RenderWare runs every batch this way).
         noteVu1Program(vuCode, codeSize, memory->getVU1CodeGeneration(), m_state.pc);
+        if (vu1VerifyNative(m_state, vuData, dataSize, g_vu1CodeHash, maxCycles,
+                            [&]() { run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles); }))
+            return;
         bool ended = false;
         if (ps2vu1nTryRun(m_state, vuData, dataSize, memory, g_vu1CodeHash, maxCycles, ended))
         {
@@ -2107,14 +2198,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (s_stats && now - s_last >= std::chrono::seconds(2))
         {
             s_last = now;
-            std::printf("[vu-stats] runs=%llu pairs=%llu cycles=%llu budgetHits=%llu maxCycles=%u codeChanges=%llu native=%llu fallback=%llu miss=%llu hash=%016llx\n",
+            std::printf("[vu-stats] runs=%llu pairs=%llu cycles=%llu budgetHits=%llu maxCycles=%u codeChanges=%llu native=%llu fallback=%llu miss=%llu ncyc=%llu hash=%016llx\n",
                         (unsigned long long)g_vuStatRuns, (unsigned long long)g_vuStatPairs,
                         (unsigned long long)g_vuStatCycles, (unsigned long long)g_vuStatBudgetHits, maxCycles,
                         (unsigned long long)g_vu1HashChanges, (unsigned long long)ps2vu1n::g_nativeRuns,
                         (unsigned long long)ps2vu1n::g_nativeFallbacks, (unsigned long long)ps2vu1n::g_nativeMisses,
+                        (unsigned long long)ps2vu1n::g_nativeCycles,
                         (unsigned long long)g_vu1CodeHash);
             g_vu1HashChanges = 0;
-            ps2vu1n::g_nativeRuns = ps2vu1n::g_nativeFallbacks = ps2vu1n::g_nativeMisses = 0;
+            ps2vu1n::g_nativeRuns = ps2vu1n::g_nativeFallbacks = ps2vu1n::g_nativeMisses = ps2vu1n::g_nativeCycles = 0;
             g_vuStatRuns = g_vuStatPairs = g_vuStatCycles = g_vuStatBudgetHits = 0;
         }
     }

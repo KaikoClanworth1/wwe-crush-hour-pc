@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <smmintrin.h>
 
 namespace ps2vu1n
 {
@@ -350,6 +351,45 @@ namespace ps2vu1n
             }
         }
         pushMac(c, mac, st);
+    }
+
+    // ---- SSE helpers for vectorized FMAC ops (lane 0 = x; blend immediate bit k = lane k)
+    VU1N_INLINE __m128 V(const float *p) { return _mm_loadu_ps(p); }
+    VU1N_INLINE __m128 B(float x) { return _mm_set1_ps(x); }
+    VU1N_INLINE __m128 clampv(__m128 v)
+    {
+        const __m128 mx = _mm_set1_ps(std::numeric_limits<float>::max());
+        return _mm_min_ps(_mm_max_ps(v, _mm_sub_ps(_mm_setzero_ps(), mx)), mx);
+    }
+    VU1N_INLINE __m128 opm(__m128 a, __m128 b) // (a.y*b.z, a.z*b.x, a.x*b.y, 0)
+    {
+        const __m128 p = _mm_mul_ps(_mm_shuffle_ps(a, a, _MM_SHUFFLE(3, 0, 2, 1)), _mm_shuffle_ps(b, b, _MM_SHUFFLE(3, 1, 0, 2)));
+        return _mm_and_ps(p, _mm_castsi128_ps(_mm_setr_epi32(-1, -1, -1, 0)));
+    }
+    VU1N_INLINE __m128 itofv(__m128 a, float scale) { return _mm_mul_ps(_mm_cvtepi32_ps(_mm_castps_si128(a)), _mm_set1_ps(scale)); }
+    VU1N_INLINE __m128 ftoiv(__m128 a, float scale)
+    {
+        const __m128 x = _mm_mul_ps(clampv(a), _mm_set1_ps(scale));
+        const __m128i i = _mm_cvttps_epi32(x); // negative overflow already 0x80000000
+        const __m128 pos = _mm_cmpge_ps(x, _mm_set1_ps(2147483648.0f));
+        return _mm_or_ps(_mm_andnot_ps(pos, _mm_castsi128_ps(i)), _mm_and_ps(pos, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))));
+    }
+    VU1N_INLINE __m128 absv(__m128 a) { return clampv(_mm_and_ps(a, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)))); }
+    VU1N_INLINE __m128 mr32(__m128 a) { return _mm_shuffle_ps(a, a, _MM_SHUFFLE(0, 3, 2, 1)); }
+    template <int IMM>
+    VU1N_INLINE void stb(float *p, __m128 v)
+    {
+        if constexpr (IMM == 0xF)
+            _mm_storeu_ps(p, v);
+        else
+            _mm_storeu_ps(p, _mm_blend_ps(_mm_loadu_ps(p), v, IMM));
+    }
+    VU1N_INLINE void macFlagsV(Ctx &c, __m128 r, uint32_t destLanes /* bit k = lane k */)
+    {
+        static constexpr uint8_t kRev[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+        const uint32_t z = static_cast<uint32_t>(_mm_movemask_ps(_mm_cmpeq_ps(r, _mm_setzero_ps()))) & destLanes;
+        const uint32_t sg = static_cast<uint32_t>(_mm_movemask_ps(r)) & destLanes;
+        pushMac(c, kRev[z] | (kRev[sg] << 4), (z ? 1u : 0u) | (sg ? 2u : 0u));
     }
 
     inline void flushAllRings(Ctx &c)

@@ -332,6 +332,7 @@ struct GSD3D11Backend::Impl
         uint64_t lastUse = 0;
     };
     std::unordered_map<uint64_t, CachedTexture> texCache;
+    std::unordered_map<uint64_t, CachedTexture> contentCache; // keyed by texture params + VRAM page contents
 
     std::array<uint32_t, 512> pageVersion{};
     std::array<uint16_t, 512> clut{};
@@ -358,7 +359,7 @@ struct GSD3D11Backend::Impl
     uint32_t lastUploadDbp = 0;
     // Page span of the host->local transfer in progress (pixel data arrives after BeginTransfer).
     uint32_t uploadFirst = 1u, uploadLast = 0u;
-    uint64_t statDraws = 0, statSyncs = 0, statUploads = 0, statTexDecodes = 0;
+    uint64_t statDraws = 0, statSyncs = 0, statUploads = 0, statTexDecodes = 0, statTexContentHits = 0;
     const char *syncReason = "?";
     char lastPresent[160] = "none";
     std::unordered_map<std::string, uint64_t> syncReasons;
@@ -892,6 +893,34 @@ struct GSD3D11Backend::Impl
             return it->second.srv.Get();
         }
 
+        // RenderWare re-streams the same texture bytes into a shared VRAM area every frame, which
+        // bumps the page versions. Reuse an earlier decode of identical page contents.
+        uint64_t contentKey = key;
+        if (vram)
+        {
+            const uint64_t *w = reinterpret_cast<const uint64_t *>(vram + static_cast<size_t>(first) * 8192u);
+            const size_t words = static_cast<size_t>(last - first + 1u) * 8192u / 8u;
+            uint64_t h = contentKey ^ 0x9E3779B97F4A7C15ull;
+            for (size_t i = 0; i < words; ++i)
+            {
+                h = (h ^ w[i]) * 0x100000001B3ull;
+                h ^= h >> 29;
+            }
+            contentKey = h;
+            auto cit = contentCache.find(contentKey);
+            if (cit != contentCache.end())
+            {
+                cit->second.lastUse = frameCounter;
+                CachedTexture shared = cit->second;
+                shared.pageStamp = stamp;
+                texCache[key] = shared;
+                outW = shared.w;
+                outH = shared.h;
+                ++statTexContentHits;
+                return shared.srv.Get();
+            }
+        }
+
         std::vector<uint32_t> px(static_cast<size_t>(tw) * th);
         const uint32_t tbw = std::max<uint32_t>(t.tbw, 1u);
         for (uint32_t y = 0; y < th; ++y)
@@ -909,10 +938,9 @@ struct GSD3D11Backend::Impl
                     c = v;
                 px[static_cast<size_t>(y) * tw + x] = c;
             }
+        // Always a fresh texture: entries may be shared with contentCache.
         CachedTexture ct;
-        if (it != texCache.end() && it->second.w == tw && it->second.h == th)
-            ct = it->second;
-        else if (!createTexture(tw, th, D3D11_BIND_SHADER_RESOURCE, ct.tex))
+        if (!createTexture(tw, th, D3D11_BIND_SHADER_RESOURCE, ct.tex))
             return nullptr;
         if (const char *dumpDir = std::getenv("PS2X_TEX_DUMP"))
         {
@@ -939,6 +967,15 @@ struct GSD3D11Backend::Impl
         ct.pageStamp = stamp;
         ct.lastUse = frameCounter;
         texCache[key] = ct;
+        if (vram)
+        {
+            if (contentCache.size() > 1500u)
+            {
+                for (auto ci = contentCache.begin(); ci != contentCache.end();)
+                    ci = (ci->second.lastUse + 300u < frameCounter) ? contentCache.erase(ci) : std::next(ci);
+            }
+            contentCache[contentKey] = ct;
+        }
         ++statTexDecodes;
         outW = tw;
         outH = th;
