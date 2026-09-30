@@ -74,6 +74,19 @@ namespace
             {
                 std::function<void()> job;
                 {
+                    // RenderWare kicks its next DMA packet from the completion handler, so kicks
+                    // arrive back-to-back: spin briefly before blocking to avoid wake-up latency.
+                    const auto spinUntil = std::chrono::steady_clock::now() + std::chrono::microseconds(300);
+                    while (std::chrono::steady_clock::now() < spinUntil)
+                    {
+                        {
+                            std::lock_guard peek(g_async.m);
+                            if (!g_async.jobs.empty())
+                                break;
+                        }
+                        for (int i = 0; i < 64; ++i)
+                            _mm_pause();
+                    }
                     std::unique_lock lock(g_async.m);
                     g_async.cv.wait(lock, [] { return !g_async.jobs.empty(); });
                     job = std::move(g_async.jobs.front());

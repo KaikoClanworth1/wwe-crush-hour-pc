@@ -88,6 +88,7 @@ namespace
     // D_STAT channel bits latch while the cause is disabled; the interrupt is raised when the game
     // re-enables it (EnableDmac). Matters once DMA completes asynchronously (PS2X_ASYNC_DMA).
     uint32_t g_latchedDmacCauses = 0u;
+    bool g_dmacDispatchNow = false; // delivering a delayed DMAC interrupt (bypass the delay)
 }
 
 void ps2AsyncDmaSetNotifier(std::function<void()> fn); // ps2_memory.cpp
@@ -1291,6 +1292,22 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
             g_latchedDmacCauses |= 1u << cause;
         return;
     }
+    if (dmac && !g_dmacDispatchNow)
+    {
+        // DMA completes instantly here; on hardware a transfer takes time and RenderWare's DMA
+        // manager is only consistent once the kicking code has moved on. Raise the channel-end
+        // interrupt a short emulated transfer time later (PS2X_DMAC_IRQ_DELAY EE cycles).
+        static const uint64_t s_delay = []() -> uint64_t
+        {
+            const char *v = std::getenv("PS2X_DMAC_IRQ_DELAY");
+            return v ? std::strtoull(v, nullptr, 0) : 0u; // off by default (experiment)
+        }();
+        if (s_delay != 0u)
+        {
+            scheduleEvent(m_eeCycle + s_delay, std::chrono::steady_clock::now(), EeEvent{EeEventType::Dmac, cause + 1u, 0u});
+            return;
+        }
+    }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
     std::vector<EeIrqHandler> matching;
     for (const auto &[id, handler] : handlers)
@@ -1941,6 +1958,14 @@ void EeScheduler::processEvent(const EeEvent &event)
         dispatchIrq(false, 3u);
         break;
     case EeEventType::Dmac:
+        if (event.id != 0u)
+        {
+            // Delayed channel-end interrupt (see dispatchIrq).
+            g_dmacDispatchNow = true;
+            dispatchIrq(true, event.id - 1u);
+            g_dmacDispatchNow = false;
+            break;
+        }
         // Async DMA worker finished a kick: apply channel completion and run DMAC handlers here.
         ps2AsyncDmaApplyCompletions();
         m_runtime.drainCompletedDmacHandlers(m_runtime.memory().getRDRAM());

@@ -942,7 +942,8 @@ struct GSD3D11Backend::Impl
         CachedTexture ct;
         if (!createTexture(tw, th, D3D11_BIND_SHADER_RESOURCE, ct.tex))
             return nullptr;
-        if (const char *dumpDir = std::getenv("PS2X_TEX_DUMP"))
+        static const char *s_texDumpDir = std::getenv("PS2X_TEX_DUMP");
+        if (const char *dumpDir = s_texDumpDir)
         {
             static int s_texDumps = 0;
             static const long s_skipTbp = std::getenv("PS2X_TEX_DUMP_SKIP") ? std::atol(std::getenv("PS2X_TEX_DUMP_SKIP")) : -1;
@@ -1658,7 +1659,8 @@ void GSD3D11Backend::BeginTransfer(const GSTransferCommand &command)
 
 void GSD3D11Backend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (const char *dumpDir = std::getenv("PS2X_UPLOAD_DUMP"))
+    static const char *s_uploadDumpDir = std::getenv("PS2X_UPLOAD_DUMP"); // per packet: no getenv here
+    if (const char *dumpDir = s_uploadDumpDir)
     {
         // Append every host->local payload to one file per destination pointer (diagnostics).
         static int s_files = 0;
