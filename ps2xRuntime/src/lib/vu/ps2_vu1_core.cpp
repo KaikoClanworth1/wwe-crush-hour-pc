@@ -76,6 +76,24 @@ VU1Interpreter::VU1Interpreter(Unit unit)
     reset();
 }
 
+namespace
+{
+    // Reset the XGKICK pipeline without zero-filling its 64 KB packet buffer (bytes are always copied in
+    // before they are read); a full `= {}` on every VU1 program start was a large memset per run.
+    template <typename Pipe>
+    inline void resetXgkickState(Pipe &x)
+    {
+        x.sourceAddress = 0;
+        x.totalBytes = 0;
+        x.copiedBytes = 0;
+        x.currentTagEnd = 0;
+        x.cycleCredit = 0;
+        x.issueCycle = 0;
+        x.active = false;
+        x.currentTagEop = false;
+    }
+}
+
 void VU1Interpreter::resetScheduler()
 {
     g_vuNextCommit[m_unit == Unit::VU1] = 0;
@@ -86,7 +104,7 @@ void VU1Interpreter::resetScheduler()
     m_vfWritePipeline = {};
     m_viWritePipeline = {};
     m_accWritePipeline = {};
-    m_xgkick = {};
+    resetXgkickState(m_xgkick);
     m_vfReady = {};
     m_viReady = {};
     m_accReady = {};
@@ -1027,7 +1045,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
         return;
 
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
-    m_xgkick = {};
+    resetXgkickState(m_xgkick);
     m_xgkick.active = true;
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.

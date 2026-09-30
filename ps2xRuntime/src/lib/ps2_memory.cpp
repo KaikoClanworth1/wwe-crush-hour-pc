@@ -19,6 +19,8 @@
 #include <mutex>
 #include <thread>
 
+void ps2GsThreadDrain(); // ps2_runtime.cpp (PS2X_GS_THREAD)
+
 namespace
 {
     // ---- Asynchronous VIF1/GIF DMA (PS2X_ASYNC_DMA=1) --------------------------------------------
@@ -1101,6 +1103,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
+        ps2GsThreadDrain(); // e.g. DISPFB at a buffer flip: the queued frame must be finished first
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -1161,6 +1164,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
+        ps2GsThreadDrain(); // e.g. DISPFB at a buffer flip: the queued frame must be finished first
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -2347,6 +2351,7 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    ps2GsThreadDrain(); // writes the GS directly, bypassing the GIF queue
     asyncDmaDrain(); // EE-side GS access: order after queued DMA kicks
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
@@ -2540,6 +2545,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
 
 bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    ps2GsThreadDrain(); // writes the GS directly, bypassing the GIF queue
     asyncDmaDrain(); // EE-side GS access: order after queued DMA kicks
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;

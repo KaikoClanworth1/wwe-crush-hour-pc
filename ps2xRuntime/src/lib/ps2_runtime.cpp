@@ -32,10 +32,116 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <vector>
 
 namespace ps2_stubs
 {
     void resetSifState();
+}
+
+// ---- GS worker thread (PS2X_GS_THREAD=1) ------------------------------------------------------------
+// GIF packets leaving the arbiter are copied into a FIFO and processed (frontend + D3D11 backend) on a
+// dedicated thread, so VU1/VIF/DMA work on the EE side overlaps with draw submission. Packet order is
+// preserved; EE-side code that touches the GS directly calls ps2GsThreadDrain() first (hooked into the
+// existing asyncDmaDrain() ordering points in ps2_memory.cpp).
+namespace
+{
+    struct GsThreadState
+    {
+        std::mutex m;
+        std::condition_variable cv, idleCv;
+        std::deque<std::vector<uint8_t>> jobs;
+        std::vector<std::vector<uint8_t>> pool;
+        bool busy = false;
+        bool started = false;
+        GS *gs = nullptr;
+    };
+    GsThreadState g_gsThread;
+    thread_local bool t_gsWorker = false;
+
+    void gsThreadStart(GS &gs)
+    {
+        g_gsThread.gs = &gs;
+        g_gsThread.started = true;
+        std::thread([]()
+                    {
+                        t_gsWorker = true;
+                        ThreadNaming::SetCurrentThreadName("GsThread");
+#if defined(PS2X_NATIVE_HOST)
+                        if (std::getenv("PS2X_PROFILE_GS")) // PS2X_PROFILE samples this thread instead
+                            ps2host::profileCurrentThread();
+#endif
+                        for (;;)
+                        {
+                            std::vector<uint8_t> job;
+                            {
+                                std::unique_lock lock(g_gsThread.m);
+                                g_gsThread.cv.wait(lock, [] { return !g_gsThread.jobs.empty(); });
+                                job = std::move(g_gsThread.jobs.front());
+                                g_gsThread.jobs.pop_front();
+                                g_gsThread.busy = true;
+                            }
+                            g_gsThread.gs->processGIFPacket(job.data(), static_cast<uint32_t>(job.size()));
+                            {
+                                std::lock_guard lock(g_gsThread.m);
+                                job.clear();
+                                if (g_gsThread.pool.size() < 256u)
+                                    g_gsThread.pool.push_back(std::move(job));
+                                g_gsThread.busy = false;
+                                if (g_gsThread.jobs.empty())
+                                    g_gsThread.idleCv.notify_all();
+                            }
+                        }
+                    })
+            .detach();
+    }
+}
+
+bool ps2GsThreadEnabled()
+{
+    static const bool s_on = []()
+    {
+        const char *v = std::getenv("PS2X_GS_THREAD");
+        return v && *v && *v != '0';
+    }();
+    return s_on;
+}
+
+void ps2GsThreadSubmit(GS &gs, const uint8_t *data, uint32_t size)
+{
+    if (t_gsWorker || !data || size == 0u)
+    {
+        gs.processGIFPacket(data, size);
+        return;
+    }
+    std::vector<uint8_t> buf;
+    {
+        std::lock_guard lock(g_gsThread.m);
+        if (!g_gsThread.started)
+            gsThreadStart(gs);
+        if (!g_gsThread.pool.empty())
+        {
+            buf = std::move(g_gsThread.pool.back());
+            g_gsThread.pool.pop_back();
+        }
+    }
+    buf.assign(data, data + size);
+    {
+        std::lock_guard lock(g_gsThread.m);
+        g_gsThread.jobs.push_back(std::move(buf));
+    }
+    g_gsThread.cv.notify_one();
+}
+
+void ps2GsThreadDrain()
+{
+    if (t_gsWorker || !g_gsThread.started)
+        return;
+    std::unique_lock lock(g_gsThread.m);
+    g_gsThread.idleCv.wait(lock, [] { return g_gsThread.jobs.empty() && !g_gsThread.busy; });
 }
 
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
@@ -835,7 +941,12 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+                                    {
+                                        if (ps2GsThreadEnabled())
+                                            ps2GsThreadSubmit(m_gs, data, size);
+                                        else
+                                            m_gs.processGIFPacket(data, size);
+                                    });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
@@ -2839,7 +2950,7 @@ void PS2Runtime::run()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
 #if defined(PS2X_NATIVE_HOST)
-        if (!std::getenv("PS2X_PROFILE_WORKER"))
+        if (!std::getenv("PS2X_PROFILE_WORKER") && !std::getenv("PS2X_PROFILE_GS"))
             ps2host::profileCurrentThread();
 #endif
         try

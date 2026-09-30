@@ -69,6 +69,7 @@ namespace ps2host
         ComPtr<ID3D11ShaderResourceView> g_uploadSrv;
         uint32_t g_uploadW = 0, g_uploadH = 0;
         std::recursive_mutex g_d3dMutex;
+        std::atomic<uint64_t> g_d3dEpoch{1}; // bumped whenever the host changes immediate-context state
 
         ComPtr<IXAudio2> g_xaudio;
         IXAudio2MasteringVoice *g_master = nullptr;
@@ -427,6 +428,7 @@ float4 ps_main(VsOut i) : SV_Target
 
         void drawBlit(ID3D11ShaderResourceView *srv, uint32_t srcW, uint32_t srcH, float u1, float v1)
         {
+            g_d3dEpoch.fetch_add(1, std::memory_order_relaxed); // GS backend state cache must rebind
             resizeIfNeeded();
             DXGI_SWAP_CHAIN_DESC1 desc{};
             g_swap->GetDesc1(&desc);
@@ -797,6 +799,7 @@ float4 ps_main(VsOut i) : SV_Target
     }
 
     std::recursive_mutex &d3dLock() { return g_d3dMutex; }
+    uint64_t d3dStateEpoch() { return g_d3dEpoch.load(std::memory_order_relaxed); }
     void beginFrame() { waitForNextFrame(); }
     ID3D11Device *device() { return g_device.Get(); }
     ID3D11DeviceContext *context() { return g_ctx.Get(); }

@@ -2,7 +2,9 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <vector>
 #include <xmmintrin.h>
@@ -115,12 +117,17 @@ namespace ps2vu1n
                     qw += nloop;
                 if ((packet.size() / 16u) + qw > u.size / 16u)
                     break;
-                for (uint64_t q = 0; q < qw; ++q)
+                // One resize per GIF tag, then copy in at most two runs (VU memory wraps).
+                size_t at = packet.size();
+                packet.resize(at + static_cast<size_t>(qw) * 16u);
+                uint64_t left = qw * 16u;
+                while (left > 0u)
                 {
-                    const size_t at = packet.size();
-                    packet.resize(at + 16u);
-                    std::memcpy(packet.data() + at, u.mem + addr, 16u);
-                    addr = (addr + 16u) % u.size;
+                    const uint32_t run = static_cast<uint32_t>(std::min<uint64_t>(left, u.size - addr));
+                    std::memcpy(packet.data() + at, u.mem + addr, run);
+                    at += run;
+                    left -= run;
+                    addr = (addr + run) % u.size;
                 }
                 if (eop)
                     break;

@@ -27,6 +27,7 @@ extern thread_local GifPathId g_gifCurrentPath;
 #include <string>
 #include <unordered_map>
 #include <vector>
+namespace ps2host { uint64_t d3dStateEpoch(); } // win32_host.cpp: bumped when the host draws
 
 using Microsoft::WRL::ComPtr;
 using namespace GSInternal;
@@ -288,6 +289,26 @@ struct GSD3D11Backend::Impl
     ComPtr<ID3D11InputLayout> layout;
     ComPtr<ID3D11Buffer> vb, cb, blitCb;
     uint32_t vbCapacity = 0;
+    uint32_t vbWriteOffset = 0; // append-only ring: NO_OVERWRITE maps, DISCARD on wrap
+    // Draw-state cache for flushPending. Anything else that changes context state (blit, present,
+    // latch) bumps pipeGen so the next draw rebinds everything.
+    uint64_t pipeGen = 1;
+    struct BoundDrawState
+    {
+        uint64_t gen = 0;
+        uint64_t hostEpoch = 0;
+        ID3D11RenderTargetView *rtv = nullptr;
+        ID3D11DepthStencilView *dsv = nullptr;
+        D3D11_VIEWPORT vp{};
+        D3D11_RECT sc{};
+        ID3D11ShaderResourceView *srv = nullptr;
+        ID3D11SamplerState *smp = nullptr;
+        ID3D11BlendState *bs = nullptr;
+        float bf[4]{};
+        ID3D11DepthStencilState *ds = nullptr;
+        bool cbValid = false;
+        unsigned char cbData[256]{};
+    } bound;
     ComPtr<ID3D11SamplerState> samplers[4]; // [linear][repeat]
     ComPtr<ID3D11SamplerState> pointClamp, linearClamp;
     ComPtr<ID3D11RasterizerState> raster;
@@ -362,6 +383,13 @@ struct GSD3D11Backend::Impl
     uint64_t statDraws = 0, statSyncs = 0, statUploads = 0, statTexDecodes = 0, statTexContentHits = 0;
     const char *syncReason = "?";
     char syncDetail[96] = "";
+    const bool syncLogEnabled = std::getenv("PS2X_SYNC_LOG") != nullptr;
+    struct ClutCacheEntry
+    {
+        uint64_t stamp = 0;
+        std::array<uint32_t, 256> raw{};
+    };
+    std::unordered_map<uint64_t, ClutCacheEntry> clutCache;
     const bool disableRtSubTex = std::getenv("PS2X_NO_RT_SUBTEX") != nullptr;
     char lastPresent[160] = "none";
     std::unordered_map<std::string, uint64_t> syncReasons;
@@ -477,6 +505,7 @@ struct GSD3D11Backend::Impl
     void blit(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, float dstW, float dstH,
               float u0, float v0, float us, float vs_, bool linear, float dstX = 0.0f, float dstY = 0.0f)
     {
+        ++pipeGen;
         D3D11_MAPPED_SUBRESOURCE m{};
         if (SUCCEEDED(ctx->Map(blitCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
         {
@@ -802,9 +831,23 @@ struct GSD3D11Backend::Impl
         }
         // The CLUT source may live in a render target that has only been drawn on the GPU.
         uint32_t first, last;
-        pageSpan(tex0.cbp, 1, tex0.cpsm, 0, 16, first, last);
+        if (tex0.csm == 0u)
+        {
+            // CSM1 palettes are tiny: T8 = 16x16 (4 CT32 / 2 CT16 blocks), T4 = 8x2 (1 block). A 64-wide page
+            // span reaches into the next page, which is often a camera-texture render target.
+            const bool c16c = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
+            const uint32_t nblocks = isIndexed4(tex0.psm) ? 1u : (c16c ? 2u : 4u);
+            first = tex0.cbp / 32u;
+            last = (tex0.cbp + nblocks - 1u) / 32u;
+        }
+        else
+            pageSpan(tex0.cbp, 1, tex0.cpsm, 0, 16, first, last);
         syncReason = "clut";
+        if (syncLogEnabled)
+            std::snprintf(syncDetail, sizeof(syncDetail), "cbp=%u cpsm=%u csm=%u tex psm=%u tbp=%u pages=%u-%u", tex0.cbp, tex0.cpsm,
+                          tex0.csm, tex0.psm, tex0.tbp0, first, last);
         syncOverlapping(first, last);
+        syncDetail[0] = 0;
 
         const bool four = isIndexed4(tex0.psm);
         const bool c16 = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
@@ -816,8 +859,28 @@ struct GSD3D11Backend::Impl
         const uint32_t dstBase = (static_cast<uint32_t>(tex0.csa) & csaMask) << 4u;
         const bool csm1Suffix = tex0.csm == 0u && c32 && !four;
         const uint32_t firstEntry = csm1Suffix ? dstBase : 0u;
+        // Palette loads happen on most TEX0 writes; reading 256 swizzled entries each time was ~8% of a
+        // match frame. Reuse the raw entries while the source pages are unchanged.
+        uint64_t ckey = fnv1a(&tex0.cbp, sizeof(tex0.cbp));
+        {
+            const uint32_t k[] = {tex0.cpsm, tex0.csm, tex0.csa, four ? 1u : 0u, texclut.cbw, texclut.cou, texclut.cov};
+            ckey = fnv1a(k, sizeof(k), ckey);
+        }
+        const uint64_t cstamp = texturePageStamp(first, last);
+        ClutCacheEntry *cached = nullptr;
+        {
+            auto it = clutCache.find(ckey);
+            if (it != clutCache.end() && it->second.stamp == cstamp)
+                cached = &it->second;
+        }
+        ClutCacheEntry fresh{};
         for (uint32_t e = firstEntry; e < count; ++e)
         {
+            uint32_t raw;
+            if (cached)
+                raw = cached->raw[e];
+            else
+            {
             uint32_t sx, sy, sw = 1u;
             if (tex0.csm == 0u)
             {
@@ -831,7 +894,9 @@ struct GSD3D11Backend::Impl
                 sx = (static_cast<uint32_t>(texclut.cou) << 4u) + e;
                 sy = texclut.cov;
             }
-            const uint32_t raw = mem.ReadVram(tex0.cpsm, tex0.cbp, sw, sx, sy);
+            raw = mem.ReadVram(tex0.cpsm, tex0.cbp, sw, sx, sy);
+            fresh.raw[e] = raw;
+            }
             const uint32_t d = (csm1Suffix ? e : dstBase + e) & (c16 ? 0x1FFu : 0xFFu);
             if (c16)
                 clut[d] = static_cast<uint16_t>(raw);
@@ -840,6 +905,13 @@ struct GSD3D11Backend::Impl
                 clut[d] = static_cast<uint16_t>(raw & 0xFFFFu);
                 clut[d + 256u] = static_cast<uint16_t>(raw >> 16u);
             }
+        }
+        if (!cached)
+        {
+            if (clutCache.size() > 4096u)
+                clutCache.clear();
+            fresh.stamp = cstamp;
+            clutCache[ckey] = fresh;
         }
         ++clutVersion;
     }
@@ -873,8 +945,9 @@ struct GSD3D11Backend::Impl
         uint32_t first, last;
         pageSpan(t.tbp0, t.tbw, t.psm, 0, th, first, last);
         syncReason = "texture";
-        std::snprintf(syncDetail, sizeof(syncDetail), "tbp=%u tbw=%u psm=%u %ux%u pages=%u-%u", t.tbp0, t.tbw, t.psm, tw, th,
-                      first, last);
+        if (syncLogEnabled)
+            std::snprintf(syncDetail, sizeof(syncDetail), "tbp=%u tbw=%u psm=%u %ux%u pages=%u-%u", t.tbp0, t.tbw, t.psm, tw, th,
+                          first, last);
         syncOverlapping(first, last);
         syncDetail[0] = 0;
 
@@ -1278,6 +1351,7 @@ struct GSD3D11Backend::Impl
 
         // ---- texture
         ID3D11ShaderResourceView *texSrv = nullptr;
+        bool texFromRt = false;
         float texDims[4] = {1, 1, 1, 1};
         float origin[2] = {0, 0};
         float alphaScale = 255.0f;
@@ -1380,9 +1454,11 @@ struct GSD3D11Backend::Impl
                     }
                     ctx->CopyResource(feedbackTex.Get(), rt->tex.Get());
                     texSrv = feedbackSrv.Get();
+                    texFromRt = true;
                 }
                 else
                     texSrv = srcRt->srv.Get();
+                    texFromRt = true;
             }
             else
             {
@@ -1439,8 +1515,10 @@ struct GSD3D11Backend::Impl
         if (bytes > vbCapacity)
         {
             vb.Reset();
+            ++pipeGen; // new buffer must be bound
+            vbWriteOffset = 0;
             D3D11_BUFFER_DESC bd{};
-            bd.ByteWidth = std::max<uint32_t>(bytes, 1u << 20);
+            bd.ByteWidth = std::max<uint32_t>(bytes, 8u << 20);
             bd.Usage = D3D11_USAGE_DYNAMIC;
             bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
             bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -1452,53 +1530,112 @@ struct GSD3D11Backend::Impl
             vbCapacity = bd.ByteWidth;
         }
         D3D11_MAPPED_SUBRESOURCE m{};
-        if (FAILED(ctx->Map(vb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        D3D11_MAP mapType = D3D11_MAP_WRITE_NO_OVERWRITE;
+        if (vbWriteOffset + bytes > vbCapacity)
+        {
+            mapType = D3D11_MAP_WRITE_DISCARD;
+            vbWriteOffset = 0;
+        }
+        if (FAILED(ctx->Map(vb.Get(), 0, mapType, 0, &m)))
         {
             pending.clear();
             return;
         }
-        std::memcpy(m.pData, pending.data(), bytes);
+        std::memcpy(static_cast<uint8_t *>(m.pData) + vbWriteOffset, pending.data(), bytes);
         ctx->Unmap(vb.Get(), 0);
+        const UINT firstVertex = vbWriteOffset / static_cast<UINT>(sizeof(Vtx));
+        vbWriteOffset += bytes;
 
         // ---- pipeline
+        const uint64_t hostEpoch = ps2host::d3dStateEpoch();
+        if (bound.gen != pipeGen || bound.hostEpoch != hostEpoch)
+        {
+            bound = BoundDrawState{};
+            bound.gen = pipeGen;
+            bound.hostEpoch = hostEpoch;
+            bound.vp.Width = -1.0f; // force
+            bound.sc.right = -1;
+            ctx->RSSetState(raster.Get());
+            ctx->IASetInputLayout(layout.Get());
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            UINT stride = sizeof(Vtx), offset = 0;
+            ID3D11Buffer *vbp = vb.Get();
+            ctx->IASetVertexBuffers(0, 1, &vbp, &stride, &offset);
+            ctx->VSSetShader(vs.Get(), nullptr, 0);
+            ctx->PSSetShader(ps.Get(), nullptr, 0);
+            ctx->GSSetShader(nullptr, nullptr, 0);
+            ID3D11Buffer *cbp = cb.Get();
+            ctx->VSSetConstantBuffers(0, 1, &cbp);
+            ctx->PSSetConstantBuffers(0, 1, &cbp);
+            ID3D11ShaderResourceView *nullSrv0 = nullptr;
+            ctx->PSSetShaderResources(0, 1, &nullSrv0);
+            ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        }
         ID3D11RenderTargetView *rtv = rt->rtv.Get();
-        ctx->OMSetRenderTargets(1, &rtv, dt ? dt->dsv.Get() : nullptr);
+        ID3D11DepthStencilView *dsv = dt ? dt->dsv.Get() : nullptr;
+        if (rtv != bound.rtv || dsv != bound.dsv)
+        {
+            ctx->OMSetRenderTargets(1, &rtv, dsv);
+            bound.rtv = rtv;
+            bound.dsv = dsv;
+        }
         D3D11_VIEWPORT vp{0, 0, static_cast<float>(rt->w * scale), static_cast<float>(rt->h * scale), 0, 1};
-        ctx->RSSetViewports(1, &vp);
+        if (std::memcmp(&vp, &bound.vp, sizeof(vp)) != 0)
+        {
+            ctx->RSSetViewports(1, &vp);
+            bound.vp = vp;
+        }
         D3D11_RECT sc{static_cast<LONG>(c.scissor.x0 * scale), static_cast<LONG>(c.scissor.y0 * scale),
                       static_cast<LONG>((c.scissor.x1 + 1u) * scale), static_cast<LONG>((c.scissor.y1 + 1u) * scale)};
-        ctx->RSSetScissorRects(1, &sc);
-        ctx->RSSetState(raster.Get());
-        ctx->IASetInputLayout(layout.Get());
-        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        UINT stride = sizeof(Vtx), offset = 0;
-        ID3D11Buffer *vbp = vb.Get();
-        ctx->IASetVertexBuffers(0, 1, &vbp, &stride, &offset);
-        ctx->VSSetShader(vs.Get(), nullptr, 0);
-        ctx->PSSetShader(ps.Get(), nullptr, 0);
-        ctx->GSSetShader(nullptr, nullptr, 0);
-        ID3D11Buffer *cbp = cb.Get();
-        ctx->VSSetConstantBuffers(0, 1, &cbp);
-        ctx->PSSetConstantBuffers(0, 1, &cbp);
-        ctx->PSSetShaderResources(0, 1, &texSrv);
+        if (std::memcmp(&sc, &bound.sc, sizeof(sc)) != 0)
+        {
+            ctx->RSSetScissorRects(1, &sc);
+            bound.sc = sc;
+        }
+        if (texSrv != bound.srv)
+        {
+            ctx->PSSetShaderResources(0, 1, &texSrv);
+            bound.srv = texSrv;
+        }
         const bool linear = st.linearFilter;
         const bool repeat = (wms == 0 && wmt == 0);
         ID3D11SamplerState *smp = samplers[(linear ? 2 : 0) + (repeat ? 1 : 0)].Get();
-        ctx->PSSetSamplers(0, 1, &smp);
+        if (smp != bound.smp)
+        {
+            ctx->PSSetSamplers(0, 1, &smp);
+            bound.smp = smp;
+        }
 
         auto drawPass = [&](float afailSelect, bool depthWrite, bool rgbOnly, bool colorOff)
         {
             cbd.p1[3] = afailSelect;
-            D3D11_MAPPED_SUBRESOURCE cm{};
-            if (SUCCEEDED(ctx->Map(cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &cm)))
+            static_assert(sizeof(cbd) <= sizeof(bound.cbData), "constant buffer cache too small");
+            if (!bound.cbValid || std::memcmp(bound.cbData, &cbd, sizeof(cbd)) != 0)
             {
-                std::memcpy(cm.pData, &cbd, sizeof(cbd));
-                ctx->Unmap(cb.Get(), 0);
+                D3D11_MAPPED_SUBRESOURCE cm{};
+                if (SUCCEEDED(ctx->Map(cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &cm)))
+                {
+                    std::memcpy(cm.pData, &cbd, sizeof(cbd));
+                    ctx->Unmap(cb.Get(), 0);
+                    std::memcpy(bound.cbData, &cbd, sizeof(cbd));
+                    bound.cbValid = true;
+                }
             }
             float bf[4];
-            ctx->OMSetBlendState(blendState(st, rgbOnly, colorOff, bf), bf, 0xFFFFFFFFu);
-            ctx->OMSetDepthStencilState(dt ? depthState(true, zfunc, depthWrite) : depthOff.Get(), 0);
-            ctx->Draw(static_cast<UINT>(pending.size()), 0);
+            ID3D11BlendState *bs = blendState(st, rgbOnly, colorOff, bf);
+            if (bs != bound.bs || std::memcmp(bf, bound.bf, sizeof(bf)) != 0)
+            {
+                ctx->OMSetBlendState(bs, bf, 0xFFFFFFFFu);
+                bound.bs = bs;
+                std::memcpy(bound.bf, bf, sizeof(bf));
+            }
+            ID3D11DepthStencilState *ds = dt ? depthState(true, zfunc, depthWrite) : depthOff.Get();
+            if (ds != bound.ds)
+            {
+                ctx->OMSetDepthStencilState(ds, 0);
+                bound.ds = ds;
+            }
+            ctx->Draw(static_cast<UINT>(pending.size()), firstVertex);
         };
 
         static const int s_traceLimit = std::getenv("PS2X_GS_TRACE") ? std::atoi(std::getenv("PS2X_GS_TRACE")) : 0;
@@ -1608,8 +1745,12 @@ struct GSD3D11Backend::Impl
         else
             drawPass(0.0f, zwrite, false, false);
 
-        ID3D11ShaderResourceView *nullSrv = nullptr;
-        ctx->PSSetShaderResources(0, 1, &nullSrv);
+        if (texFromRt)
+        {
+            ID3D11ShaderResourceView *nullSrv = nullptr;
+            ctx->PSSetShaderResources(0, 1, &nullSrv);
+            bound.srv = nullptr;
+        }
         rt->gpuDirty = true;
         {
             float minY = 1e9f, maxY = -1e9f;
@@ -1618,8 +1759,12 @@ struct GSD3D11Backend::Impl
                 minY = std::min(minY, v.y);
                 maxY = std::max(maxY, v.y);
             }
-            const int y0 = std::max<int>(static_cast<int>(c.scissor.y0), static_cast<int>(std::floor(minY)));
-            const int y1 = std::min<int>(static_cast<int>(c.scissor.y1), static_cast<int>(std::ceil(maxY)));
+            // Rows whose pixel centres lie in [minY, maxY): a full 256-line sprite ends at y=256 but
+            // only touches rows 0..255 (counting row 256 forced readbacks for CLUTs stored below).
+            const int yTop = static_cast<int>(std::floor(minY));
+            const int yBottom = std::max(yTop, static_cast<int>(std::ceil(maxY)) - 1);
+            const int y0 = std::max<int>(static_cast<int>(c.scissor.y0), yTop);
+            const int y1 = std::min<int>({static_cast<int>(c.scissor.y1), yBottom, static_cast<int>(rt->h) - 1});
             if (y1 >= y0)
             {
                 rt->dirtyY0 = std::min<uint32_t>(rt->dirtyY0, static_cast<uint32_t>(std::max(0, y0)));
@@ -1638,6 +1783,7 @@ struct GSD3D11Backend::Impl
     // ---------------------------------------------------------------- presentation
     void latchDisplay(ID3D11Texture2D *src, uint32_t sx, uint32_t sy, uint32_t w, uint32_t h, bool scaled)
     {
+        ++pipeGen;
         const uint32_t s = scaled ? scale : 1u;
         const uint32_t dw = w * s, dh = h * s;
         D3D11_TEXTURE2D_DESC td{};
@@ -1662,6 +1808,7 @@ struct GSD3D11Backend::Impl
 
     bool presentRequest(const GSPresentationRequest &req)
     {
+        ++pipeGen;
         auto valid = [](uint64_t fb, uint64_t disp)
         { return ((fb >> 9) & 0x3Fu) != 0u && ((disp >> 32) & 0xFFFu) != 0u && ((disp >> 44) & 0x7FFu) != 0u; };
         const bool en1 = (req.pmode & 1u) != 0u && valid(req.dispfb1, req.display1);
