@@ -104,8 +104,8 @@ bool ps2GsThreadEnabled()
 {
     static const bool s_on = []()
     {
-        const char *v = std::getenv("PS2X_GS_THREAD");
-        return v && *v && *v != '0';
+        const char *v = std::getenv("PS2X_GS_THREAD"); // default on; PS2X_GS_THREAD=0 processes GIF inline
+        return !(v && *v == '0');
     }();
     return s_on;
 }
