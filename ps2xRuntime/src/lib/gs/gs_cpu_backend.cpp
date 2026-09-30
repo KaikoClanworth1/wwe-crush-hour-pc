@@ -15,6 +15,12 @@
 #include <iostream>
 #include <stdexcept>
 
+namespace GSMem
+{
+    // ps2_gs_memory.cpp (not in the header to keep the runner PCH untouched)
+    void WriteCT32Row(uint8_t *data, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, const uint8_t *src, uint32_t n);
+}
+
 using namespace GSInternal;
 
 namespace
@@ -1523,13 +1529,20 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
             const uint32_t avail = (sizeBytes - offset) / 4u;
             const uint32_t pixelsLeft = m_transferState.totalPixels - m_transferState.copiedPixels;
             const uint32_t n = std::min(std::min(rowLeft, avail), pixelsLeft);
-            const auto writeFn = m_writeVramFuncs[dpsm & 0x3Fu];
             const uint32_t x0 = m_transferState.x, y0 = m_transferState.y;
-            for (uint32_t i = 0; i < n; ++i)
+            if (dpsm == GS_PSM_CT32)
             {
-                uint32_t value = 0u;
-                std::memcpy(&value, data + offset + i * 4u, sizeof(value));
-                writeFn(m_vram, dbp, dbw, x0 + i, y0, value);
+                GSMem::WriteCT32Row(m_vram, dbp, dbw, x0, y0, data + offset, n);
+            }
+            else
+            {
+                const auto writeFn = m_writeVramFuncs[dpsm & 0x3Fu];
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    uint32_t value = 0u;
+                    std::memcpy(&value, data + offset + i * 4u, sizeof(value));
+                    writeFn(m_vram, dbp, dbw, x0 + i, y0, value);
+                }
             }
             offset += n * 4u;
             advancePixel(n);

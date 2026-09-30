@@ -898,7 +898,9 @@ namespace ps2_stubs
         // If handle is 0 fflush flushes *all* output streams.
         if (file_handle == 0)
         {
-            ret = ::fflush(NULL);
+            // Guest "flush everything": nothing guest-visible depends on host stream buffers, and a
+            // real ::fflush(NULL) per call is a syscall storm (the game calls it every frame).
+            ret = 0;
         }
         else
         {

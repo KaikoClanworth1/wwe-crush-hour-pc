@@ -536,6 +536,14 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
     {
         return 0u;
     }
+    // Called at every EE checkpoint (as often as every 32 cycles in wait loops); batch the work.
+    // Timer interrupts land at most ~1024 EE cycles (~3.5 us) late.
+    static uint64_t s_pendingCycles = 0u;
+    s_pendingCycles += eeCycles;
+    if (s_pendingCycles < 1024u)
+        return 0u;
+    eeCycles = s_pendingCycles;
+    s_pendingCycles = 0u;
 
     constexpr uint32_t kGifStat = 0x10003020u;
     constexpr uint32_t kGifFqcMask = 0x1F000000u;

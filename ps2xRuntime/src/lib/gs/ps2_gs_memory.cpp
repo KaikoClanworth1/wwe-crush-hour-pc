@@ -260,6 +260,21 @@ namespace GSMem
         PixelStorageTraits<C32>::Write(PageTableC32, data, bp, bw, x, y, value);
     }
 
+    // n consecutive CT32 pixels of one row (image uploads). Same addressing as WriteCT32 with the
+    // row-invariant parts hoisted: page = bp/32 + (y/32)*bw + x/64, pixel = table[bp%32][y%32][x%64].
+    void WriteCT32Row(u8* data, u32 bp, u32 bw, u32 x, u32 y, const u8* src, u32 n)
+    {
+        const auto &row = PageTableC32[bp % 32u][y % 32u];
+        const u32 rowPage = bp / 32u + (y / 32u) * bw;
+        for (u32 i = 0; i < n; ++i)
+        {
+            const u32 xx = x + i;
+            const u32 pixel = (rowPage + xx / 64u) * 2048u + row[xx % 64u];
+            const u32 byteAddr = (pixel * 4u) & (0x400000u - 4u);
+            std::memcpy(data + byteAddr, src + i * 4u, 4);
+        }
+    }
+
     void WriteCT24(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
         PixelStorageTraits<C24>::Write(PageTableC32, data, bp, bw, x, y, value);

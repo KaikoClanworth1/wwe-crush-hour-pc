@@ -965,6 +965,8 @@ namespace ps2_stubs
 
         notifyMpegCdStreamStart(runtime);
 
+        static const bool s_cdLog = std::getenv("PS2X_CD_LOG") != nullptr;
+        if (s_cdLog)
         std::cerr << "[sceCdStStart] lbn=0x" << std::hex << g_cdStreamingLbn
                   << " endLbn=0x" << g_cdStreamingEndLbn << std::dec
                   << " rate=" << g_cdStreamTiming.sectorsPerSecond << " sectors/s"
