@@ -1670,6 +1670,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 #endif
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint32_t spBefore = GPR_U32(ctx, 29);
+    extern uint64_t g_eeTransferSeq;
+    const uint64_t transferSeqBefore = g_eeTransferSeq;
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -1677,10 +1680,31 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (ctx->pc == entryPc)
+    // A callee that leaves pc at its own entry normally returned without setting pc (HLE stubs).
+    // But if it (or anything it called) suspended at a checkpoint, pc == entry can also mean "resume
+    // a *nested* call of this same function" (e.g. _rwDMAAddPkt -> _rwDMAClosePkt -> rwDMAFlushPURef
+    // -> _rwDMAAddPkt): treating that as a return skipped the rest of the call chain with the inner
+    // frame's sp, and the next return jumped into the heap (title-screen freeze at 0x8a80c0).
+    if (ctx->pc == entryPc && g_eeTransferSeq == transferSeqBefore)
     {
         ctx->pc = fallthroughPc;
     }
+
+#if defined(PS2X_NATIVE_HOST)
+    {
+        // PS2X_SPCHECK=1: a call that returns normally must leave sp as it found it.
+        static const bool s_spCheck = std::getenv("PS2X_SPCHECK") != nullptr;
+        static int s_spReports = 0;
+        if (s_spCheck && ctx->pc == fallthroughPc && GPR_U32(ctx, 29) != spBefore && s_spReports < 10)
+        {
+            ++s_spReports;
+            std::printf("[spcheck] call %08x (%s) from %08x (%s) returned sp=0x%x, was 0x%x (ra=0x%x)\n", targetPc,
+                        guestSymbolName(targetPc), sourcePc, guestSymbolName(sourcePc), GPR_U32(ctx, 29), spBefore,
+                        GPR_U32(ctx, 31));
+            std::fflush(stdout);
+        }
+    }
+#endif
 
     return ctx->pc == fallthroughPc;
 }
@@ -2398,6 +2422,41 @@ void ps2RecordBranch(uint32_t source, uint32_t target, uint32_t ra, uint32_t sp)
         return true;
     }();
     (void)s_scanInit;
+    // PS2X_GLOBALWATCH=addr:lo-hi (hex): report the first transfer after which the 32-bit guest word at
+    // addr lies inside [lo,hi) (e.g. a DMA write pointer that wanders into the stack).
+    static uint32_t s_gwAddr = 0, s_gwLo = 0, s_gwHi = 0;
+    static bool s_gwDone = false;
+    static uint32_t s_gwPrev = 0, s_gwPrevSrc = 0, s_gwPrevTgt = 0;
+    static const bool s_gwInit = []()
+    {
+        if (const char *v = std::getenv("PS2X_GLOBALWATCH"))
+            std::sscanf(v, "%x:%x-%x", &s_gwAddr, &s_gwLo, &s_gwHi);
+        return true;
+    }();
+    (void)s_gwInit;
+    if (s_gwHi && !s_gwDone && g_dbgRdram)
+    {
+        uint32_t w;
+        std::memcpy(&w, g_dbgRdram + (s_gwAddr & 0x1FFFFFCu), 4);
+        if (w >= s_gwLo && w < s_gwHi)
+        {
+            s_gwDone = true;
+            std::printf("[globalwatch] [0x%x]=0x%x (was 0x%x before %08x->%08x); this transfer %08x -> %08x (%s -> %s) ra=%08x sp=%08x\n",
+                        s_gwAddr, w, s_gwPrev, s_gwPrevSrc, s_gwPrevTgt, source, target, guestSymbolName(source),
+                        guestSymbolName(target), ra, sp);
+            for (uint32_t a = (s_gwAddr & ~0xFu) - 0x20u; a < (s_gwAddr & ~0xFu) + 0x40u; a += 16)
+            {
+                uint32_t q[4];
+                std::memcpy(q, g_dbgRdram + a, 16);
+                std::printf("  %08x: %08x %08x %08x %08x\n", a, q[0], q[1], q[2], q[3]);
+            }
+            extern void ps2DumpBranchRing();
+            ps2DumpBranchRing();
+        }
+        s_gwPrev = w;
+        s_gwPrevSrc = source;
+        s_gwPrevTgt = target;
+    }
     if (s_scanHi && !s_scanDone && g_dbgRdram)
     {
         for (uint32_t a = s_scanLo & ~3u; a + 4 <= s_scanHi; a += 4)

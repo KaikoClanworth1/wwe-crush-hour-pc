@@ -93,20 +93,31 @@ namespace
     // Debug: ring of scheduler events (invocation start/finish, thread switches) dumped when a thread
     // jumps to a missing target. evt: 'S' start invocation, 'F' finish, 'T' thread switch.
     struct SchedEvt { char evt; int thread; int kind; uint32_t invPc; uint32_t threadPc; uint32_t threadSp; uint32_t threadRa; };
-    SchedEvt g_schedRing[128];
+    SchedEvt g_schedRing[4096];
     uint32_t g_schedRingPos = 0;
     void schedRecord(char evt, int thread, int kind, uint32_t invPc, const R5900Context &base)
     {
         const R5900Context *cp = &base;
-        g_schedRing[g_schedRingPos++ & 127u] = {evt, thread, kind, invPc, base.pc, GPR_U32(cp, 29), GPR_U32(cp, 31)};
+        g_schedRing[g_schedRingPos++ & 4095u] = {evt, thread, kind, invPc, base.pc, GPR_U32(cp, 29), GPR_U32(cp, 31)};
     }
     void schedDump()
     {
         std::printf("[sched-ring] last scheduler events (oldest first): evt thread kind invPc | base pc sp ra\n");
-        for (uint32_t i = 0; i < 128u; ++i)
+        uint32_t shown = 0;
+        uint32_t startIdx = 0;
+        for (uint32_t i = 4096u; i-- > 0u && shown < 80u;)
         {
-            const SchedEvt &e = g_schedRing[(g_schedRingPos + i) & 127u];
-            if (!e.evt)
+            const SchedEvt &e = g_schedRing[(g_schedRingPos + i) & 4095u];
+            if (e.evt && e.thread == 1)
+            {
+                ++shown;
+                startIdx = i;
+            }
+        }
+        for (uint32_t i = startIdx; i < 4096u; ++i)
+        {
+            const SchedEvt &e = g_schedRing[(g_schedRingPos + i) & 4095u];
+            if (!e.evt || e.thread != 1)
                 continue;
             std::printf("  %c t=%d k=%d inv=%08x | pc=%08x sp=%08x ra=%08x\n", e.evt, e.thread, e.kind, e.invPc, e.threadPc,
                         e.threadSp, e.threadRa);
@@ -347,6 +358,12 @@ void EeScheduler::run()
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
         {
+            const R5900Context *cp = &context;
+            schedRecord('D', running->id, running->invocations.empty() ? -1 : static_cast<int>(running->invocations.back().kind),
+                        0u, context);
+            (void)cp;
+        }
+        {
             extern void ps2RecordBranch(uint32_t source, uint32_t target, uint32_t ra, uint32_t sp);
             const R5900Context *cp = &context;
             ps2RecordBranch(0xEEEEEEEEu, context.pc, GPR_U32(cp, 31), GPR_U32(cp, 29));
@@ -419,7 +436,19 @@ void EeScheduler::postEvent(EeEvent event)
     m_eventCv.notify_one();
 }
 
+// Counts checkpoint transfers (guest code returning to the dispatcher mid-call). dispatchGuestBranch
+// uses it to tell "callee returned without touching pc" (HLE stubs) from "callee suspended".
+uint64_t g_eeTransferSeq = 0;
+
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+{
+    const bool due = checkpointDueImpl(cycles);
+    if (due)
+        ++g_eeTransferSeq;
+    return due;
+}
+
+bool EeScheduler::checkpointDueImpl(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
 

@@ -258,6 +258,16 @@ namespace ps2_stubs
                 return true;
             }
 
+            {
+                static int s_warn = 20;
+                if (s_warn > 0 && offset + bytes > 0x01F80000u)
+                {
+                    --s_warn;
+                    std::printf("[cd-write] Read dst=0x%x bytes=0x%zx end=0x%zx lbn=0x%x  <-- reaches stack area\n", offset, bytes,
+                                offset + bytes, args.lbn);
+                    std::fflush(stdout);
+                }
+            }
             return readCdSectors(args.lbn, args.sectors, rdram + offset, bytes);
         };
 
@@ -826,6 +836,16 @@ namespace ps2_stubs
 
                 const uint32_t readLbn = g_cdStreamingLbn;
                 const size_t readBytes = static_cast<size_t>(sectors) * kCdSectorSize;
+                {
+                    static int s_warn = 20;
+                    if (s_warn > 0 && offset + readBytes > 0x01F80000u)
+                    {
+                        --s_warn;
+                        std::printf("[cd-write] StRead dst=0x%x bytes=0x%zx end=0x%zx buffer=0x%x read=%u/%u  <-- reaches stack area\n",
+                                    offset, readBytes, offset + readBytes, state.buffer, state.sectorsRead, state.requestedSectors);
+                        std::fflush(stdout);
+                    }
+                }
                 if (!readCdSectors(readLbn, sectors, rdram + offset, readBytes))
                 {
                     finishCdStRead(rdram, ctx, state, g_lastCdError);

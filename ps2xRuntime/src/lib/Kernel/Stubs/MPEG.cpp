@@ -1849,6 +1849,23 @@ namespace ps2_stubs
             dispatchStreamCallbacks(rdram, ctx, runtime, events);
         }
 
+        // Debug: PS2X_MPEG_WRITE_LOG lists picture writes; writes reaching the top 512 KB of RAM (thread
+        // stacks) are always reported.
+        void logMpegGuestWrite(const char *what, uint32_t destAddr, uint32_t bytes, uint32_t w, uint32_t h)
+        {
+            static int s_log = std::getenv("PS2X_MPEG_WRITE_LOG") ? 40 : 0;
+            static int s_warn = 20;
+            const uint32_t phys = destAddr & 0x1FFFFFFFu;
+            const bool high = phys + bytes > 0x01F80000u;
+            if ((s_log > 0) || (high && s_warn > 0))
+            {
+                if (s_log > 0) --s_log; else --s_warn;
+                std::printf("[mpeg-write] %s dst=0x%x bytes=0x%x end=0x%x size=%ux%u%s\n", what, destAddr, bytes, phys + bytes, w, h,
+                            high ? "  <-- reaches stack area" : "");
+                std::fflush(stdout);
+            }
+        }
+
         void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height)
         {
             if (!rdram || destAddr == 0u)
@@ -1859,6 +1876,7 @@ namespace ps2_stubs
             const uint32_t outWidth = align16(width == 0u ? kStubMovieWidth : width);
             const uint32_t outHeight = align16(height == 0u ? kStubMovieHeight : height);
             const uint32_t macroblockColumns = outWidth / 16u;
+            logMpegGuestWrite("blank", destAddr, outWidth * outHeight * 4u, outWidth, outHeight);
             for (uint32_t mbx = 0u; mbx < macroblockColumns; ++mbx)
             {
                 const size_t stripOffset =
@@ -1895,6 +1913,7 @@ namespace ps2_stubs
             const uint32_t outWidth = align16(width);
             const uint32_t outHeight = align16(height);
             const uint32_t macroblockColumns = outWidth / 16u;
+            logMpegGuestWrite("frame", destAddr, outWidth * outHeight * 4u, width, height);
 
             // Output layout experiment: 0 = 16px column strips (default), 1 = macroblock row-major
             // (each 16x16 MB contiguous), 2 = plain raster.

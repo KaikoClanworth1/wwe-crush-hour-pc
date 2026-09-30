@@ -279,6 +279,7 @@ public:
     void requestStop();
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+    bool checkpointDueImpl(uint32_t cycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
