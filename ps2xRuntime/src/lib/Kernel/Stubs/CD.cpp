@@ -260,7 +260,7 @@ namespace ps2_stubs
 
             {
                 static int s_warn = 20;
-                if (s_warn > 0 && offset + bytes > 0x01F80000u)
+                if (s_warn > 0 && offset + bytes > 0x01FF0000u)
                 {
                     --s_warn;
                     std::printf("[cd-write] Read dst=0x%x bytes=0x%zx end=0x%zx lbn=0x%x  <-- reaches stack area\n", offset, bytes,
@@ -838,7 +838,7 @@ namespace ps2_stubs
                 const size_t readBytes = static_cast<size_t>(sectors) * kCdSectorSize;
                 {
                     static int s_warn = 20;
-                    if (s_warn > 0 && offset + readBytes > 0x01F80000u)
+                    if (s_warn > 0 && offset + readBytes > 0x01FF0000u)
                     {
                         --s_warn;
                         std::printf("[cd-write] StRead dst=0x%x bytes=0x%zx end=0x%zx buffer=0x%x read=%u/%u  <-- reaches stack area\n",

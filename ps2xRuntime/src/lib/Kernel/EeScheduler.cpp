@@ -5,6 +5,8 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <xmmintrin.h>
 #include <cassert>
 #include <cstring>
 #include <limits>
@@ -205,6 +207,14 @@ void EeScheduler::run()
 {
     assertExecutor();
     m_running.store(true, std::memory_order_release);
+
+    // The EE FPU rounds toward zero and has no denormals. With SSE's default round-to-nearest, a
+    // subtraction the game expects to be exactly 0 left a 4.5e-15 residue: a zero-length animation
+    // then looped forever in RtAnimInterpolatorSubAnimTime (`while (t < 0) t += duration`) during
+    // wrestler select. Guest code runs on this thread, so match the EE here (VU1 native code sets
+    // the same mode). PS2X_FPU_NEAREST=1 keeps the host default.
+    if (!std::getenv("PS2X_FPU_NEAREST"))
+        _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u); // RC=toward zero, FTZ, DAZ
 
     while (!m_stopRequested.load(std::memory_order_acquire))
     {

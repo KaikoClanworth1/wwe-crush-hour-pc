@@ -1856,7 +1856,7 @@ namespace ps2_stubs
             static int s_log = std::getenv("PS2X_MPEG_WRITE_LOG") ? 40 : 0;
             static int s_warn = 20;
             const uint32_t phys = destAddr & 0x1FFFFFFFu;
-            const bool high = phys + bytes > 0x01F80000u;
+            const bool high = phys + bytes > 0x01FF0000u;
             if ((s_log > 0) || (high && s_warn > 0))
             {
                 if (s_log > 0) --s_log; else --s_warn;
