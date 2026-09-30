@@ -823,6 +823,28 @@ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, con
             std::cout << "[runtime] SENG.IRX replaced by native XAudio2 sound engine" << std::endl;
             return fake;
         }
+        // Controller, memory card and sound-library modules: the game only reaches them through the
+        // EE-side libpad / libmc / sceSdRemote APIs, which are served natively (Kernel/Stubs/Pad.cpp,
+        // MemoryCard.cpp, Audio.cpp). Nothing talks to the IRXs, so report them resident without
+        // running MIPS IOP code. PS2X_IOP_EMULATE=1 loads them into the IOP interpreter again.
+        static const bool s_emulate = std::getenv("PS2X_IOP_EMULATE") != nullptr;
+        static const char *const kNativeModules[] = {"SIO2MAN.IRX", "MTAPMAN.IRX", "PADMAN.IRX", "MCMAN.IRX",
+                                                      "MCSERV.IRX", "LIBSD.IRX", "SDRDRV.IRX"};
+        if (!s_emulate)
+        {
+            for (const char *name : kNativeModules)
+            {
+                if (upperPath.find(name) == std::string::npos)
+                    continue;
+                static int32_t s_nextId = 0x60;
+                ps2x::iop::ModuleLoadResult fake;
+                fake.handled = true;
+                fake.moduleId = s_nextId++;
+                fake.startResult = 0;
+                std::cout << "[runtime] " << name << " served natively (no IOP emulation)" << std::endl;
+                return fake;
+            }
+        }
     }
 #endif
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());

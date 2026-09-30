@@ -1,5 +1,7 @@
 #include "Common.h"
 #include "RPC.h"
+#include <chrono>
+#include <map>
 #include "../../ps2_iop_transport.h"
 
 namespace ps2_syscalls
@@ -544,6 +546,26 @@ namespace ps2_syscalls
             request.endParameter = endParameter;
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+            {
+                // PS2X_RPC_STATS=1: which SIF RPC services the game uses (every 5 s).
+                static const bool s_stats = std::getenv("PS2X_RPC_STATS") != nullptr;
+                if (s_stats)
+                {
+                    static std::map<std::pair<uint32_t, uint32_t>, uint64_t> s_counts;
+                    static auto s_last = std::chrono::steady_clock::now();
+                    ++s_counts[{sid, iopResult.handled ? 1u : 0u}];
+                    if (std::chrono::steady_clock::now() - s_last > std::chrono::seconds(5))
+                    {
+                        s_last = std::chrono::steady_clock::now();
+                        std::printf("[rpc-stats]");
+                        for (const auto &[k, n] : s_counts)
+                            std::printf(" sid=%08x handled=%u n=%llu", k.first, k.second, (unsigned long long)n);
+                        std::printf("\n");
+                        std::fflush(stdout);
+                        s_counts.clear();
+                    }
+                }
+            }
 
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
