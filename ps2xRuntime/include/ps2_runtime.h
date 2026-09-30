@@ -426,7 +426,7 @@ public:
                                  uint32_t tadr,
                                  uint32_t chcr);
 
-    static inline bool isSpecialAddress(uint32_t addr)
+    static PS2X_FORCEINLINE bool isSpecialAddress(uint32_t addr)
     {
         return Ps2IsSpecialAddress(addr);
     }

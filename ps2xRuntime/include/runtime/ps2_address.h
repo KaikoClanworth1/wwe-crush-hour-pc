@@ -5,6 +5,14 @@
 
 #include "runtime/ps2_memory.h"
 
+#ifndef PS2X_FORCEINLINE
+#if defined(_MSC_VER)
+#define PS2X_FORCEINLINE __forceinline
+#else
+#define PS2X_FORCEINLINE inline __attribute__((always_inline))
+#endif
+#endif
+
 static inline constexpr uint32_t PS2_EE_UNCACHED_RAM_MIRROR_BASE = 0x20000000u;
 static inline constexpr uint32_t PS2_EE_UNCACHED_RAM_MIRROR_SIZE = 0x20000000u;
 static inline constexpr uint32_t PS2_KSEG0_BASE = 0x80000000u;
@@ -50,8 +58,11 @@ static inline constexpr bool Ps2IsPhysicalSpecialAddress(uint32_t physAddr)
            (physAddr >= PS2_VU0_DATA_BASE && physAddr < (PS2_VU1_CODE_BASE + PS2_VU1_CODE_SIZE));
 }
 
-static inline constexpr bool Ps2IsSpecialAddress(uint32_t addr)
+PS2X_FORCEINLINE constexpr bool Ps2IsSpecialAddress(uint32_t addr)
 {
+    // Main RAM (the vast majority of guest accesses) is never special: one compare.
+    if (addr < PS2_RAM_SIZE)
+        return false;
     if (Ps2IsKseg23Address(addr))
         return true;
 
