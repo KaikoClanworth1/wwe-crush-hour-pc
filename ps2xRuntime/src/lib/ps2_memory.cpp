@@ -43,6 +43,7 @@ namespace
     };
     AsyncDma g_async;
     thread_local bool t_dmaWorker = false;
+    std::vector<uint8_t> g_chainPool; // recycled VIF1 chain gather buffer (synchronous mode)
     thread_local bool t_asyncKick = false; // processPendingTransfers() called for a VIF1/GIF CHCR kick
 
     bool asyncDmaEnabled()
@@ -1479,9 +1480,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 4096;
+                    // Reuse the previous chain buffer: fresh multi-MB vectors cost page faults every frame.
                     std::vector<uint8_t> chainBuf;
-                    if (channelBase == 0x10009000u)
-                        chainBuf.reserve(1u << 20); // RenderWare VIF1 frame chains are ~0.5-1 MB
+                    if (channelBase == 0x10009000u && !asyncDmaEnabled())
+                    {
+                        chainBuf = std::move(g_chainPool);
+                        chainBuf.clear();
+                    }
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -2146,6 +2151,9 @@ void PS2Memory::processPendingTransfers()
     if (!t_dmaWorker)
         pipe.lock();
     const uint32_t bits = run(m_pendingGifTransfers, m_pendingVif0Transfers, m_pendingVif1Transfers);
+    for (auto &t : m_pendingVif1Transfers)
+        if (t.chainData.capacity() > g_chainPool.capacity())
+            g_chainPool = std::move(t.chainData);
     m_pendingGifTransfers.clear();
     m_pendingVif0Transfers.clear();
     m_pendingVif1Transfers.clear();

@@ -621,6 +621,55 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
+            // Fast path for the common case (no MASK, MODE 0, no skipping writes): same results as
+            // the general loop below without the per-lane mask/mode machinery.
+            static const bool s_unpackTraces = std::getenv("PS2X_UNPACK_TRACE") || std::getenv("PS2X_VU_CONST_TRACE");
+            if (!maskEnable && (vif1_regs.mode & 3u) == 0u && cl >= wl && m_vu1Data && totalBytes > 0 &&
+                pos + totalBytes <= sizeBytes && !(vl == 3u && vn == 3u) && vl <= 2u && !s_unpackTraces)
+            {
+                const uint8_t *srcBase = data + pos;
+                const uint32_t comps = static_cast<uint32_t>(components > 4 ? 4 : components);
+                for (uint32_t w = 0; w < writeVectorCount; ++w)
+                {
+                    const uint32_t destVec = (cl == wl) ? ((vuAddr + w) & 0x3FFu)
+                                                        : ((vuAddr + (w / wl) * cl + (w % wl)) & 0x3FFu);
+                    uint32_t *dst = reinterpret_cast<uint32_t *>(m_vu1Data + destVec * 16u);
+                    const uint8_t *src = srcBase + w * bytesPerVector;
+                    uint32_t v[4];
+                    if (vl == 0u)
+                    {
+                        std::memcpy(v, src, comps * 4u);
+                    }
+                    else if (vl == 1u)
+                    {
+                        for (uint32_t c = 0; c < comps; ++c)
+                        {
+                            uint16_t raw;
+                            std::memcpy(&raw, src + c * 2u, 2);
+                            v[c] = zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+                        }
+                    }
+                    else
+                    {
+                        for (uint32_t c = 0; c < comps; ++c)
+                            v[c] = zeroExtend ? src[c] : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(src[c])));
+                    }
+                    if (comps == 1u)
+                    {
+                        dst[0] = dst[1] = dst[2] = dst[3] = v[0];
+                    }
+                    else
+                    {
+                        for (uint32_t c = 0; c < comps; ++c)
+                            dst[c] = v[c];
+                    }
+                }
+                pos += totalBytes;
+                if (pos > sizeBytes)
+                    break;
+                continue;
+            }
+
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
