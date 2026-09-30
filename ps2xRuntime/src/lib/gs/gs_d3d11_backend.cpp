@@ -361,6 +361,8 @@ struct GSD3D11Backend::Impl
     uint32_t uploadFirst = 1u, uploadLast = 0u;
     uint64_t statDraws = 0, statSyncs = 0, statUploads = 0, statTexDecodes = 0, statTexContentHits = 0;
     const char *syncReason = "?";
+    char syncDetail[96] = "";
+    const bool disableRtSubTex = std::getenv("PS2X_NO_RT_SUBTEX") != nullptr;
     char lastPresent[160] = "none";
     std::unordered_map<std::string, uint64_t> syncReasons;
     std::unordered_map<uint32_t, uint64_t> fmtStats;
@@ -573,13 +575,18 @@ struct GSD3D11Backend::Impl
         if (!rt.gpuDirty)
             return;
         {
-            static const bool s_logSync = std::getenv("PS2X_SYNC_LOG") != nullptr;
+            // PS2X_SYNC_LOG=<sec>: log readbacks starting that many seconds after the first one.
+            static const char *s_logEnv = std::getenv("PS2X_SYNC_LOG");
+            static const double s_logSec = s_logEnv ? std::atof(s_logEnv) : 0.0;
+            static const auto s_logBoot = std::chrono::steady_clock::now();
             static int s_logged = 0;
-            if (s_logSync && s_logged < 400)
+            if (s_logEnv && s_logged < 400 &&
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - s_logBoot).count() >= s_logSec)
             {
                 ++s_logged;
-                std::printf("[sync] reason=%s fbp=%u psm=%u frame=%llu\n", syncReason, rt.fbpBlock / 32u, rt.psm,
-                            static_cast<unsigned long long>(frameCounter));
+                std::printf("[sync] reason=%s fbp=%u psm=%u %ux%u dirtyRows=%u-%u frame=%llu %s\n", syncReason,
+                            rt.fbpBlock / 32u, rt.psm, rt.w, rt.h, rt.dirtyY0, rt.dirtyY1,
+                            static_cast<unsigned long long>(frameCounter), syncDetail);
             }
         }
         flushPending();
@@ -866,7 +873,10 @@ struct GSD3D11Backend::Impl
         uint32_t first, last;
         pageSpan(t.tbp0, t.tbw, t.psm, 0, th, first, last);
         syncReason = "texture";
+        std::snprintf(syncDetail, sizeof(syncDetail), "tbp=%u tbw=%u psm=%u %ux%u pages=%u-%u", t.tbp0, t.tbw, t.psm, tw, th,
+                      first, last);
         syncOverlapping(first, last);
+        syncDetail[0] = 0;
 
         uint64_t key = fnv1a(&t.tbp0, sizeof(t.tbp0));
         const uint32_t k2[] = {t.tbw, t.psm, tw, th};
@@ -1277,6 +1287,28 @@ struct GSD3D11Backend::Impl
             texDims[0] = static_cast<float>(st.textureWidth);
             texDims[1] = static_cast<float>(st.textureHeight);
             RenderTarget *srcRt = (!isIndexed(t.psm)) ? findRt(t.tbp0) : nullptr;
+            if (!srcRt && !isIndexed(t.psm) && !disableRtSubTex)
+            {
+                // Texture at a page-aligned offset inside a render target (e.g. a screen effect sampling
+                // part of the frame buffer): sample the GPU target with an origin instead of reading back.
+                for (auto &r : rts)
+                {
+                    if (t.tbp0 <= r.fbpBlock || ((t.tbp0 - r.fbpBlock) & 31u) != 0u || r.fbw != std::max<uint32_t>(t.tbw, 1u) ||
+                        bitsPerPixel(r.psm) != bitsPerPixel(t.psm) || r.needsUpload)
+                        continue;
+                    uint32_t pw, ph;
+                    pageSize(r.psm, pw, ph);
+                    const uint32_t pagesPerRow = std::max<uint32_t>(1u, (r.fbw * 64u + pw - 1u) / pw);
+                    const uint32_t page = (t.tbp0 - r.fbpBlock) / 32u;
+                    const uint32_t ox = (page % pagesPerRow) * pw, oy = (page / pagesPerRow) * ph;
+                    if (oy >= r.h || ox + st.textureWidth > r.w || oy + st.textureHeight > r.h)
+                        continue;
+                    srcRt = &r;
+                    origin[0] = static_cast<float>(ox);
+                    origin[1] = static_cast<float>(oy);
+                    break;
+                }
+            }
             {
                 static const bool s_count = std::getenv("PS2X_RTTEX_LOG") != nullptr;
                 if (s_count)
@@ -1499,12 +1531,12 @@ struct GSD3D11Backend::Impl
             }
             std::printf("[gs-bbox] %.0f,%.0f-%.0f,%.0f col=%.0f..%.0f ", bx0, by0, bx1, by1, cmin, cmax);
             std::printf("[gs-trace] #%llu n=%zu fbp=%u psm=%u fbmsk=%08x tme=%d tex=%u/%u psm=%u %ux%u tfx=%u tcc=%u abe=%d alpha=%llx test=%llx "
-                        "sc=%u,%u-%u,%u v0=(%.1f,%.1f z=%.4f rgba=%.0f,%.0f,%.0f,%.0f st=%.3f,%.3f,%.3f) zte=%u ztst=%u zmsk=%d\n",
+                        "sc=%u,%u-%u,%u v0=(%.1f,%.1f z=%.4f rgba=%.0f,%.0f,%.0f,%.0f st=%.3f,%.3f,%.3f) zte=%u ztst=%u zmsk=%d zbp=%u zpsm=%u\n",
                         static_cast<unsigned long long>(statDraws), pending.size(), c.frame.fbp, c.frame.psm, c.frame.fbmsk,
                         st.prim.tme ? 1 : 0, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, st.textureWidth, st.textureHeight,
                         c.tex0.tfx, c.tex0.tcc, st.prim.abe ? 1 : 0, static_cast<unsigned long long>(c.alpha),
                         static_cast<unsigned long long>(c.test), c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1,
-                        v0.x, v0.y, v0.z, v0.r, v0.g, v0.b, v0.a, v0.s, v0.t, v0.q, ztest, ztst, c.zbuf.zmask ? 1 : 0);
+                        v0.x, v0.y, v0.z, v0.r, v0.g, v0.b, v0.a, v0.s, v0.t, v0.q, ztest, ztst, c.zbuf.zmask ? 1 : 0, static_cast<unsigned>(c.zbuf.zbp), static_cast<unsigned>(c.zbuf.psm));
         }
 
         // Debug: PS2X_SKIP_CYCLE="tbp:psm,tbp:psm,..." hides one textured draw class at a time (4 s each,

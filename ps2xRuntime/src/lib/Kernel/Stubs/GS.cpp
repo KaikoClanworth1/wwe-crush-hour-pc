@@ -896,16 +896,23 @@ namespace ps2_stubs
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
 
+        // As libgraph: zbp = sceGszbufaddr(psm, w, h) (already doubled for two frame buffers in frame
+        // mode); the second buffer sits at zbp / 2 in frame mode or non-interlaced output, otherwise
+        // (field mode) both buffers share address 0. Draw env 0 renders into buffer 1 while display
+        // env 0 shows buffer 0, and vice versa.
         uint32_t zbufAddr = 0u;
         {
             R5900Context temp = *ctx;
+            temp.r[4] = _mm_set_epi64x(0, static_cast<int64_t>(psm));
+            temp.r[5] = _mm_set_epi64x(0, static_cast<int64_t>(w));
+            temp.r[6] = _mm_set_epi64x(0, static_cast<int64_t>(h));
             sceGszbufaddr(rdram, &temp, runtime);
             zbufAddr = getRegU32(&temp, 2);
         }
-
-        const uint32_t fbp1 = zbufAddr;
-        const uint64_t dispfb0 = makeDispFb(fbp1, fbw, psm, 0u, 0u);
-        const uint64_t dispfb1 = makeDispFb(0u, fbw, psm, 0u, 0u);
+        const bool frameMode = (g_gparam.interlace & 0x1u) == 0u || (g_gparam.ffmode & 0x1u) != 0u;
+        const uint32_t fbp1 = frameMode ? ((zbufAddr >> 1) & 0x1FFu) : 0u;
+        const uint64_t dispfb0 = makeDispFb(0u, fbw, psm, 0u, 0u);
+        const uint64_t dispfb1 = makeDispFb(fbp1, fbw, psm, 0u, 0u);
 
         GsDBuffDcMem db{};
         db.disp[0].pmode = pmode;
@@ -918,11 +925,11 @@ namespace ps2_stubs
 
         const bool seedClear = clear != 0u;
         db.giftag0 = {makeGiftagAplusD(seedClear ? 22u : 16u), 0xEULL};
-        seedGsDrawEnv1(db.draw01, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
-        seedGsDrawEnv2(db.draw02, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv1(db.draw01, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv2(db.draw02, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
         db.giftag1 = db.giftag0;
-        seedGsDrawEnv1(db.draw11, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
-        seedGsDrawEnv2(db.draw12, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv1(db.draw11, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv2(db.draw12, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
         if (seedClear)
         {
             seedGsClearPacket(db.clear0, drawWidth, drawHeight, 0u, ztest, false);
@@ -968,12 +975,18 @@ namespace ps2_stubs
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
 
+        // Same layout rules as sceGsSetDefDBuffDc (see there).
         uint32_t zbufAddr = 0u;
         {
             R5900Context temp = *ctx;
+            temp.r[4] = _mm_set_epi64x(0, static_cast<int64_t>(psm));
+            temp.r[5] = _mm_set_epi64x(0, static_cast<int64_t>(w));
+            temp.r[6] = _mm_set_epi64x(0, static_cast<int64_t>(h));
             sceGszbufaddr(rdram, &temp, runtime);
             zbufAddr = getRegU32(&temp, 2);
         }
+        const bool frameMode = (g_gparam.interlace & 0x1u) == 0u || (g_gparam.ffmode & 0x1u) != 0u;
+        const uint32_t fbp1 = frameMode ? ((zbufAddr >> 1) & 0x1FFu) : 0u;
 
         GsDBuffMem db{};
         db.disp[0].pmode = pmode;
@@ -982,9 +995,10 @@ namespace ps2_stubs
         db.disp[0].display = display;
         db.disp[0].bgcolor = 0u;
         db.disp[1] = db.disp[0];
+        db.disp[1].dispfb = makeDispFb(fbp1, fbw, psm, 0u, 0u);
 
         db.giftag0 = {makeGiftagAplusD(14u), 0x0E0E0E0E0E0E0E0EULL};
-        seedGsDrawEnv1(db.draw0, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv1(db.draw0, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
         db.giftag1 = db.giftag0;
         seedGsDrawEnv1(db.draw1, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
 
@@ -1036,8 +1050,16 @@ namespace ps2_stubs
 
         uint32_t psm = param_2 & 0xFU;
         uint32_t fbw = ((static_cast<uint32_t>(w) + 63u) >> 6) & 0x3FU;
-        sceGszbufaddr(rdram, ctx, runtime);
-        int32_t zbuf = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 2) & 0xFFFF));
+        int32_t zbuf = 0;
+        {
+            // sceGszbufaddr(psm, w, h), as libgraph calls it.
+            R5900Context temp = *ctx;
+            temp.r[4] = _mm_set_epi64x(0, static_cast<int64_t>(param_2));
+            temp.r[5] = _mm_set_epi64x(0, static_cast<int64_t>(w));
+            temp.r[6] = _mm_set_epi64x(0, static_cast<int64_t>(h));
+            sceGszbufaddr(rdram, &temp, runtime);
+            zbuf = static_cast<int32_t>(static_cast<int16_t>(getRegU32(&temp, 2) & 0xFFFF));
+        }
 
         GsDrawEnv1Mem env{};
         seedGsDrawEnv1(env,
@@ -1079,8 +1101,16 @@ namespace ps2_stubs
 
         uint32_t psm = param_2 & 0xFU;
         uint32_t fbw = ((static_cast<uint32_t>(w) + 63u) >> 6) & 0x3FU;
-        sceGszbufaddr(rdram, ctx, runtime);
-        int32_t zbuf = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 2) & 0xFFFF));
+        int32_t zbuf = 0;
+        {
+            // sceGszbufaddr(psm, w, h), as libgraph calls it.
+            R5900Context temp = *ctx;
+            temp.r[4] = _mm_set_epi64x(0, static_cast<int64_t>(param_2));
+            temp.r[5] = _mm_set_epi64x(0, static_cast<int64_t>(w));
+            temp.r[6] = _mm_set_epi64x(0, static_cast<int64_t>(h));
+            sceGszbufaddr(rdram, &temp, runtime);
+            zbuf = static_cast<int32_t>(static_cast<int16_t>(getRegU32(&temp, 2) & 0xFFFF));
+        }
 
         GsDrawEnv2Mem env{};
         seedGsDrawEnv2(env,
@@ -1316,12 +1346,13 @@ namespace ps2_stubs
         setReturnU32(ctx, oldCallback);
     }
 
+    // libgraph: int sceGszbufaddr(short psm, short w, short h) -- a0 = psm, a1 = w, a2 = h.
     void sceGszbufaddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
         uint32_t param_1 = getRegU32(ctx, 4);
-        int32_t w = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 6) & 0xFFFF));
-        int32_t h = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 7) & 0xFFFF));
+        int32_t w = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 5) & 0xFFFF));
+        int32_t h = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 6) & 0xFFFF));
 
         int32_t width_blocks = (w + 63) >> 6;
         if (w + 63 < 0)

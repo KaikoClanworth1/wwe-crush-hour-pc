@@ -3,6 +3,10 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
+// Debug (PS2X_VU1_SKIP_CYCLE=<sec>): drop the XGKICK output of one VU1 program image at a time.
+bool g_vu1SuppressKick = false;
+#include <vector>
+namespace ps2vu1n { extern std::vector<uint32_t> *g_vu1nPcTrace; }
 
 #include <algorithm>
 #include <bit>
@@ -981,6 +985,7 @@ namespace
 {
     uint32_t g_vuTraceProgramStart = 0;
     int g_vuTraceRemaining = -1;
+    std::vector<uint32_t> *g_vu1iPcTrace = nullptr; // debug lockstep trace for PS2X_VU1_VERIFY
     uint32_t g_vuTracePc = 0xFFFFFFFFu;
     int64_t g_vuTraceIndex = -2;
 }
@@ -1009,7 +1014,7 @@ void VU1Interpreter::finishXgkick()
         }
     }
 
-    if (m_activeMemory)
+    if (m_activeMemory && !g_vu1SuppressKick)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
@@ -1689,6 +1694,34 @@ namespace
 
     void noteVu1Program(const uint8_t *code, uint32_t size, uint64_t generation, uint32_t pc)
     {
+        struct SkipCycleUpdate
+        {
+            ~SkipCycleUpdate()
+            {
+                static const char *s_env = std::getenv("PS2X_VU1_SKIP_CYCLE");
+                if (!s_env)
+                    return;
+                static const double s_start = std::atof(s_env);
+                static const auto s_boot = std::chrono::steady_clock::now();
+                static std::vector<uint64_t> s_hashes;
+                static int s_last = -2;
+                const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_boot).count();
+                if (t < s_start)
+                    return;
+                if (std::find(s_hashes.begin(), s_hashes.end(), g_vu1CodeHash) == s_hashes.end())
+                    s_hashes.push_back(g_vu1CodeHash);
+                const int slot = static_cast<int>((t - s_start) / 4.0);
+                const int idx = slot % static_cast<int>(s_hashes.size() + 1) - 1;
+                if (idx != s_last)
+                {
+                    s_last = idx;
+                    std::printf("[vu1-skip] t=%.1f idx=%d hash=%016llx\n", t, idx,
+                                idx >= 0 ? static_cast<unsigned long long>(s_hashes[idx]) : 0ull);
+                    std::fflush(stdout);
+                }
+                g_vu1SuppressKick = idx >= 0 && s_hashes[idx] == g_vu1CodeHash;
+            }
+        } skipCycleUpdate;
         if (generation != g_vu1CodeGen)
         {
             g_vu1CodeGen = generation;
@@ -1752,7 +1785,11 @@ namespace
         const std::vector<uint8_t> m0(mem, mem + size);
         const uint32_t entry = st.pc;
         bool ended = false;
-        if (!ps2vu1nTryRun(st, mem, size, nullptr, hash, maxCycles, ended) || !ended)
+        std::vector<uint32_t> ntr, itr;
+        ps2vu1n::g_vu1nPcTrace = &ntr;
+        const bool ranNative = ps2vu1nTryRun(st, mem, size, nullptr, hash, maxCycles, ended);
+        ps2vu1n::g_vu1nPcTrace = nullptr;
+        if (!ranNative || !ended)
         {
             st = saved;
             std::memcpy(mem, m0.data(), size);
@@ -1762,7 +1799,9 @@ namespace
         const std::vector<uint8_t> m1(mem, mem + size);
         st = saved;
         std::memcpy(mem, m0.data(), size);
+        g_vu1iPcTrace = &itr;
         interp();
+        g_vu1iPcTrace = nullptr;
 
         static int s_reports = 0;
         static uint64_t s_checked = 0, s_bad = 0;
@@ -1817,6 +1856,16 @@ namespace
                 ++s_reports;
                 std::printf("[vu1-verify] %016llx entry=%04x (%llu/%llu bad)%s\n", static_cast<unsigned long long>(hash), entry,
                             static_cast<unsigned long long>(s_bad), static_cast<unsigned long long>(s_checked), diff.c_str());
+                if (!ntr.empty())
+                {
+                    size_t k = 0;
+                    while (k < ntr.size() && k < itr.size() && ntr[k] == itr[k])
+                        ++k;
+                    std::printf("[vu1-verify]   pc traces: native %zu interp %zu, diverge at step %zu:", ntr.size(), itr.size(), k);
+                    for (size_t j = k >= 6 ? k - 6 : 0; j < k + 4 && j < std::max(ntr.size(), itr.size()); ++j)
+                        std::printf(" [%zu n=%04x i=%04x]", j, j < ntr.size() ? ntr[j] : 0xFFFFu, j < itr.size() ? itr[j] : 0xFFFFu);
+                    std::printf("\n");
+                }
                 std::fflush(stdout);
             }
         }
@@ -1982,6 +2031,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         int32_t traceViBefore[16];
         const bool tracing = g_vuTraceRemaining > 0 && m_unit == Unit::VU1;
         const uint32_t tracePc = m_state.pc;
+        if (g_vu1iPcTrace && m_unit == Unit::VU1)
+            g_vu1iPcTrace->push_back(tracePc);
         if (tracing)
         {
             std::memcpy(traceBefore, m_state.vf, sizeof(traceBefore));

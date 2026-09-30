@@ -8,8 +8,11 @@
 #include <xmmintrin.h>
 #include <pmmintrin.h>
 
+extern bool g_vu1SuppressKick;
+
 namespace ps2vu1n
 {
+    std::vector<uint32_t> *g_vu1nPcTrace = nullptr; // debug lockstep trace (see VU1_TRACE_HASH)
 #if !defined(PS2X_HAVE_VU1_NATIVE)
     const ProgramEntry *programs(uint32_t &count)
     {
@@ -122,7 +125,7 @@ namespace ps2vu1n
                 if (eop)
                     break;
             }
-            if (!packet.empty() && u.memory)
+            if (!packet.empty() && u.memory && !g_vu1SuppressKick)
                 u.memory->submitGifPacket(GifPathId::Path1, packet.data(), static_cast<uint32_t>(packet.size()));
         }
 
