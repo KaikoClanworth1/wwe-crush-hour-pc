@@ -38,6 +38,8 @@
 
 using Microsoft::WRL::ComPtr;
 
+uint64_t ps2Vif1KickCount(); // ps2_memory.cpp: game frames (VIF1 frame kicks) so far
+
 namespace ps2host
 {
     namespace
@@ -80,6 +82,19 @@ namespace ps2host
         double g_nextFrameTime = 0.0;
         double g_lastFrameMs = 0.0;
         double g_lastPresentTime = 0.0;
+
+        // FPS counter: on-screen box (F1 toggles, ShowFPS in [Display]) and the window title.
+        bool g_showFps = true;
+        std::wstring g_baseTitle;
+        std::atomic<int> g_titleFps{-1}, g_titleGameFps{-1};
+        int g_shownTitleFps = -2, g_shownTitleGameFps = -2;
+        double g_fpsWindowStart = 0.0;
+        uint32_t g_fpsPresents = 0;
+        uint64_t g_fpsKickStart = 0;
+        double g_presentFps = 0.0, g_gameFps = 0.0;
+        ComPtr<ID3D11Texture2D> g_fpsTex;
+        ComPtr<ID3D11ShaderResourceView> g_fpsSrv;
+        ComPtr<ID3D11SamplerState> g_pointSampler;
 
         const char *kBlitShader = R"(
 cbuffer Blit : register(b0) { float4 uvRect; };
@@ -129,6 +144,8 @@ float4 ps_main(VsOut i) : SV_Target
                     std::lock_guard lock(g_inputMutex);
                     g_keys[wp] = true;
                 }
+                if (wp == VK_F1 && !(lp & (1 << 30)))
+                    g_showFps = !g_showFps;
                 if (wp == VK_RETURN && (lp & (1 << 29)))
                 {
                     // Alt+Enter toggles borderless fullscreen.
@@ -296,6 +313,118 @@ float4 ps_main(VsOut i) : SV_Target
             g_ctx->Unmap(staging.Get(), 0);
         }
 
+        // 5x7 glyphs (one byte per row, low 5 bits, bit 4 = left column) for the FPS box.
+        const uint8_t *glyph(char c)
+        {
+            static const uint8_t digits[10][7] = {
+                {14, 17, 19, 21, 25, 17, 14}, {4, 12, 4, 4, 4, 4, 14},  {14, 17, 1, 2, 4, 8, 31},
+                {31, 2, 4, 2, 1, 17, 14},     {2, 6, 10, 18, 31, 2, 2}, {31, 16, 30, 1, 1, 17, 14},
+                {6, 8, 16, 30, 17, 17, 14},   {31, 1, 2, 4, 8, 8, 8},   {14, 17, 17, 14, 17, 17, 14},
+                {14, 17, 17, 15, 1, 2, 12}};
+            static const uint8_t F[7] = {31, 16, 16, 30, 16, 16, 16}, P[7] = {30, 17, 17, 30, 16, 16, 16},
+                                 S[7] = {15, 16, 16, 14, 1, 1, 30}, G[7] = {14, 17, 16, 23, 17, 17, 15},
+                                 A[7] = {14, 17, 17, 31, 17, 17, 17}, M[7] = {17, 27, 21, 21, 17, 17, 17},
+                                 E[7] = {31, 16, 16, 30, 16, 16, 31}, blank[7] = {0, 0, 0, 0, 0, 0, 0};
+            if (c >= '0' && c <= '9')
+                return digits[c - '0'];
+            switch (c)
+            {
+            case 'F': return F;
+            case 'P': return P;
+            case 'S': return S;
+            case 'G': return G;
+            case 'A': return A;
+            case 'M': return M;
+            case 'E': return E;
+            default: return blank;
+            }
+        }
+
+        // Counts presents and game frames (VIF1 frame kicks) and draws the FPS box over the back buffer.
+        void updateAndDrawFps(float bh)
+        {
+            const double now = nowSeconds();
+            ++g_fpsPresents;
+            if (g_fpsWindowStart == 0.0)
+            {
+                g_fpsWindowStart = now;
+                g_fpsKickStart = ps2Vif1KickCount();
+            }
+            else if (now - g_fpsWindowStart >= 0.5)
+            {
+                const double dt = now - g_fpsWindowStart;
+                const uint64_t kicks = ps2Vif1KickCount();
+                g_presentFps = g_fpsPresents / dt;
+                g_gameFps = static_cast<double>(kicks - g_fpsKickStart) / dt;
+                g_fpsPresents = 0;
+                g_fpsWindowStart = now;
+                g_fpsKickStart = kicks;
+                g_titleFps.store(static_cast<int>(g_presentFps + 0.5));
+                g_titleGameFps.store(static_cast<int>(g_gameFps + 0.5));
+            }
+            if (!g_showFps)
+                return;
+
+            char lines[2][16];
+            std::snprintf(lines[0], sizeof(lines[0]), "FPS  %3d", static_cast<int>(g_presentFps + 0.5));
+            std::snprintf(lines[1], sizeof(lines[1]), "GAME %3d", static_cast<int>(g_gameFps + 0.5));
+            constexpr uint32_t kCols = 8, kW = kCols * 6 + 3, kH = 2 * 9 + 3;
+            uint32_t px[kW * kH];
+            for (uint32_t &p : px)
+                p = 0xFF000000u; // opaque black box
+            for (int l = 0; l < 2; ++l)
+            {
+                // RGBA in memory (little endian ABGR): green normally, orange when the game drops below 55.
+                const uint32_t color = (l == 1 && g_gameFps < 55.0) ? 0xFF3090FFu : 0xFF60FF60u;
+                for (uint32_t ci = 0; ci < kCols && lines[l][ci]; ++ci)
+                {
+                    const uint8_t *g = glyph(lines[l][ci]);
+                    for (uint32_t y = 0; y < 7; ++y)
+                        for (uint32_t x = 0; x < 5; ++x)
+                            if (g[y] & (16u >> x))
+                                px[(2 + l * 9 + y) * kW + 2 + ci * 6 + x] = color;
+                }
+            }
+            if (!g_fpsTex)
+            {
+                D3D11_TEXTURE2D_DESC td{};
+                td.Width = kW;
+                td.Height = kH;
+                td.MipLevels = 1;
+                td.ArraySize = 1;
+                td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                td.SampleDesc.Count = 1;
+                td.Usage = D3D11_USAGE_DEFAULT;
+                td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                if (FAILED(g_device->CreateTexture2D(&td, nullptr, &g_fpsTex)))
+                    return;
+                g_device->CreateShaderResourceView(g_fpsTex.Get(), nullptr, &g_fpsSrv);
+                D3D11_SAMPLER_DESC sd{};
+                sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+                sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+                sd.MaxLOD = D3D11_FLOAT32_MAX;
+                g_device->CreateSamplerState(&sd, &g_pointSampler);
+            }
+            g_ctx->UpdateSubresource(g_fpsTex.Get(), 0, nullptr, px, kW * 4u, 0);
+            const float s = std::max(2.0f, std::floor(bh / 360.0f)); // integer scale: 3x at 1080p
+            D3D11_VIEWPORT vp{8.0f, 8.0f, kW * s, kH * s, 0.0f, 1.0f};
+            g_ctx->RSSetViewports(1, &vp);
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (SUCCEEDED(g_ctx->Map(g_blitCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            {
+                const float rect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+                std::memcpy(m.pData, rect, sizeof(rect));
+                g_ctx->Unmap(g_blitCb.Get(), 0);
+            }
+            ID3D11ShaderResourceView *srv = g_fpsSrv.Get();
+            g_ctx->PSSetShaderResources(0, 1, &srv);
+            ID3D11SamplerState *smp = g_pointSampler.Get();
+            g_ctx->PSSetSamplers(0, 1, &smp);
+            g_ctx->Draw(3, 0);
+            ID3D11ShaderResourceView *nullSrv = nullptr;
+            g_ctx->PSSetShaderResources(0, 1, &nullSrv);
+        }
+
         void drawBlit(ID3D11ShaderResourceView *srv, uint32_t srcW, uint32_t srcH, float u1, float v1)
         {
             resizeIfNeeded();
@@ -346,6 +475,7 @@ float4 ps_main(VsOut i) : SV_Target
             g_ctx->Draw(3, 0);
             ID3D11ShaderResourceView *nullSrv = nullptr;
             g_ctx->PSSetShaderResources(0, 1, &nullSrv);
+            updateAndDrawFps(bh);
 
             if (!g_shotDir.empty() && nowSeconds() >= g_nextShot)
             {
@@ -392,6 +522,7 @@ float4 ps_main(VsOut i) : SV_Target
         g_config.targetFps = GetPrivateProfileIntA("Display", "TargetFPS", g_config.targetFps, iniPath);
         g_config.keepAspect = GetPrivateProfileIntA("Display", "KeepAspect", g_config.keepAspect, iniPath) != 0;
         g_config.widescreen = GetPrivateProfileIntA("Display", "Widescreen", g_config.widescreen, iniPath) != 0;
+        g_showFps = GetPrivateProfileIntA("Display", "ShowFPS", g_showFps ? 1 : 0, iniPath) != 0;
         return true;
     }
 
@@ -474,6 +605,7 @@ float4 ps_main(VsOut i) : SV_Target
                 pos = end + 1;
             }
         }
+        g_baseTitle = widen(title);
         g_hwnd = CreateWindowExW(g_background ? (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) : 0, wc.lpszClassName, widen(title).c_str(), style, x, y, w, h,
                                  nullptr, nullptr, inst, nullptr);
         if (!g_hwnd)
@@ -614,6 +746,14 @@ float4 ps_main(VsOut i) : SV_Target
             DispatchMessageW(&msg);
         }
         pollInput();
+        const int fps = g_titleFps.load(), gameFps = g_titleGameFps.load();
+        if (g_hwnd && fps >= 0 && (fps != g_shownTitleFps || gameFps != g_shownTitleGameFps))
+        {
+            g_shownTitleFps = fps;
+            g_shownTitleGameFps = gameFps;
+            const std::wstring t = g_baseTitle + L"  |  " + std::to_wstring(fps) + L" fps  (game " + std::to_wstring(gameFps) + L")";
+            SetWindowTextW(g_hwnd, t.c_str());
+        }
         return !g_quit.load();
     }
 

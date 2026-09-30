@@ -158,8 +158,10 @@ bool ps2vu1nTryRun(VU1State &state, uint8_t *vuData, uint32_t dataSize, PS2Memor
                    uint64_t codeHash, uint32_t maxCycles, bool &ended)
 {
     using namespace ps2vu1n;
-    static const bool s_disabled = std::getenv("PS2X_VU1_INTERP") != nullptr;
-    if (s_disabled)
+    // PS2X_VU1_INTERP=1 interprets every program; PS2X_VU1_INTERP=<16-hex-digit hash> only that one.
+    static const char *s_interp = std::getenv("PS2X_VU1_INTERP");
+    static const uint64_t s_interpHash = (s_interp && std::strlen(s_interp) >= 8) ? std::strtoull(s_interp, nullptr, 16) : 0;
+    if (s_interp && (s_interpHash == 0 || s_interpHash == codeHash))
         return false;
     const ProgramFn fn = lookup(codeHash);
     if (!fn)

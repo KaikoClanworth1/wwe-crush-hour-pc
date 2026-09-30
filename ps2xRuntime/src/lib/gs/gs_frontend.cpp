@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <cstdio>
+#include <chrono>
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
@@ -1402,6 +1403,20 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             command.trxreg = m_trxreg;
             command.direction = m_trxdir;
             m_backend->BeginTransfer(command);
+        }
+        {
+            // PS2X_XFER_LOG=<count>: log image transfers, starting PS2X_XFER_LOG_SEC seconds after boot.
+            static int s_xferLog = std::getenv("PS2X_XFER_LOG") ? std::atoi(std::getenv("PS2X_XFER_LOG")) : 0;
+            static const double s_xferSec = std::getenv("PS2X_XFER_LOG_SEC") ? std::atof(std::getenv("PS2X_XFER_LOG_SEC")) : 0.0;
+            static const auto s_xferBoot = std::chrono::steady_clock::now();
+            if (s_xferLog > 0 &&
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - s_xferBoot).count() >= s_xferSec)
+            {
+                --s_xferLog;
+                std::printf("[xfer] dir=%u dbp=%u dbw=%u dpsm=%u pos=%u,%u size=%ux%u sbp=%u\n", m_trxdir, m_bitbltbuf.dbp,
+                            m_bitbltbuf.dbw, m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh,
+                            m_bitbltbuf.sbp);
+            }
         }
         recordTransferDebugEventUnlocked();
         break;

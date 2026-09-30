@@ -1743,6 +1743,11 @@ namespace
         static const bool s_on = std::getenv("PS2X_VU1_VERIFY") != nullptr;
         if (!s_on)
             return false;
+        // PS2X_VU1_VERIFY=<seconds>: only start verifying after that long (the interpreter is slow).
+        static const double s_startSec = std::atof(std::getenv("PS2X_VU1_VERIFY"));
+        static const auto s_boot = std::chrono::steady_clock::now();
+        if (s_startSec > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - s_boot).count() < s_startSec)
+            return false;
         const VU1State saved = st;
         const std::vector<uint8_t> m0(mem, mem + size);
         const uint32_t entry = st.pc;
@@ -1803,7 +1808,8 @@ namespace
                           a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
             diff += buf;
         }
-        if (!diff.empty())
+        static const bool s_memOnly = std::getenv("PS2X_VU1_VERIFY_MEM") != nullptr; // ignore register-only differences
+        if (!diff.empty() && (!s_memOnly || memDiff))
         {
             ++s_bad;
             if (s_reports < 60)

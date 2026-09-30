@@ -299,7 +299,9 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        // First-fit from the heap base so freed blocks are reused (movie buffers are
+        // allocated/freed per clip; a monotonic cursor exhausts the 2 MB IOP RAM).
+        uint32_t candidate = alignUp(HeapBase, alignment);
         for (;;)
         {
             bool overlap = false;

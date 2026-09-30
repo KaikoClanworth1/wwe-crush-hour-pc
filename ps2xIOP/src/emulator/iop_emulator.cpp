@@ -741,7 +741,15 @@ namespace ps2x::iop::detail
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
+        // Advance the IOP in batches: stepping it every 32 EE cycles spent most of the time in the
+        // scheduler bookkeeping (beginNextReady / nextWakeCycle) rather than executing anything.
+        constexpr uint64_t kEeBatch = 8u * 1024u;
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+        if (total < kEeBatch)
+        {
+            m_impl->eeCycleCarry = total;
+            return;
+        }
         const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
         if (iopCycles)

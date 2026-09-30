@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+﻿cmake_minimum_required(VERSION 3.21)
 
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VITASDK})
     set(PS2X_VITA_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake")
@@ -10,6 +10,10 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VITASDK})
 endif()
 
 project(PS2RetroX)
+
+if(MSVC)
+    add_compile_options(/MP /bigobj)
+endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

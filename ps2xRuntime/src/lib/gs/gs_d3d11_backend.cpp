@@ -948,7 +948,12 @@ struct GSD3D11Backend::Impl
             static int s_texDumps = 0;
             static const long s_skipTbp = std::getenv("PS2X_TEX_DUMP_SKIP") ? std::atol(std::getenv("PS2X_TEX_DUMP_SKIP")) : -1;
             static const uint64_t s_dumpFrame = std::getenv("PS2X_TEX_DUMP_FRAME") ? std::strtoull(std::getenv("PS2X_TEX_DUMP_FRAME"), nullptr, 10) : 0;
-            if (s_texDumps < 400 && static_cast<long>(t.tbp0) != s_skipTbp && frameCounter >= s_dumpFrame)
+            static const long s_onlyTbp = std::getenv("PS2X_TEX_DUMP_TBP") ? std::atol(std::getenv("PS2X_TEX_DUMP_TBP")) : -1;
+            static const double s_dumpSec = std::getenv("PS2X_TEX_DUMP_SEC") ? std::atof(std::getenv("PS2X_TEX_DUMP_SEC")) : 0.0;
+            static const auto s_dumpBoot = std::chrono::steady_clock::now();
+            const bool dumpTimeOk = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_dumpBoot).count() >= s_dumpSec;
+            if (s_texDumps < 1500 && static_cast<long>(t.tbp0) != s_skipTbp && frameCounter >= s_dumpFrame && dumpTimeOk &&
+                tw * th >= 1024u && (s_onlyTbp < 0 || static_cast<long>(t.tbp0) == s_onlyTbp))
             {
                 char path[512];
                 std::snprintf(path, sizeof(path), "%s/tex_%04d_tbp%u_psm%u_cpsm%u_%ux%u.rgba", dumpDir, s_texDumps++,
@@ -1272,6 +1277,55 @@ struct GSD3D11Backend::Impl
             texDims[0] = static_cast<float>(st.textureWidth);
             texDims[1] = static_cast<float>(st.textureHeight);
             RenderTarget *srcRt = (!isIndexed(t.psm)) ? findRt(t.tbp0) : nullptr;
+            {
+                static const bool s_count = std::getenv("PS2X_RTTEX_LOG") != nullptr;
+                if (s_count)
+                {
+                    static uint64_t s_into = 0, s_from = 0, s_fromRt = 0;
+                    static auto s_last = std::chrono::steady_clock::now();
+                    if (framePageBaseToBlock(c.frame.fbp) == 14336u)
+                        ++s_into;
+                    if (t.tbp0 == 14336u)
+                    {
+                        ++s_from;
+                        if (srcRt)
+                            ++s_fromRt;
+                    }
+                    if (std::chrono::steady_clock::now() - s_last > std::chrono::seconds(2))
+                    {
+                        s_last = std::chrono::steady_clock::now();
+                        std::printf("[rt14336] drawsInto=%llu samples=%llu samplesFromRt=%llu\n", (unsigned long long)s_into,
+                                    (unsigned long long)s_from, (unsigned long long)s_fromRt);
+                        std::fflush(stdout);
+                        s_into = s_from = s_fromRt = 0;
+                    }
+                }
+                static int s_any = std::getenv("PS2X_RTTEX_LOG") ? 5 : 0;
+                if (s_any > 0 && t.tbp0 >= 14000u && t.tbp0 < 15000u && t.psm == 0u)
+                {
+                    --s_any;
+                    std::printf("[rt-tex-any] tbp=%u psm=%u srcRt=%p rts=%zu\n", t.tbp0, t.psm, (void *)srcRt, rts.size());
+                    std::fflush(stdout);
+                }
+                static int s_rtTexLog = std::getenv("PS2X_RTTEX_LOG") ? 40 : 0;
+                if (s_rtTexLog > 0 && !srcRt && t.tbp0 == 14336u)
+                {
+                    --s_rtTexLog;
+                    std::printf("[rt-tex] tbp=%u: no RT; rts:", t.tbp0);
+                    for (const auto &r : rts)
+                        std::printf(" [fbp=%u fbw=%u psm=%u %ux%u]", r.fbpBlock, r.fbw, r.psm, r.w, r.h);
+                    std::printf("\n");
+                    std::fflush(stdout);
+                }
+                if (s_rtTexLog > 0 && srcRt && t.tbp0 == 14336u)
+                {
+                    --s_rtTexLog;
+                    std::printf("[rt-tex] tbp=%u tbw=%u psm=%u -> rt fbw=%u psm=%u %ux%u needsUpload=%d gpuDirty=%d target=%u\n", t.tbp0,
+                                t.tbw, t.psm, srcRt->fbw, srcRt->psm, srcRt->w, srcRt->h, srcRt->needsUpload ? 1 : 0,
+                                srcRt->gpuDirty ? 1 : 0, rt ? rt->fbpBlock : 0u);
+                    std::fflush(stdout);
+                }
+            }
             if (srcRt && srcRt->fbw == std::max<uint32_t>(t.tbw, 1u) && bitsPerPixel(srcRt->psm) == bitsPerPixel(t.psm) && !srcRt->needsUpload)
             {
                 texDims[2] = static_cast<float>(srcRt->w);
@@ -1418,12 +1472,32 @@ struct GSD3D11Backend::Impl
         static const int s_traceLimit = std::getenv("PS2X_GS_TRACE") ? std::atoi(std::getenv("PS2X_GS_TRACE")) : 0;
         static int s_traced = 0;
         static const uint64_t s_traceFrame = std::getenv("PS2X_GS_TRACE_FRAME") ? std::strtoull(std::getenv("PS2X_GS_TRACE_FRAME"), nullptr, 10) : 0;
-        if (s_traced < s_traceLimit && frameCounter >= s_traceFrame)
+        // PS2X_GS_TRACE_SEC: start tracing this many seconds after the first draw (frame counts vary per run).
+        static const double s_traceSec = std::getenv("PS2X_GS_TRACE_SEC") ? std::atof(std::getenv("PS2X_GS_TRACE_SEC")) : 0.0;
+        static const auto s_firstDraw = std::chrono::steady_clock::now();
+        const bool traceTimeOk = s_traceSec <= 0.0 ||
+                                 std::chrono::duration<double>(std::chrono::steady_clock::now() - s_firstDraw).count() >= s_traceSec;
+        if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk)
         {
             if (s_traced == 0)
                 std::printf("[gs-trace] start at frame %llu\n", static_cast<unsigned long long>(frameCounter));
             ++s_traced;
             const Vtx &v0 = pending[0];
+            float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
+            for (const Vtx &v : pending)
+            {
+                bx0 = std::min(bx0, v.x);
+                by0 = std::min(by0, v.y);
+                bx1 = std::max(bx1, v.x);
+                by1 = std::max(by1, v.y);
+            }
+            float cmin = 1e9f, cmax = -1e9f;
+            for (const Vtx &v : pending)
+            {
+                cmin = std::min({cmin, v.r, v.g, v.b});
+                cmax = std::max({cmax, v.r, v.g, v.b});
+            }
+            std::printf("[gs-bbox] %.0f,%.0f-%.0f,%.0f col=%.0f..%.0f ", bx0, by0, bx1, by1, cmin, cmax);
             std::printf("[gs-trace] #%llu n=%zu fbp=%u psm=%u fbmsk=%08x tme=%d tex=%u/%u psm=%u %ux%u tfx=%u tcc=%u abe=%d alpha=%llx test=%llx "
                         "sc=%u,%u-%u,%u v0=(%.1f,%.1f z=%.4f rgba=%.0f,%.0f,%.0f,%.0f st=%.3f,%.3f,%.3f) zte=%u ztst=%u zmsk=%d\n",
                         static_cast<unsigned long long>(statDraws), pending.size(), c.frame.fbp, c.frame.psm, c.frame.fbmsk,
@@ -1431,6 +1505,58 @@ struct GSD3D11Backend::Impl
                         c.tex0.tfx, c.tex0.tcc, st.prim.abe ? 1 : 0, static_cast<unsigned long long>(c.alpha),
                         static_cast<unsigned long long>(c.test), c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1,
                         v0.x, v0.y, v0.z, v0.r, v0.g, v0.b, v0.a, v0.s, v0.t, v0.q, ztest, ztst, c.zbuf.zmask ? 1 : 0);
+        }
+
+        // Debug: PS2X_SKIP_CYCLE="tbp:psm,tbp:psm,..." hides one textured draw class at a time (4 s each,
+        // starting once the frame counter reaches PS2X_SKIP_CYCLE_FRAME), to find which draws make up a surface.
+        {
+            static const char *s_cycle = std::getenv("PS2X_SKIP_CYCLE");
+            if (s_cycle && st.prim.tme)
+            {
+                static std::vector<std::pair<uint32_t, uint32_t>> s_list = []()
+                {
+                    std::vector<std::pair<uint32_t, uint32_t>> l;
+                    const char *p = std::getenv("PS2X_SKIP_CYCLE");
+                    while (p && *p)
+                    {
+                        unsigned a = 0, b = 0;
+                        if (std::sscanf(p, "%u:%u", &a, &b) == 2)
+                            l.emplace_back(a, b);
+                        p = std::strchr(p, ',');
+                        if (p)
+                            ++p;
+                    }
+                    return l;
+                }();
+                static const uint64_t s_startFrame = std::getenv("PS2X_SKIP_CYCLE_FRAME") ? std::strtoull(std::getenv("PS2X_SKIP_CYCLE_FRAME"), nullptr, 10) : 0;
+                static auto s_t0 = std::chrono::steady_clock::time_point{};
+                static int s_lastIdx = -2;
+                static const double s_startSec = std::getenv("PS2X_SKIP_CYCLE_SEC") ? std::atof(std::getenv("PS2X_SKIP_CYCLE_SEC")) : 0.0;
+                static const auto s_cycleBoot = std::chrono::steady_clock::now();
+                const bool secOk = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_cycleBoot).count() >= s_startSec;
+                if (frameCounter >= s_startFrame && secOk && !s_list.empty())
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (s_t0 == std::chrono::steady_clock::time_point{})
+                        s_t0 = now;
+                    static const int s_slotSec = std::getenv("PS2X_SKIP_CYCLE_SLOT") ? std::max(1, std::atoi(std::getenv("PS2X_SKIP_CYCLE_SLOT"))) : 4;
+                    const int slot = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(now - s_t0).count() / s_slotSec);
+                    const int idx = slot % static_cast<int>(s_list.size() + 1) - 1; // -1 = nothing skipped
+                    if (idx != s_lastIdx)
+                    {
+                        s_lastIdx = idx;
+                        std::printf("[skip-cycle] t=%lld idx=%d tbp=%u psm=%u\n",
+                                    (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count(), idx,
+                                    idx >= 0 ? s_list[idx].first : 0u, idx >= 0 ? s_list[idx].second : 0u);
+                        std::fflush(stdout);
+                    }
+                    if (idx >= 0 && c.tex0.tbp0 == s_list[idx].first && c.tex0.psm == s_list[idx].second)
+                    {
+                        pending.clear();
+                        return;
+                    }
+                }
+            }
         }
 
         const bool zwrite = dt && !c.zbuf.zmask;
