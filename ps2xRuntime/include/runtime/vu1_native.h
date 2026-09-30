@@ -25,6 +25,7 @@ namespace ps2vu1n
     {
         kEnded = 0,
         kFallback = 1, // continue in the interpreter at state.pc
+        kContinue = 2, // generated code only: leave a region, trampoline continues at state.pc
     };
 
     struct FlagEntry

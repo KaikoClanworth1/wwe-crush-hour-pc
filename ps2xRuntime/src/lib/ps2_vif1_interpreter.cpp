@@ -629,6 +629,19 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
                 const uint32_t comps = static_cast<uint32_t>(components > 4 ? 4 : components);
+                static const bool s_noBulk = std::getenv("PS2X_UNPACK_NO_BULK") != nullptr;
+                if (vl == 0u && comps == 4u && cl == wl && !s_noBulk)
+                {
+                    // V4-32: straight quadword copy (VU1 data memory wraps at 1024 qwords).
+                    const uint32_t first = std::min<uint32_t>(writeVectorCount, 1024u - vuAddr);
+                    std::memcpy(m_vu1Data + vuAddr * 16u, srcBase, first * 16u);
+                    if (first < writeVectorCount)
+                        std::memcpy(m_vu1Data, srcBase + first * 16u, (writeVectorCount - first) * 16u);
+                    pos += totalBytes;
+                    if (pos > sizeBytes)
+                        break;
+                    continue;
+                }
                 for (uint32_t w = 0; w < writeVectorCount; ++w)
                 {
                     const uint32_t destVec = (cl == wl) ? ((vuAddr + w) & 0x3FFu)
@@ -670,6 +683,26 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 continue;
             }
 
+            {
+                static const bool s_stats = std::getenv("PS2X_UNPACK_STATS") != nullptr;
+                if (s_stats)
+                {
+                    static uint64_t s_slow[8][4][2][2] = {};
+                    static uint64_t s_calls = 0;
+                    ++s_slow[vl & 3u][vn & 3u][maskEnable ? 1 : 0][(vif1_regs.mode & 3u) ? 1 : 0];
+                    if (++s_calls % 200000u == 0u)
+                    {
+                        for (int a = 0; a < 4; ++a)
+                            for (int b = 0; b < 4; ++b)
+                                for (int m = 0; m < 2; ++m)
+                                    for (int md = 0; md < 2; ++md)
+                                        if (s_slow[a][b][m][md])
+                                            std::printf("[unpack-slow] vl=%d vn=%d mask=%d mode=%d count=%llu (cl=%u wl=%u)\n", a, b, m, md,
+                                                        (unsigned long long)s_slow[a][b][m][md], cl, wl);
+                        std::fflush(stdout);
+                    }
+                }
+            }
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
