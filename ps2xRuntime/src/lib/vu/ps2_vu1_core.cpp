@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
+#include "runtime/native_rw.h"
 // Debug (PS2X_VU1_SKIP_CYCLE=<sec>): drop the XGKICK output of one VU1 program image at a time.
 bool g_vu1SuppressKick = false;
 #include <vector>
@@ -1033,7 +1034,10 @@ void VU1Interpreter::finishXgkick()
     }
 
     if (m_activeMemory && !g_vu1SuppressKick)
+    {
+        nrw::observeKick(m_xgkick.packet.data(), m_xgkick.totalBytes);
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
+    }
     else if (m_activeGs)
         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
     m_xgkick.active = false;

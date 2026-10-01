@@ -24,6 +24,7 @@ public:
     void Reset() override;
 
     void Submit(const GSPrimitiveBatch &batch) override;
+    void SubmitNative(const GSDrawState &state, const void *job, uint32_t jobSize) override;
     void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
     void BeginTransfer(const GSTransferCommand &command) override;
     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;

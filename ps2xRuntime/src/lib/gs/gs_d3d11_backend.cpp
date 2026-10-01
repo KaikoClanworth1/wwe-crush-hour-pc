@@ -28,6 +28,7 @@ extern thread_local GifPathId g_gifCurrentPath;
 #include <unordered_map>
 #include <vector>
 namespace ps2host { uint64_t d3dStateEpoch(); } // win32_host.cpp: bumped when the host draws
+#include "runtime/native_rw.h"
 
 using Microsoft::WRL::ComPtr;
 using namespace GSInternal;
@@ -127,8 +128,63 @@ Texture2D gsTex : register(t0);
 SamplerState gsSamp : register(s0);
 
 struct VsIn  { float4 pos : POSITION; float4 col : COLOR0; float4 tc : TEXCOORD0; };
-struct PsIn  { float4 pos : SV_Position; float4 col : COLOR0; float4 tc : TEXCOORD0; };
+struct PsIn  { float4 pos : SV_Position; noperspective float4 col : COLOR0; noperspective float4 tc : TEXCOORD0; };
 struct PsOut { float4 c0 : SV_Target0; float4 c1 : SV_Target1; };
+
+// Native RenderWare geometry (runtime/native_rw.h): the math of RenderWare's PS2All VU1 program.
+cbuffer Native : register(b1)
+{
+    float4 nC0, nC1, nC2, nC3; // object -> screen columns (VU1 1008..1011 after the program's setup)
+    float4 nOff;               // screen offset (VU1 1016 + 1017)
+    float4 nMat;               // material colour scale (VU1 1019)
+    float4 nMisc;              // x, y: XYOFFSET in pixels; z: Z format range; w: fog on (object flag bit 0)
+    float4 nFog;               // x: fz, y: fw (VU1 1014.zw); z: light count
+    float4 nLightCol[6];       // xyz: colour * surface coefficient, w: 1 ambient / 2 directional / 3 point
+    float4 nLightDir[6];       // object-space direction (directional) or position + 1/radius (point)
+    float4 nClip;              // clip variants: x, y = VU1 1021.z, 1022.z (clip z = x + y*w, kept within +-w); z: on
+};
+// GS-equivalent outputs plus the clip variants' near/far planes (VU1 CLIP of z against w).
+struct NativeOut { float4 pos : SV_Position; noperspective float4 col : COLOR0; noperspective float4 tc : TEXCOORD0;
+                   float2 cd : SV_ClipDistance0; };
+struct NativeIn { float3 pos : POSITION; float2 uv : TEXCOORD0; uint4 col : COLOR0; int4 nrm : NORMAL; };
+NativeOut vs_native(NativeIn v)
+{
+    const float4 clip = v.pos.x * nC0 + v.pos.y * nC1 + v.pos.z * nC2 + nC3;
+    const float q = 1.0 / clip.w;
+    const float3 scr = clip.xyz * q + nOff.xyz;
+    const float2 xy = trunc(scr.xy * 16.0) / 16.0 - nMisc.xy; // FTOI4 -> GS 12.4 coordinates
+    // FTOI4, then packed XYZF2 keeps bits 4..27 of the Z word.
+    const float z = clamp(floor(max(trunc(scr.z * 16.0), 0.0) / 16.0), 0.0, min(nMisc.z, 16777215.0));
+    NativeOut o;
+    // Homogeneous output so D3D clips like the VU1 clip routines; behind the camera z stays linear in w.
+    const float zn = clip.w > 0.0 ? z / nMisc.z : scr.z / nMisc.z;
+    o.pos = float4(xy.x / rtSize.x * 2.0 - 1.0, 1.0 - xy.y / rtSize.y * 2.0, zn, 1.0) * clip.w;
+    const float cz = nClip.x + nClip.y * clip.w;
+    o.cd = nClip.z != 0.0 ? float2(clip.w - cz, clip.w + cz) : float2(clip.w, clip.w);
+    float4 col = float4(v.col);
+    const float3 n = float3(v.nrm.xyz) / 128.0;
+    for (int li = 0; li < (int)nFog.z; ++li)
+    {
+        if (nLightCol[li].w == 1.0)
+            col.rgb += nLightCol[li].rgb;
+        else if (nLightCol[li].w == 2.0)
+            col.rgb += nLightCol[li].rgb * max(0.0, dot(n, nLightDir[li].xyz));
+        else
+        {
+            // Point: L * max(0, n.d) * max(0, 1/|d| - 1/R), d unnormalised (VU1 handler 0x658).
+            const float3 d = nLightDir[li].xyz - v.pos;
+            const float d2 = dot(d, d);
+            const float inv = d2 > 0.0 ? rsqrt(d2) : 0.0;
+            col.rgb += nLightCol[li].rgb * max(0.0, dot(n, d)) * max(0.0, inv - nLightDir[li].w);
+        }
+    }
+    o.col = trunc(min(col, 255.0) * nMat);                     // FTOI0
+    // Fog routines: F = clamp(fz * clip.w, fz*fw, fz*fw + 255) - fz*fw  (XYZF2 F byte).
+    const float lo = nFog.x * nFog.y;
+    const float fog = nMisc.w != 0.0 ? trunc(clamp(clip.w * nFog.x, min(lo, lo + 255.0), max(lo, lo + 255.0)) - lo) : 255.0;
+    o.tc = float4(v.uv * q, q, fog);                           // STQ + fog
+    return o;
+}
 
 PsIn vs_main(VsIn v)
 {
@@ -290,6 +346,33 @@ struct GSD3D11Backend::Impl
     ComPtr<ID3D11Buffer> vb, cb, blitCb;
     uint32_t vbCapacity = 0;
     uint32_t vbWriteOffset = 0; // append-only ring: NO_OVERWRITE maps, DISCARD on wrap
+    // Native RenderWare geometry.
+    ComPtr<ID3D11VertexShader> vsNative;
+    ComPtr<ID3D11InputLayout> layoutNative;
+    ComPtr<ID3D11Buffer> cbNative;
+    struct NativeVtx
+    {
+        float pos[3];
+        float uv[2];
+        uint8_t col[4];
+        int8_t nrm[4];
+    };
+    struct NativeSector
+    {
+        ComPtr<ID3D11Buffer> vb;
+        uint32_t verts = 0, numVerts = 0;
+    };
+    struct NativeMesh
+    {
+        ComPtr<ID3D11Buffer> ib;
+        uint32_t indices = 0, numIndices = 0;
+        bool strip = false;
+    };
+    std::unordered_map<uint32_t, NativeSector> nativeSectors;
+    std::unordered_map<uint32_t, NativeMesh> nativeMeshes;
+    const nrw::MeshJob *nativeJob = nullptr;
+    NativeSector *nativeSector = nullptr;
+    NativeMesh *nativeMesh = nullptr;
     // Draw-state cache for flushPending. Anything else that changes context state (blit, present,
     // latch) bumps pipeGen so the next draw rebinds everything.
     uint64_t pipeGen = 1;
@@ -380,6 +463,7 @@ struct GSD3D11Backend::Impl
     uint32_t lastUploadDbp = 0;
     // Page span of the host->local transfer in progress (pixel data arrives after BeginTransfer).
     uint32_t uploadFirst = 1u, uploadLast = 0u;
+    uint64_t statNativeDraws = 0;
     uint64_t statDraws = 0, statSyncs = 0, statUploads = 0, statTexDecodes = 0, statTexContentHits = 0;
     const char *syncReason = "?";
     char syncDetail[96] = "";
@@ -418,10 +502,21 @@ struct GSD3D11Backend::Impl
             }
             return true;
         };
-        ComPtr<ID3DBlob> vsb, psb, vsbb, psbb;
+        ComPtr<ID3DBlob> vsb, psb, vsbb, psbb, vsnb;
         if (!compile("vs_main", "vs_5_0", vsb) || !compile("ps_main", "ps_5_0", psb) ||
-            !compile("vs_blit", "vs_5_0", vsbb) || !compile("ps_blit", "ps_5_0", psbb))
+            !compile("vs_blit", "vs_5_0", vsbb) || !compile("ps_blit", "ps_5_0", psbb) ||
+            !compile("vs_native", "vs_5_0", vsnb))
             return false;
+        dev->CreateVertexShader(vsnb->GetBufferPointer(), vsnb->GetBufferSize(), nullptr, &vsNative);
+        {
+            const D3D11_INPUT_ELEMENT_DESC nil[] = {
+                {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"NORMAL", 0, DXGI_FORMAT_R8G8B8A8_SINT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            };
+            dev->CreateInputLayout(nil, 4, vsnb->GetBufferPointer(), vsnb->GetBufferSize(), &layoutNative);
+        }
         dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs);
         dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps);
         dev->CreateVertexShader(vsbb->GetBufferPointer(), vsbb->GetBufferSize(), nullptr, &vsBlit);
@@ -442,6 +537,8 @@ struct GSD3D11Backend::Impl
         dev->CreateBuffer(&cbd, nullptr, &cb);
         cbd.ByteWidth = 16;
         dev->CreateBuffer(&cbd, nullptr, &blitCb);
+        cbd.ByteWidth = 21 * 16;
+        dev->CreateBuffer(&cbd, nullptr, &cbNative);
 
         for (int lin = 0; lin < 2; ++lin)
             for (int rep = 0; rep < 2; ++rep)
@@ -1320,13 +1417,165 @@ struct GSD3D11Backend::Impl
             flushPending();
     }
 
+    // Vertex / index buffers for a RenderWare world sector mesh, built once from EE memory.
+    bool prepareNative(const nrw::MeshJob &job)
+    {
+        const uint8_t *ee = nrw::rdram();
+        if (!ee)
+            return false;
+        auto rd32 = [&](uint32_t a) { uint32_t v; std::memcpy(&v, ee + (a & 0x1FFFFFFu), 4); return v; };
+        auto rd16 = [&](uint32_t a) { uint16_t v; std::memcpy(&v, ee + (a & 0x1FFFFFFu), 2); return v; };
+        const uint32_t sec = job.object;
+        const uint32_t verts = rd32(sec + 0x08), normals = rd32(sec + 0x0C), uvs = rd32(sec + 0x10), prelit = rd32(sec + 0x30);
+        const uint32_t numVerts = rd16(sec + 0x8A);
+        if (!verts || !numVerts)
+            return false;
+        NativeSector &ns = nativeSectors[sec];
+        if (!ns.vb || ns.verts != verts || ns.numVerts != numVerts)
+        {
+            std::vector<NativeVtx> vtx(numVerts);
+            for (uint32_t i = 0; i < numVerts; ++i)
+            {
+                NativeVtx &o = vtx[i];
+                std::memcpy(o.pos, ee + ((verts + i * 12u) & 0x1FFFFFFu), 12);
+                if (uvs)
+                    std::memcpy(o.uv, ee + ((uvs + i * 8u) & 0x1FFFFFFu), 8);
+                else
+                    o.uv[0] = o.uv[1] = 0.0f;
+                if (prelit)
+                    std::memcpy(o.col, ee + ((prelit + i * 4u) & 0x1FFFFFFu), 4);
+                else
+                    o.col[0] = o.col[1] = o.col[2] = o.col[3] = 255;
+                if (normals)
+                    std::memcpy(o.nrm, ee + ((normals + i * 4u) & 0x1FFFFFFu), 4);
+                else
+                    o.nrm[0] = o.nrm[1] = o.nrm[2] = o.nrm[3] = 0;
+            }
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = static_cast<UINT>(vtx.size() * sizeof(NativeVtx));
+            bd.Usage = D3D11_USAGE_IMMUTABLE;
+            bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+            D3D11_SUBRESOURCE_DATA sd{vtx.data(), 0, 0};
+            ns.vb.Reset();
+            if (FAILED(dev->CreateBuffer(&bd, &sd, &ns.vb)))
+                return false;
+            ns.verts = verts;
+            ns.numVerts = numVerts;
+        }
+        const uint32_t indices = rd32(job.mesh + 0x0), numIndices = rd32(job.mesh + 0x4);
+        if (!indices || numIndices < 3u)
+            return false;
+        NativeMesh &nm = nativeMeshes[job.mesh];
+        const bool strip = (job.meshHeaderFlags & 1u) != 0u;
+        if (!nm.ib || nm.indices != indices || nm.numIndices != numIndices || nm.strip != strip)
+        {
+            std::vector<uint16_t> idx(numIndices);
+            std::memcpy(idx.data(), ee + (indices & 0x1FFFFFFu), numIndices * 2u);
+            for (uint16_t &i : idx)
+                if (i >= numVerts)
+                    i = 0;
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = numIndices * 2u;
+            bd.Usage = D3D11_USAGE_IMMUTABLE;
+            bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+            D3D11_SUBRESOURCE_DATA sd{idx.data(), 0, 0};
+            nm.ib.Reset();
+            if (FAILED(dev->CreateBuffer(&bd, &sd, &nm.ib)))
+                return false;
+            nm.indices = indices;
+            nm.numIndices = numIndices;
+            nm.strip = strip;
+        }
+        nativeSector = &ns;
+        nativeMesh = &nm;
+        return true;
+    }
+
+    // Bind the native pipeline over the standard one (flushPending rebinds everything afterwards).
+    void bindNative(const nrw::MeshJob &job, const GSDrawState &st)
+    {
+        auto vu = [&](uint32_t a) { return job.vu[nrw::vuIndex(a)]; };
+        float cols[4][4];
+        for (int i = 0; i < 4; ++i)
+            std::memcpy(cols[i], vu(1008u + static_cast<uint32_t>(i)), 16);
+        // VU1 setup: z lane from C3 only (= 1), shift x/y by half w, then scale by VU1 1015.
+        for (int i = 0; i < 3; ++i)
+            cols[i][2] = 0.0f;
+        cols[3][2] = 1.0f;
+        const float *scale = vu(1015);
+        for (int i = 0; i < 4; ++i)
+        {
+            cols[i][0] = (cols[i][0] - 0.5f * cols[i][3]) * scale[0];
+            cols[i][1] = (cols[i][1] - 0.5f * cols[i][3]) * scale[1];
+        }
+        cols[3][2] *= scale[2];
+        float cbv[21][4] = {};
+        std::memcpy(cbv, cols, sizeof(cols));
+        const float *off = vu(1016), *off2 = vu(1017);
+        cbv[4][0] = off[0] + off2[0];
+        cbv[4][1] = off[1] + off2[1];
+        cbv[4][2] = off[2];
+        cbv[4][3] = 0.0f;
+        std::memcpy(cbv[5], vu(1019), 16);
+        const auto &c = st.context;
+        cbv[6][0] = static_cast<float>(c.xyoffset.ofx) / 16.0f;
+        cbv[6][1] = static_cast<float>(c.xyoffset.ofy) / 16.0f;
+        double maxz = 4294967296.0;
+        if (c.zbuf.psm == GS_PSM_Z24) maxz = 16777216.0;
+        else if (c.zbuf.psm == GS_PSM_Z16 || c.zbuf.psm == GS_PSM_Z16S) maxz = 65536.0;
+        cbv[6][2] = static_cast<float>(maxz);
+        uint32_t objFlags;
+        std::memcpy(&objFlags, vu(1023), 4);
+        cbv[6][3] = (objFlags & 1u) ? 1.0f : 0.0f;
+        cbv[7][0] = vu(1014)[2];
+        cbv[7][1] = vu(1014)[3];
+        cbv[7][3] = 0.0f;
+        cbv[7][2] = static_cast<float>(nrw::parseLights(job, &cbv[8][0], &cbv[14][0], 6));
+        cbv[20][0] = vu(1021)[2];
+        cbv[20][1] = vu(1022)[2];
+        cbv[20][2] = (objFlags & 2u) ? 1.0f : 0.0f;
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (SUCCEEDED(ctx->Map(cbNative.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        {
+            std::memcpy(m.pData, cbv, sizeof(cbv));
+            ctx->Unmap(cbNative.Get(), 0);
+        }
+        ID3D11Buffer *cbn = cbNative.Get();
+        ctx->VSSetConstantBuffers(1, 1, &cbn);
+        ctx->VSSetShader(vsNative.Get(), nullptr, 0);
+        ctx->IASetInputLayout(layoutNative.Get());
+        UINT stride = sizeof(NativeVtx), offset = 0;
+        ID3D11Buffer *vbn = nativeSector->vb.Get();
+        ctx->IASetVertexBuffers(0, 1, &vbn, &stride, &offset);
+        ctx->IASetIndexBuffer(nativeMesh->ib.Get(), DXGI_FORMAT_R16_UINT, 0);
+        ctx->IASetPrimitiveTopology(nativeMesh->strip ? D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+                                                      : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ++pipeGen; // the next ordinary draw rebinds the standard pipeline
+    }
+
+    void submitNative(const GSDrawState &st, const nrw::MeshJob &job)
+    {
+        flushPending();
+        if (!prepareNative(job))
+            return;
+        pending.clear();
+        pendingState = st;
+        hasPending = true;
+        nativeJob = &job;
+        flushPending();
+        nativeJob = nullptr;
+        nativeSector = nullptr;
+        nativeMesh = nullptr;
+        ++statNativeDraws;
+    }
+
     void flushPending()
     {
         if (!hasPending)
             return;
         ps2prof::Scope profScope(ps2prof::kGsFlush);
         hasPending = false;
-        if (pending.empty() || !gpuReady)
+        if ((pending.empty() && !nativeJob) || !gpuReady)
         {
             pending.clear();
             return;
@@ -1337,7 +1586,7 @@ struct GSD3D11Backend::Impl
         const uint32_t fbpBlock = framePageBaseToBlock(c.frame.fbp);
         // Size by what is actually drawn: a full-VRAM scissor would otherwise grow the frame buffer
         // over the texture area, and every texture upload then forces an RT re-upload.
-        float maxY = 0.0f;
+        float maxY = nativeJob ? static_cast<float>(pendingState.context.scissor.y1) : 0.0f;
         for (const Vtx &v : pending)
             maxY = std::max(maxY, v.y);
         const uint32_t drawnH = static_cast<uint32_t>(std::max(0.0f, std::ceil(maxY))) + 1u;
@@ -1512,6 +1761,9 @@ struct GSD3D11Backend::Impl
 
         // ---- vertex upload
         const uint32_t bytes = static_cast<uint32_t>(pending.size() * sizeof(Vtx));
+        UINT firstVertex = 0;
+        if (!nativeJob)
+        {
         if (bytes > vbCapacity)
         {
             vb.Reset();
@@ -1543,8 +1795,9 @@ struct GSD3D11Backend::Impl
         }
         std::memcpy(static_cast<uint8_t *>(m.pData) + vbWriteOffset, pending.data(), bytes);
         ctx->Unmap(vb.Get(), 0);
-        const UINT firstVertex = vbWriteOffset / static_cast<UINT>(sizeof(Vtx));
+        firstVertex = vbWriteOffset / static_cast<UINT>(sizeof(Vtx));
         vbWriteOffset += bytes;
+        }
 
         // ---- pipeline
         const uint64_t hostEpoch = ps2host::d3dStateEpoch();
@@ -1605,6 +1858,8 @@ struct GSD3D11Backend::Impl
             ctx->PSSetSamplers(0, 1, &smp);
             bound.smp = smp;
         }
+        if (nativeJob)
+            bindNative(*nativeJob, st);
 
         auto drawPass = [&](float afailSelect, bool depthWrite, bool rgbOnly, bool colorOff)
         {
@@ -1635,7 +1890,10 @@ struct GSD3D11Backend::Impl
                 ctx->OMSetDepthStencilState(ds, 0);
                 bound.ds = ds;
             }
-            ctx->Draw(static_cast<UINT>(pending.size()), firstVertex);
+            if (nativeJob)
+                ctx->DrawIndexed(nativeMesh->numIndices, 0, 0);
+            else
+                ctx->Draw(static_cast<UINT>(pending.size()), firstVertex);
         };
 
         static const int s_traceLimit = std::getenv("PS2X_GS_TRACE") ? std::atoi(std::getenv("PS2X_GS_TRACE")) : 0;
@@ -1646,7 +1904,7 @@ struct GSD3D11Backend::Impl
         static const auto s_firstDraw = std::chrono::steady_clock::now();
         const bool traceTimeOk = s_traceSec <= 0.0 ||
                                  std::chrono::duration<double>(std::chrono::steady_clock::now() - s_firstDraw).count() >= s_traceSec;
-        if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk)
+        if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk && !pending.empty())
         {
             if (s_traced == 0)
                 std::printf("[gs-trace] start at frame %llu\n", static_cast<unsigned long long>(frameCounter));
@@ -1758,6 +2016,11 @@ struct GSD3D11Backend::Impl
             {
                 minY = std::min(minY, v.y);
                 maxY = std::max(maxY, v.y);
+            }
+            if (nativeJob)
+            {
+                minY = static_cast<float>(c.scissor.y0);
+                maxY = static_cast<float>(c.scissor.y1) + 1.0f;
             }
             // Rows whose pixel centres lie in [minY, maxY): a full 256-line sprite ends at y=256 but
             // only touches rows 0..255 (counting row 256 forced readbacks for CLUTs stored below).
@@ -1885,6 +2148,14 @@ void GSD3D11Backend::Reset()
     m_impl->texCache.clear();
     m_impl->hasDisplay = false;
     m_impl->mem.Reset();
+}
+
+void GSD3D11Backend::SubmitNative(const GSDrawState &state, const void *job, uint32_t jobSize)
+{
+    std::lock_guard<std::recursive_mutex> lock(ps2host::d3dLock());
+    if (!job || jobSize != sizeof(nrw::MeshJob) || !m_impl->initGpu())
+        return;
+    m_impl->submitNative(state, *static_cast<const nrw::MeshJob *>(job));
 }
 
 void GSD3D11Backend::Submit(const GSPrimitiveBatch &batch)

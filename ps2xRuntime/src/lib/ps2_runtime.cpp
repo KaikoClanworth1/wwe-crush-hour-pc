@@ -7,6 +7,7 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/native_rw.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -84,7 +85,7 @@ namespace
                                 g_gsThread.jobs.pop_front();
                                 g_gsThread.busy = true;
                             }
-                            g_gsThread.gs->processGIFPacket(job.data(), static_cast<uint32_t>(job.size()));
+                            nrw::dispatchPacket(*g_gsThread.gs, job.data(), static_cast<uint32_t>(job.size()));
                             {
                                 std::lock_guard lock(g_gsThread.m);
                                 job.clear();
@@ -962,6 +963,8 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    nrw::setGs(&m_gs);
+    nrw::setRdram(rdram);
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     {
                                         if (ps2GsThreadEnabled())

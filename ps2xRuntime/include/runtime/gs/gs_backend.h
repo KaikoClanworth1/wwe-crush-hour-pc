@@ -31,4 +31,13 @@ public:
     virtual void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) = 0;
     virtual void SnapshotVram(std::vector<uint8_t> &out) const = 0;
     virtual GSTransferSnapshot GetTransferSnapshot() const = 0;
+
+    // Native RenderWare geometry (see runtime/native_rw.h): draw a job with the GS state current at this
+    // point of the command stream. Backends without support ignore it.
+    virtual void SubmitNative(const GSDrawState &state, const void *job, uint32_t jobSize)
+    {
+        (void)state;
+        (void)job;
+        (void)jobSize;
+    }
 };

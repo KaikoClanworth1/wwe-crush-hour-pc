@@ -1,4 +1,5 @@
-﻿#include <cstdlib>
+﻿#include "runtime/native_rw.h"
+#include <cstdlib>
 #include <cstdio>
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
@@ -426,6 +427,18 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_MARK)
         {
+            if (imm == nrw::kMarkerMark && pos + 4 <= sizeBytes)
+            {
+                // Native RenderWare mesh marker (runtime/native_rw.h): the next word is a NOP carrying the index.
+                uint32_t next;
+                memcpy(&next, data + pos, 4);
+                if (((next >> 24) & 0x7Fu) == VIF_NOP)
+                {
+                    pos += 4;
+                    nrw::marker(*this, next & 0xFFFFu);
+                    continue;
+                }
+            }
             vif1_regs.mark = imm;
             vif1_regs.stat |= (1u << 6); // MRK
             continue;

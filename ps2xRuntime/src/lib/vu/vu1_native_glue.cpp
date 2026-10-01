@@ -1,4 +1,5 @@
 #include "runtime/vu1_native.h"
+#include "runtime/native_rw.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
 
@@ -133,7 +134,10 @@ namespace ps2vu1n
                     break;
             }
             if (!packet.empty() && u.memory && !g_vu1SuppressKick)
+            {
+                nrw::observeKick(packet.data(), static_cast<uint32_t>(packet.size()));
                 u.memory->submitGifPacket(GifPathId::Path1, packet.data(), static_cast<uint32_t>(packet.size()));
+            }
         }
 
         ProgramFn lookup(uint64_t hash)

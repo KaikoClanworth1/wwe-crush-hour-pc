@@ -108,6 +108,8 @@ public:
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+    // Native RenderWare mesh job, ordered with the GIF stream; primReg = PRIM from the job's GIF tag.
+    void nativeDraw(uint64_t primReg, const void *job, uint32_t jobSize);
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
                            uint64_t trxreg,

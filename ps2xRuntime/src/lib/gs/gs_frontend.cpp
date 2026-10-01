@@ -641,6 +641,17 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
+void GS::nativeDraw(uint64_t primReg, const void *job, uint32_t jobSize)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (!m_backend || !job)
+        return;
+    // The replaced VU1 program would have started its GIF output with a tag carrying PRE=1 and this PRIM.
+    writeRegisterUnlocked(GS_REG_PRIM, primReg);
+    GSPrimitiveBatch batch = buildDrawBatch(0);
+    m_backend->SubmitNative(batch.state, job, jobSize);
+}
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
