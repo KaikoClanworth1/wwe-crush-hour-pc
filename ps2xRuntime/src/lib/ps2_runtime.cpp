@@ -29,6 +29,7 @@
 #include <cstring>
 #include <limits>
 #include <chrono>
+#include <functional>
 #include <atomic>
 #include <thread>
 #include <unordered_map>
@@ -43,6 +44,7 @@ namespace ps2_stubs
     void resetSifState();
 }
 
+
 // ---- GS worker thread (PS2X_GS_THREAD=1) ------------------------------------------------------------
 // GIF packets leaving the arbiter are copied into a FIFO and processed (frontend + D3D11 backend) on a
 // dedicated thread, so VU1/VIF/DMA work on the EE side overlaps with draw submission. Packet order is
@@ -54,10 +56,12 @@ namespace
     {
         std::mutex m;
         std::condition_variable cv, idleCv;
-        std::deque<std::vector<uint8_t>> jobs;
+        std::deque<std::vector<uint8_t>> jobs; // an empty job runs the next entry of calls
+        std::deque<std::function<void()>> calls;
         std::vector<std::vector<uint8_t>> pool;
         bool busy = false;
         bool started = false;
+        uint32_t queuedFlips = 0; // DISPFB writes queued and not yet applied (ps2GsThreadDeferFlip)
         GS *gs = nullptr;
     };
     GsThreadState g_gsThread;
@@ -78,14 +82,23 @@ namespace
                         for (;;)
                         {
                             std::vector<uint8_t> job;
+                            std::function<void()> call;
                             {
                                 std::unique_lock lock(g_gsThread.m);
                                 g_gsThread.cv.wait(lock, [] { return !g_gsThread.jobs.empty(); });
                                 job = std::move(g_gsThread.jobs.front());
                                 g_gsThread.jobs.pop_front();
+                                if (job.empty())
+                                {
+                                    call = std::move(g_gsThread.calls.front());
+                                    g_gsThread.calls.pop_front();
+                                }
                                 g_gsThread.busy = true;
                             }
-                            nrw::dispatchPacket(*g_gsThread.gs, job.data(), static_cast<uint32_t>(job.size()));
+                            if (job.empty())
+                                call();
+                            else
+                                nrw::dispatchPacket(*g_gsThread.gs, job.data(), static_cast<uint32_t>(job.size()));
                             {
                                 std::lock_guard lock(g_gsThread.m);
                                 job.clear();
@@ -135,6 +148,59 @@ void ps2GsThreadSubmit(GS &gs, const uint8_t *data, uint32_t size)
         g_gsThread.jobs.push_back(std::move(buf));
     }
     g_gsThread.cv.notify_one();
+}
+
+// Runs fn on the GS worker in stream order (after every packet queued so far) without waiting for it.
+// Returns false -- the caller does the work itself -- on the worker or when the worker is not running.
+bool ps2GsThreadDefer(std::function<void()> fn)
+{
+    if (t_gsWorker || !ps2GsThreadEnabled())
+        return false;
+    {
+        std::lock_guard lock(g_gsThread.m);
+        if (!g_gsThread.started)
+            return false;
+        g_gsThread.calls.push_back(std::move(fn));
+        g_gsThread.jobs.emplace_back();
+    }
+    g_gsThread.cv.notify_one();
+    return true;
+}
+
+// A DISPFB write (buffer flip), deferred like ps2GsThreadDefer. The flip is also the back-pressure point:
+// the EE may run at most one frame ahead of the worker. Unbounded, it queued several frames, the worker
+// monopolised the D3D lock and the host stalled for seconds (frame rate swinging between 0 and 118).
+bool ps2GsThreadDeferFlip(std::function<void()> fn)
+{
+    if (t_gsWorker || !ps2GsThreadEnabled())
+        return false;
+    {
+        std::unique_lock lock(g_gsThread.m);
+        if (!g_gsThread.started)
+            return false;
+        g_gsThread.idleCv.wait(lock, [] { return g_gsThread.queuedFlips < 1u; });
+        ++g_gsThread.queuedFlips;
+        g_gsThread.calls.push_back([f = std::move(fn)]()
+                                   {
+                                       f();
+                                       std::lock_guard l(g_gsThread.m);
+                                       --g_gsThread.queuedFlips;
+                                       g_gsThread.idleCv.notify_all();
+                                   });
+        g_gsThread.jobs.emplace_back();
+    }
+    g_gsThread.cv.notify_one();
+    return true;
+}
+
+// Host presentation with the worker: latching from the host thread races the stream -- the EE can flip
+// DISPFB and the worker draw the start of the next frame into the buffer being copied (half-drawn menu
+// frames: sky / HUD missing). Queue the latch instead; the worker runs it between packets, and DISPFB
+// writes are queued the same way (ps2_memory.cpp), so it sees the display registers that belong to the
+// frames drawn so far. Returns false when the worker is not running.
+bool ps2GsThreadLatch()
+{
+    return ps2GsThreadDefer([] { g_gsThread.gs->latchHostPresentationFrame(); });
 }
 
 void ps2GsThreadDrain()
@@ -584,7 +650,8 @@ static void UploadFrame(PS2X_FRAME_TEX_T &tex, PS2Runtime *rt, uint32_t &outWidt
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        if (!ps2GsThreadLatch())
+            rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }

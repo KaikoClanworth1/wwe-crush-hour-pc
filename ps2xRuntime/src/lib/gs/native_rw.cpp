@@ -164,8 +164,8 @@ namespace nrw
     {
         static const bool s_on = []()
         {
-            const char *v = std::getenv("PS2X_NATIVE_WORLD");
-            return v && *v && *v != '0';
+            const char *v = std::getenv("PS2X_NATIVE_WORLD"); // default on; PS2X_NATIVE_WORLD=0 uses VU1
+            return !(v && *v == '0');
         }();
         return s_on;
     }

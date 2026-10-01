@@ -20,6 +20,8 @@
 #include <thread>
 
 void ps2GsThreadDrain(); // ps2_runtime.cpp (PS2X_GS_THREAD)
+bool ps2GsThreadDefer(std::function<void()> fn); // ps2_runtime.cpp
+bool ps2GsThreadDeferFlip(std::function<void()> fn); // ps2_runtime.cpp
 
 namespace
 {
@@ -244,6 +246,18 @@ namespace
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
+    // PMODE..BGCOLOR (0x12000000..0x120000E0): display setup only, nothing the EE waits on.
+    inline bool isGsDisplayReg(uint32_t address)
+    {
+        return ((address - PS2_GS_PRIV_REG_BASE) & ~0x7u) < 0x1000u;
+    }
+
+    // Queue a display-register write on the GS worker; DISPFB1/2 (a flip) also paces the EE.
+    bool deferGsDisplayWrite(uint32_t address, std::function<void()> fn)
+    {
+        const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        return (regOff == 0x70u || regOff == 0x90u) ? ps2GsThreadDeferFlip(std::move(fn)) : ps2GsThreadDefer(std::move(fn));
+    }
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
@@ -1107,7 +1121,11 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
-        ps2GsThreadDrain(); // e.g. DISPFB at a buffer flip: the queued frame must be finished first
+        // Display registers (a DISPFB flip) apply in stream order on the GS worker -- the presentation
+        // latch runs there too -- so the EE does not wait for the queued frame to finish.
+        if (isGsDisplayReg(address) && deferGsDisplayWrite(address, [this, address, value] { write32(address, value); }))
+            return;
+        ps2GsThreadDrain(); // status registers (CSR, ...): the queued work must be finished first
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -1168,7 +1186,9 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
-        ps2GsThreadDrain(); // e.g. DISPFB at a buffer flip: the queued frame must be finished first
+        if (isGsDisplayReg(address) && deferGsDisplayWrite(address, [this, address, value] { write64(address, value); }))
+            return;
+        ps2GsThreadDrain(); // status registers (CSR, ...): the queued work must be finished first
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {

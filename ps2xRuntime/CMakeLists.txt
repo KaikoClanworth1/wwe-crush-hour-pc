@@ -492,6 +492,10 @@ else()
     add_executable(ps2EntryRunner
         ${RUNNER_SRC_FILES}
     )
+    if(WIN32)
+        target_sources(ps2EntryRunner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/res/game.rc)
+        set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/res/game.rc PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    endif()
 endif()
 
 if(PS2X_ENABLE_RUNNER_UNITY_BUILD)

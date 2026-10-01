@@ -1,0 +1,32 @@
+// Executable icon and version information (Windows). game.ico is the game's own memory-card icon
+// texture (tools/make_icon.py); the native window loads icon 1 (win32_host.cpp).
+// Constants are spelled out so no SDK header is needed: VOS_NT_WINDOWS32 = 0x40004, VFT_APP = 1.
+
+1 ICON "game.ico"
+
+1 VERSIONINFO
+ FILEVERSION     1,0,0,0
+ PRODUCTVERSION  1,0,0,0
+ FILEFLAGSMASK   0x3fL
+ FILEFLAGS       0x0L
+ FILEOS          0x40004L
+ FILETYPE        0x1L
+ FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription",  "WWE Crush Hour"
+            VALUE "FileVersion",      "1.0"
+            VALUE "InternalName",     "WWECrushHour"
+            VALUE "OriginalFilename", "WWECrushHour.exe"
+            VALUE "ProductName",      "WWE Crush Hour PC Port"
+            VALUE "ProductVersion",   "1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
