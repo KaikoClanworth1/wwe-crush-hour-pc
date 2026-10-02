@@ -1901,6 +1901,42 @@ namespace ps2_stubs
             }
         }
 
+        // sceMpegGetPicture(mp, rgb32, mbcount): the buffer holds mbcount macroblocks (16x16 RGBA32, 1 KiB
+        // each). The writers below emit the whole picture; a caller with a smaller buffer -- the arena
+        // jumbotron video textures -- had the guest memory after it overwritten every frame (car textures
+        // and other data turned to video pixels). Saves that tail before the write and restores it after.
+        struct McLimitGuard
+        {
+            uint8_t *base = nullptr;
+            std::vector<uint8_t> saved;
+            McLimitGuard(uint8_t *rdram, uint32_t dest, uint32_t mbcount, uint32_t w, uint32_t h)
+            {
+                const uint64_t full = static_cast<uint64_t>(w) * h * 4u;
+                const uint64_t limit = static_cast<uint64_t>(mbcount) * 1024u;
+                if (!rdram || dest == 0u || mbcount == 0u || limit >= full)
+                    return;
+                const uint32_t start = (dest & 0x1FFFFFFu) + static_cast<uint32_t>(limit);
+                const uint32_t end = static_cast<uint32_t>(std::min<uint64_t>((dest & 0x1FFFFFFu) + full, 0x2000000u));
+                if (start >= end)
+                    return;
+                base = rdram + start;
+                saved.assign(base, base + (end - start));
+                static int s_log = 8;
+                if (s_log > 0)
+                {
+                    --s_log;
+                    std::printf("[MPEG] picture %ux%u exceeds caller buffer (%u macroblocks): keeping 0x%x bytes after it\n",
+                                w, h, mbcount, end - start);
+                    std::fflush(stdout);
+                }
+            }
+            ~McLimitGuard()
+            {
+                if (base)
+                    std::memcpy(base, saved.data(), saved.size());
+            }
+        };
+
         void writeDecodedFrameToGuest(uint8_t *rdram, uint32_t destAddr, const MpegDecodedFrame &frame)
         {
             if (!rdram || destAddr == 0u || frame.rgba.empty() || frame.width <= 0 || frame.height <= 0)
@@ -2690,10 +2726,13 @@ namespace ps2_stubs
                 }
             }
             ps2prof::Scope profScope(ps2prof::kMpegFrameWrite);
+            McLimitGuard guard(rdram, imageAddr, getRegU32(ctx, 6), align16(static_cast<uint32_t>(std::max(frame.width, 0))),
+                               align16(static_cast<uint32_t>(std::max(frame.height, 0))));
             writeDecodedFrameToGuest(rdram, imageAddr, frame);
         }
         else if (frameCount == 0u)
         {
+            McLimitGuard guard(rdram, imageAddr, getRegU32(ctx, 6), align16(width), align16(height));
             writeBlankMpegFrame(rdram, imageAddr, width, height);
         }
 

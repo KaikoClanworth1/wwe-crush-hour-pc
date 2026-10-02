@@ -743,7 +743,14 @@ struct GSD3D11Backend::Impl
         D3D11_MAPPED_SUBRESOURCE m{};
         if (FAILED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m)))
             return;
-        for (uint32_t y = 0; y < rt.h; ++y)
+        // Only the rows the GPU drew. The rest of the target merely overlaps VRAM (e.g. a 256x288 env-map
+        // raster runs 32 rows into the next allocation) and holds what was there when the target was
+        // created; writing it back stamped stale copies over textures uploaded since (green car / HUD
+        // garbage on texture-heavy arenas). PS2X_SYNC_ALL_ROWS=1 restores the old behaviour.
+        static const bool s_allRows = std::getenv("PS2X_SYNC_ALL_ROWS") != nullptr;
+        const uint32_t yFirst = s_allRows ? 0u : rt.dirtyY0;
+        const uint32_t yEnd = s_allRows ? rt.h : std::min(rt.h, rt.dirtyY1 + 1u);
+        for (uint32_t y = yFirst; y < yEnd; ++y)
         {
             const uint32_t *row = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(m.pData) + y * m.RowPitch);
             for (uint32_t x = 0; x < rt.w; ++x)
