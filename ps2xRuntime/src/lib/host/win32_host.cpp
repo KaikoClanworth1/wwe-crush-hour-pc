@@ -40,6 +40,42 @@ using Microsoft::WRL::ComPtr;
 
 uint64_t ps2Vif1KickCount(); // ps2_memory.cpp: game frames (VIF1 frame kicks) so far
 
+// Crash report: an unhandled exception prints the faulting thread's stack as module+offset (x64 unwind
+// data, no PDB needed) to stdout; tools/crashsym.py resolves the offsets with ps2EntryRunner.map.
+static LONG WINAPI ps2xCrashFilter(EXCEPTION_POINTERS *ep)
+{
+    CONTEXT c = *ep->ContextRecord;
+    std::printf("[crash] code=0x%08lx addr=%p thread=%lu\n", ep->ExceptionRecord->ExceptionCode,
+                ep->ExceptionRecord->ExceptionAddress, GetCurrentThreadId());
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+        std::printf("[crash] %s address 0x%llx\n", ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
+                    static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[1]));
+    for (int i = 0; i < 48 && c.Rip; ++i)
+    {
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(c.Rip), &mod))
+            GetModuleFileNameA(mod, name, MAX_PATH);
+        const char *base = std::strrchr(name, '\\');
+        std::printf("[crash]   #%02d %s+0x%llx\n", i, base ? base + 1 : name,
+                    static_cast<unsigned long long>(c.Rip - reinterpret_cast<DWORD64>(mod)));
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
+        if (!fn)
+        {
+            c.Rip = *reinterpret_cast<DWORD64 *>(c.Rsp); // leaf function
+            c.Rsp += 8;
+            continue;
+        }
+        void *handlerData = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, fn, &c, &handlerData, &establisher, nullptr);
+    }
+    std::fflush(stdout);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 namespace ps2host
 {
     namespace
@@ -50,7 +86,7 @@ namespace ps2host
         double g_shotInterval = 5.0;    // PS2X_SCREENSHOT_SEC
         double g_nextShot = 0.0;
         int g_shotIndex = 0;
-        struct AutoPress { double t; uint16_t button; };
+        struct AutoPress { double t, until; uint16_t button; };
         std::vector<AutoPress> g_autoPress; // PS2X_AUTOINPUT="12:START,15:CROSS"
         HWND g_hwnd = nullptr;
         std::atomic<bool> g_quit{false};
@@ -532,6 +568,7 @@ float4 ps_main(VsOut i) : SV_Target
     {
         if (g_ready)
             return true;
+        SetUnhandledExceptionFilter(ps2xCrashFilter);
 
         QueryPerformanceFrequency(&g_qpcFreq);
         QueryPerformanceCounter(&g_qpcStart);
@@ -582,7 +619,7 @@ float4 ps_main(VsOut i) : SV_Target
         }
         if (const char *ai = std::getenv("PS2X_AUTOINPUT"))
         {
-            // "seconds:BUTTON" entries separated by commas.
+            // "seconds:BUTTON" (0.25 s press) or "from-to:BUTTON" (held) entries separated by commas.
             std::string spec = ai;
             size_t pos = 0;
             while (pos < spec.size())
@@ -592,7 +629,10 @@ float4 ps_main(VsOut i) : SV_Target
                 size_t colon = item.find(':');
                 if (colon != std::string::npos)
                 {
-                    const double t = std::atof(item.substr(0, colon).c_str());
+                    const std::string when = item.substr(0, colon);
+                    const size_t dash = when.find('-', 1);
+                    const double t = std::atof(when.c_str());
+                    const double until = dash != std::string::npos ? std::atof(when.c_str() + dash + 1) : t + 0.25;
                     const std::string b = item.substr(colon + 1);
                     static const std::pair<const char *, uint16_t> names[] = {
                         {"START", kBtnStart}, {"SELECT", kBtnSelect}, {"CROSS", kBtnCross}, {"CIRCLE", kBtnCircle},
@@ -600,7 +640,7 @@ float4 ps_main(VsOut i) : SV_Target
                         {"LEFT", kBtnLeft}, {"RIGHT", kBtnRight}, {"L1", kBtnL1}, {"R1", kBtnR1}, {"L2", kBtnL2}, {"R2", kBtnR2}};
                     for (const auto &n : names)
                         if (b == n.first)
-                            g_autoPress.push_back({t, n.second});
+                            g_autoPress.push_back({t, until, n.second});
                 }
                 if (end == std::string::npos)
                     break;
@@ -848,7 +888,7 @@ float4 ps_main(VsOut i) : SV_Target
         {
             const double t = nowSeconds();
             for (const auto &ap : g_autoPress)
-                if (t >= ap.t && t < ap.t + 0.25)
+                if (t >= ap.t && t < ap.until)
                     pads[0].buttons |= ap.button;
         }
         std::lock_guard lock(g_inputMutex);

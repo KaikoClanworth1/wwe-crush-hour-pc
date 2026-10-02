@@ -273,6 +273,14 @@ namespace ps2_stubs
 
         CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
         bool ok = tryRead(selected);
+        {
+            static const bool s_log = std::getenv("PS2X_CD_READ_LOG") != nullptr;
+            if (s_log)
+            {
+                std::printf("[cdread] lbn=0x%x sectors=0x%x dst=0x%x ok=%d ra=0x%x\n", a0, a1, a2, ok ? 1 : 0, getRegU32(ctx, 31));
+                std::fflush(stdout);
+            }
+        }
 
         if (!ok)
         {

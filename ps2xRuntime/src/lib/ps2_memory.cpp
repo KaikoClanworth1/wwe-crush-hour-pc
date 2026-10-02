@@ -1000,10 +1000,7 @@ uint64_t PS2Memory::read64(uint32_t address)
 
 __m128i PS2Memory::read128(uint32_t address)
 {
-    if (address & 15)
-    {
-        throw std::runtime_error("Unaligned 128-bit read at address: 0x" + std::to_string(address));
-    }
+    address &= ~15u; // the EE ignores the low 4 bits (LQ/LQC2), no address error
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
@@ -1238,10 +1235,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
 void PS2Memory::write128(uint32_t address, __m128i value)
 {
-    if (address & 15)
-    {
-        throw std::runtime_error("Unaligned 128-bit write at address: 0x" + std::to_string(address));
-    }
+    address &= ~15u; // the EE ignores the low 4 bits (SQ/SQC2), no address error
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);

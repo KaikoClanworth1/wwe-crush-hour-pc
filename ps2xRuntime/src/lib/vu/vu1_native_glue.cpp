@@ -8,6 +8,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <vector>
+#include <array>
+#include <memory>
+#include <unordered_map>
 #include <xmmintrin.h>
 #include <pmmintrin.h>
 
@@ -18,6 +21,11 @@ namespace ps2vu1n
     std::vector<uint32_t> *g_vu1nPcTrace = nullptr; // debug lockstep trace (see VU1_TRACE_HASH)
 #if !defined(PS2X_HAVE_VU1_NATIVE)
     const ProgramEntry *programs(uint32_t &count)
+    {
+        count = 0;
+        return nullptr;
+    }
+    const RegionEntry *regions(uint32_t &count)
     {
         count = 0;
         return nullptr;
@@ -164,6 +172,85 @@ namespace ps2vu1n
     }
 
     uint64_t g_nativeRuns = 0, g_nativeFallbacks = 0, g_nativeMisses = 0, g_nativeCycles = 0;
+
+    namespace
+    {
+        const uint8_t *g_code = nullptr; // VU1 micro memory (ps2vu1nNoteCode)
+        uint32_t g_codeSize = 0;
+
+        // pc -> compiled region for one resident image, built from the regions whose code bytes match.
+        using RegionMap = std::array<ProgramFn, 0x4000 / 8>;
+
+        const RegionMap *regionMap(uint64_t codeHash)
+        {
+            static std::unordered_map<uint64_t, std::unique_ptr<RegionMap>> s_maps;
+            const auto it = s_maps.find(codeHash);
+            if (it != s_maps.end())
+                return it->second.get();
+            if (!g_code || g_codeSize < 0x4000u)
+                return nullptr;
+            if (s_maps.size() > 1024u)
+                s_maps.clear();
+            uint32_t count = 0;
+            const RegionEntry *table = regions(count);
+            auto map = std::make_unique<RegionMap>();
+            map->fill(nullptr);
+            // Several entries share a region (and regions repeat across images): hash each range once.
+            std::unordered_map<uint64_t, bool> verified;
+            uint32_t matched = 0;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const RegionEntry &e = table[i];
+                ProgramFn &slot = (*map)[(e.pc & 0x3FFFu) >> 3];
+                if (slot)
+                    continue;
+                const uint64_t key = (static_cast<uint64_t>(e.lo) << 32) ^ e.hi ^ (e.hash * 31u);
+                auto v = verified.find(key);
+                if (v == verified.end())
+                    v = verified.emplace(key, codeRangeHash(g_code, e.lo, e.hi) == e.hash).first;
+                if (v->second)
+                {
+                    slot = e.fn;
+                    ++matched;
+                }
+            }
+            static const bool s_log = std::getenv("PS2X_VU_STATS") != nullptr;
+            if (s_log)
+                std::printf("[vu1n] image %016llx: %u region entries match compiled code\n",
+                            static_cast<unsigned long long>(codeHash), matched);
+            const RegionMap *out = map.get();
+            s_maps.emplace(codeHash, std::move(map));
+            return out;
+        }
+
+        // Generic trampoline over a region map (same contract as a generated image dispatcher).
+        int runRegions(Ctx &c, uint32_t pc, const RegionMap &map)
+        {
+            for (uint32_t hops = 0; hops < 1000000u; ++hops)
+            {
+                const ProgramFn fn = map[(pc & 0x3FFFu) >> 3];
+                if (!fn || (pc & 7u))
+                {
+                    c.s->pc = pc;
+                    return kFallback;
+                }
+                const int r = fn(c, pc);
+                if (r != kContinue)
+                    return r;
+                if (c.cyc >= c.budget)
+                    return kFallback;
+                pc = c.s->pc;
+            }
+            c.s->pc = pc;
+            return kFallback;
+        }
+    }
+}
+
+void ps2vu1nNoteCode(const uint8_t *code, uint32_t size)
+{
+    ps2vu1n::g_code = code;
+    ps2vu1n::g_codeSize = size;
 }
 
 // Returns true when the native program ran; `ended` tells whether it reached the E-bit (false =
@@ -178,7 +265,11 @@ bool ps2vu1nTryRun(VU1State &state, uint8_t *vuData, uint32_t dataSize, PS2Memor
     if (s_interp && (s_interpHash == 0 || s_interpHash == codeHash))
         return false;
     const ProgramFn fn = lookup(codeHash);
-    if (!fn)
+    // Unknown whole image (another arena's mix of programs): run the compiled regions whose code is
+    // resident unchanged. PS2X_VU1_NO_REGIONS=1 disables (exact images only).
+    static const bool s_noRegions = std::getenv("PS2X_VU1_NO_REGIONS") != nullptr;
+    const RegionMap *rmap = (fn || s_noRegions) ? nullptr : regionMap(codeHash);
+    if (!fn && (!rmap || !(*rmap)[(state.pc & 0x3FFFu) >> 3]))
     {
         ++g_nativeMisses;
         return false;
@@ -198,7 +289,7 @@ bool ps2vu1nTryRun(VU1State &state, uint8_t *vuData, uint32_t dataSize, PS2Memor
     const unsigned int savedCsr = _mm_getcsr();
     _mm_setcsr((savedCsr & ~0x6000u) | 0x6000u | 0x8040u);
     const uint32_t entryPc = state.pc;
-    const int r = fn(c, state.pc);
+    const int r = fn ? fn(c, state.pc) : runRegions(c, state.pc, *rmap);
     _mm_setcsr(savedCsr);
     if (r == kFallback)
     {

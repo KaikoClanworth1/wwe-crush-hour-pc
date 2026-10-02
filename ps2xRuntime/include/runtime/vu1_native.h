@@ -92,8 +92,33 @@ namespace ps2vu1n
         ProgramFn fn;
     };
 
+    // Region entry points of every compiled image: `fn` runs code compiled from micro memory [lo, hi)
+    // (byte addresses) and is valid in any resident image whose bytes there hash to `hash`. Arenas
+    // load different combinations of programs, so whole-image hashes rarely repeat across scenes
+    // while the programs themselves do (vu1_native_glue.cpp builds a pc -> region table per image).
+    struct RegionEntry
+    {
+        uint32_t pc, lo, hi;
+        uint64_t hash;
+        ProgramFn fn;
+    };
+
+    // FNV-1a over 32-bit words; tools/vu1_recomp.py computes the same.
+    inline uint64_t codeRangeHash(const uint8_t *code, uint32_t lo, uint32_t hi)
+    {
+        uint64_t h = 0xCBF29CE484222325ull;
+        for (uint32_t a = lo; a < hi; a += 4)
+        {
+            uint32_t w;
+            std::memcpy(&w, code + (a & 0x3FFCu), 4);
+            h = (h ^ w) * 0x100000001B3ull;
+        }
+        return h;
+    }
+
     // Provided by the generated translation unit.
     const ProgramEntry *programs(uint32_t &count);
+    const RegionEntry *regions(uint32_t &count);
 
     // ---------------------------------------------------------------- helpers used by generated code
     inline void commitQ(Ctx &c)

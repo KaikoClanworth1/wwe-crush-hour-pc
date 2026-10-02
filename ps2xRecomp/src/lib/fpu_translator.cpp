@@ -53,10 +53,10 @@ namespace ps2recomp
             case COP1_S_MUL:
                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_DIV:
-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
-                                   ft, fd, fs, fd, fs, ft);
+                // EE: x / 0 = +-FLT_MAX (sign fs ^ ft), never Inf/NaN (ps2_fdiv).
+                return fmt::format("if (ctx->f[{}] == 0.0f) ctx->fcr31 |= 0x100000; /* DZ flag */ "
+                                   "ctx->f[{}] = ps2_fdiv(ctx->f[{}], ctx->f[{}]);",
+                                   ft, fd, fs, ft);
             case COP1_S_SQRT:
                 // EE SQRT.S reads its operand from the ft field (fs is zero in real encodings) and
                 // takes the root of |x| for negative inputs.
@@ -80,7 +80,7 @@ namespace ps2recomp
                 return fmt::format("{{ int32_t tmp = ((fabsf(ctx->f[{0}]) >= 2147483648.0f) ? ((ctx->f[{0}]) < 0.0f ? INT32_MIN : INT32_MAX) : (int32_t)(ctx->f[{0}])); std::memcpy(&ctx->f[{1}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_RSQRT:
                 // EE RSQRT.S: fd = fs / sqrt(ft).
-                return fmt::format("ctx->f[{}] = ctx->f[{}] / sqrtf(fabsf(ctx->f[{}]));", fd, fs, ft);
+                return fmt::format("ctx->f[{}] = ps2_fdiv(ctx->f[{}], sqrtf(fabsf(ctx->f[{}])));", fd, fs, ft);
             case COP1_S_ADDA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
             case COP1_S_SUBA:

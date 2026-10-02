@@ -141,11 +141,11 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_PNOR(a, b) _mm_xor_si128(_mm_or_si128((__m128i)(a), (__m128i)(b)), _mm_set1_epi32(0xFFFFFFFF))
 
 // PS2 VU (Vector Unit) operations
-#define PS2_VADD(a, b) _mm_add_ps((__m128)(a), (__m128)(b))
-#define PS2_VSUB(a, b) _mm_sub_ps((__m128)(a), (__m128)(b))
-#define PS2_VMUL(a, b) _mm_mul_ps((__m128)(a), (__m128)(b))
-#define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
-#define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
+#define PS2_VADD(a, b) ps2_vclamp(_mm_add_ps((__m128)(a), (__m128)(b)))
+#define PS2_VSUB(a, b) ps2_vclamp(_mm_sub_ps((__m128)(a), (__m128)(b)))
+#define PS2_VMUL(a, b) ps2_vclamp(_mm_mul_ps((__m128)(a), (__m128)(b)))
+#define PS2_VDIV(a, b) ps2_vclamp(_mm_div_ps((__m128)(a), (__m128)(b)))
+#define PS2_VMULQ(a, q) ps2_vclamp(_mm_mul_ps((__m128)(a), _mm_set1_ps(q)))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
 
 // Memory access helpers - Hybrid Fast/Slow Path
@@ -315,13 +315,25 @@ static PS2X_FORCEINLINE void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m1
 #define FAST_READ16(addr) Ps2FastRead16(rdram, (uint32_t)(addr))
 #define FAST_READ32(addr) Ps2FastRead32(rdram, (uint32_t)(addr))
 #define FAST_READ64(addr) Ps2FastRead64(rdram, (uint32_t)(addr))
-#define FAST_READ128(addr) Ps2FastRead128(rdram, (uint32_t)(addr))
+// LQ / SQ / LQC2 / SQC2 ignore the low 4 address bits on the EE (no address error).
+void ps2NoteUnaligned128(uint32_t addr); // ps2_runtime.cpp: logs the first few (PS2X_UNALIGNED_LOG)
+static PS2X_FORCEINLINE uint32_t ps2Align128(uint32_t addr)
+{
+    if ((addr & 15u) != 0u)
+    {
+        ps2NoteUnaligned128(addr);
+        addr &= ~15u;
+    }
+    return addr;
+}
+
+#define FAST_READ128(addr) Ps2FastRead128(rdram, ps2Align128((uint32_t)(addr)))
 
 #define FAST_WRITE8(addr, val) Ps2FastWrite8(rdram, (uint32_t)(addr), (uint8_t)(val))
 #define FAST_WRITE16(addr, val) Ps2FastWrite16(rdram, (uint32_t)(addr), (uint16_t)(val))
 #define FAST_WRITE32(addr, val) Ps2FastWrite32(rdram, (uint32_t)(addr), (uint32_t)(val))
 #define FAST_WRITE64(addr, val) Ps2FastWrite64(rdram, (uint32_t)(addr), (uint64_t)(val))
-#define FAST_WRITE128(addr, val) Ps2FastWrite128(rdram, (uint32_t)(addr), (val))
+#define FAST_WRITE128(addr, val) Ps2FastWrite128(rdram, ps2Align128((uint32_t)(addr)), (val))
 
 #define READ8(addr) ([&]() -> uint8_t {                       \
     uint32_t _addr = (uint32_t)(addr);                        \
@@ -348,7 +360,7 @@ static PS2X_FORCEINLINE void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m1
         : FAST_READ64(_addr); }())
 
 #define READ128(addr) ([&]() -> __m128i {                     \
-    uint32_t _addr = (uint32_t)(addr);                        \
+    uint32_t _addr = ps2Align128((uint32_t)(addr));           \
     return PS2Runtime::isSpecialAddress(_addr)                \
         ? runtime->Load128(rdram, ctx, _addr)                 \
         : FAST_READ128(_addr); }())
@@ -408,7 +420,7 @@ static PS2X_FORCEINLINE void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m1
 #define WRITE128(addr, val)                                                          \
     do                                                                               \
     {                                                                                \
-        uint32_t _addr = (addr);                                                     \
+        uint32_t _addr = ps2Align128((uint32_t)(addr));                              \
         __m128i _value = (val);                                                      \
         if (PS2Runtime::isSpecialAddress(_addr))                                     \
             runtime->Store128(rdram, ctx, _addr, _value);                            \
@@ -603,12 +615,41 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define PS2_PMFHL_LH(hi, lo) _mm_shuffle_epi32(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0))
 #define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
 
+// EE FPU / VU0 float semantics: there is no Inf or NaN. Results that overflow saturate to +-FLT_MAX and
+// x / 0 (including 0 / 0) is +-FLT_MAX with the sign of fs XOR ft. With plain IEEE results, x/0 = Inf and
+// then Inf*0 / Inf-Inf = NaN, and a NaN fails every comparison -- e.g. Havok's segment/AABB slab tests
+// (division by an axis-aligned ray's zero components) stop reporting hits and vehicles pass through walls.
+static inline float ps2_fclamp(float x)
+{
+    // maxss returns the second operand for NaN, so a NaN also ends up finite.
+    const __m128 v = _mm_max_ss(_mm_set_ss(x), _mm_set_ss(-3.402823466e+38f));
+    return _mm_cvtss_f32(_mm_min_ss(v, _mm_set_ss(3.402823466e+38f)));
+}
+static inline __m128 ps2_vclamp(__m128 v)
+{
+    return _mm_min_ps(_mm_max_ps(v, _mm_set1_ps(-3.402823466e+38f)), _mm_set1_ps(3.402823466e+38f));
+}
+static inline float ps2_fdiv(float a, float b)
+{
+    if (b == 0.0f)
+    {
+        uint32_t ua, ub;
+        std::memcpy(&ua, &a, 4);
+        std::memcpy(&ub, &b, 4);
+        const uint32_t r = ((ua ^ ub) & 0x80000000u) | 0x7F7FFFFFu;
+        float f;
+        std::memcpy(&f, &r, 4);
+        return f;
+    }
+    return ps2_fclamp(a / b);
+}
+
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
+#define FPU_ADD_S(a, b) ps2_fclamp((float)(a) + (float)(b))
+#define FPU_SUB_S(a, b) ps2_fclamp((float)(a) - (float)(b))
+#define FPU_MUL_S(a, b) ps2_fclamp((float)(a) * (float)(b))
+#define FPU_DIV_S(a, b) ps2_fdiv((float)(a), (float)(b))
 #define FPU_SQRT_S(a) sqrtf((float)(a))
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))

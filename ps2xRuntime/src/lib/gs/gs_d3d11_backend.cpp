@@ -361,11 +361,13 @@ struct GSD3D11Backend::Impl
     {
         ComPtr<ID3D11Buffer> vb;
         uint32_t verts = 0, numVerts = 0;
+        uint64_t key = 0; // array pointers + a sample of the data: sectors are freed and reallocated per arena
     };
     struct NativeMesh
     {
         ComPtr<ID3D11Buffer> ib;
         uint32_t indices = 0, numIndices = 0;
+        uint64_t key = 0;
         bool strip = false;
     };
     std::unordered_map<uint32_t, NativeSector> nativeSectors;
@@ -474,7 +476,10 @@ struct GSD3D11Backend::Impl
         std::array<uint32_t, 256> raw{};
     };
     std::unordered_map<uint64_t, ClutCacheEntry> clutCache;
-    const bool disableRtSubTex = std::getenv("PS2X_NO_RT_SUBTEX") != nullptr;
+    // Sampling a texture that lies inside a render target straight from the GPU target (screen-grab effects)
+    // gave the car reflections stale frame pixels (green garbage) on several arenas; the VRAM path costs no
+    // measurable fps now. PS2X_RT_SUBTEX=1 re-enables it.
+    const bool disableRtSubTex = std::getenv("PS2X_RT_SUBTEX") == nullptr;
     char lastPresent[160] = "none";
     std::unordered_map<std::string, uint64_t> syncReasons;
     std::unordered_map<uint32_t, uint64_t> fmtStats;
@@ -1423,15 +1428,32 @@ struct GSD3D11Backend::Impl
         const uint8_t *ee = nrw::rdram();
         if (!ee)
             return false;
-        auto rd32 = [&](uint32_t a) { uint32_t v; std::memcpy(&v, ee + (a & 0x1FFFFFFu), 4); return v; };
-        auto rd16 = [&](uint32_t a) { uint16_t v; std::memcpy(&v, ee + (a & 0x1FFFFFFu), 2); return v; };
+        constexpr uint32_t kRam = 0x2000000u;
+        auto rd32 = [&](uint32_t a) { uint32_t v; std::memcpy(&v, ee + (a & 0x1FFFFFCu), 4); return v; };
+        auto rd16 = [&](uint32_t a) { uint16_t v; std::memcpy(&v, ee + (a & 0x1FFFFFEu), 2); return v; };
+        // Array [p, p + bytes) inside EE RAM. A job can outlive its sector (freed while an arena loads),
+        // so nothing read from it is trusted.
+        auto inRam = [&](uint32_t p, uint64_t bytes) { p &= 0x1FFFFFFFu; return p != 0u && p < kRam && p + bytes <= kRam; };
+        auto sample = [&](uint64_t h, uint32_t p, uint32_t bytes)
+        {
+            for (uint32_t i = 0; i < bytes; i += 4u)
+                h = (h ^ rd32(p + i)) * 0x100000001B3ull;
+            return h;
+        };
         const uint32_t sec = job.object;
         const uint32_t verts = rd32(sec + 0x08), normals = rd32(sec + 0x0C), uvs = rd32(sec + 0x10), prelit = rd32(sec + 0x30);
         const uint32_t numVerts = rd16(sec + 0x8A);
-        if (!verts || !numVerts)
+        if (!numVerts || !inRam(verts, numVerts * 12ull) || (uvs && !inRam(uvs, numVerts * 8ull)) ||
+            (prelit && !inRam(prelit, numVerts * 4ull)) || (normals && !inRam(normals, numVerts * 4ull)))
             return false;
+        uint64_t key = 0xCBF29CE484222325ull;
+        key = (key ^ uvs) * 0x100000001B3ull;
+        key = (key ^ prelit) * 0x100000001B3ull;
+        key = (key ^ normals) * 0x100000001B3ull;
+        key = sample(key, verts, std::min<uint32_t>(numVerts * 12u, 192u));
+        key = sample(key, verts + (numVerts - 1u) * 12u, 12u);
         NativeSector &ns = nativeSectors[sec];
-        if (!ns.vb || ns.verts != verts || ns.numVerts != numVerts)
+        if (!ns.vb || ns.verts != verts || ns.numVerts != numVerts || ns.key != key)
         {
             std::vector<NativeVtx> vtx(numVerts);
             for (uint32_t i = 0; i < numVerts; ++i)
@@ -1461,16 +1483,18 @@ struct GSD3D11Backend::Impl
                 return false;
             ns.verts = verts;
             ns.numVerts = numVerts;
+            ns.key = key;
         }
         const uint32_t indices = rd32(job.mesh + 0x0), numIndices = rd32(job.mesh + 0x4);
-        if (!indices || numIndices < 3u)
+        if (numIndices < 3u || numIndices > (1u << 20) || !inRam(indices, numIndices * 2ull))
             return false;
+        const uint64_t ikey = sample(0xCBF29CE484222325ull, indices, std::min<uint32_t>(numIndices * 2u, 64u) & ~3u);
         NativeMesh &nm = nativeMeshes[job.mesh];
         const bool strip = (job.meshHeaderFlags & 1u) != 0u;
-        if (!nm.ib || nm.indices != indices || nm.numIndices != numIndices || nm.strip != strip)
+        if (!nm.ib || nm.indices != indices || nm.numIndices != numIndices || nm.strip != strip || nm.key != ikey)
         {
             std::vector<uint16_t> idx(numIndices);
-            std::memcpy(idx.data(), ee + (indices & 0x1FFFFFFu), numIndices * 2u);
+            std::memcpy(idx.data(), ee + (indices & 0x1FFFFFFu), numIndices * 2u); // range checked above
             for (uint16_t &i : idx)
                 if (i >= numVerts)
                     i = 0;
@@ -1484,6 +1508,7 @@ struct GSD3D11Backend::Impl
                 return false;
             nm.indices = indices;
             nm.numIndices = numIndices;
+            nm.key = ikey;
             nm.strip = strip;
         }
         nativeSector = &ns;
@@ -2069,11 +2094,20 @@ struct GSD3D11Backend::Impl
         hasDisplay = true;
     }
 
+    static bool validCircuit(uint64_t fb, uint64_t disp)
+    {
+        return ((fb >> 9) & 0x3Fu) != 0u && ((disp >> 32) & 0xFFFu) != 0u && ((disp >> 44) & 0x7FFu) != 0u;
+    }
+    static bool displayEnabled(const GSPresentationRequest &req)
+    {
+        return ((req.pmode & 1u) != 0u && validCircuit(req.dispfb1, req.display1)) ||
+               ((req.pmode & 2u) != 0u && validCircuit(req.dispfb2, req.display2));
+    }
+
     bool presentRequest(const GSPresentationRequest &req)
     {
         ++pipeGen;
-        auto valid = [](uint64_t fb, uint64_t disp)
-        { return ((fb >> 9) & 0x3Fu) != 0u && ((disp >> 32) & 0xFFFu) != 0u && ((disp >> 44) & 0x7FFu) != 0u; };
+        auto valid = validCircuit;
         const bool en1 = (req.pmode & 1u) != 0u && valid(req.dispfb1, req.display1);
         const bool en2 = (req.pmode & 2u) != 0u && valid(req.dispfb2, req.display2);
         if (!en1 && !en2)
@@ -2298,6 +2332,11 @@ PresentationFrame GSD3D11Backend::Present(const GSPresentationRequest &request)
         result.pixels.assign(4u, 0u);
         result.width = 1u;
         result.height = 1u;
+    }
+    else if (!Impl::displayEnabled(request))
+    {
+        // Display not set up yet (e.g. DISPFB 0 around a scene change): nothing to show, and reading
+        // every render target back for the CPU path took long enough to stall the frame.
     }
     else
     {

@@ -114,6 +114,22 @@ namespace
     }
 }
 
+void ps2NoteUnaligned128(uint32_t addr)
+{
+    static const int s_limit = []()
+    {
+        const char *v = std::getenv("PS2X_UNALIGNED_LOG");
+        return v ? std::atoi(v) : 0;
+    }();
+    static std::atomic<int> s_n{0};
+    const int n = s_n.fetch_add(1, std::memory_order_relaxed);
+    if (n < s_limit)
+    {
+        std::printf("[unaligned128] #%d addr=0x%08x\n", n, addr);
+        std::fflush(stdout);
+    }
+}
+
 bool ps2GsThreadEnabled()
 {
     static const bool s_on = []()
@@ -200,7 +216,20 @@ bool ps2GsThreadDeferFlip(std::function<void()> fn)
 // frames drawn so far. Returns false when the worker is not running.
 bool ps2GsThreadLatch()
 {
-    return ps2GsThreadDefer([] { g_gsThread.gs->latchHostPresentationFrame(); });
+    // At most one latch queued: a slow one (CPU present path while no render target is displayed, e.g.
+    // DISPFB 0 at match start) must not pile up one per vsync -- the EE's flips queue behind them and the
+    // game slowed to one frame every few seconds.
+    static std::atomic<bool> s_pending{false};
+    if (s_pending.exchange(true, std::memory_order_acq_rel))
+        return ps2GsThreadEnabled() && g_gsThread.started;
+    if (ps2GsThreadDefer([]
+                         {
+                             s_pending.store(false, std::memory_order_release);
+                             g_gsThread.gs->latchHostPresentationFrame();
+                         }))
+        return true;
+    s_pending.store(false, std::memory_order_release);
+    return false;
 }
 
 void ps2GsThreadDrain()

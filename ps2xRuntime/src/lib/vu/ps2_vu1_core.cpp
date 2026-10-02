@@ -1705,6 +1705,7 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
 namespace ps2vu1n { extern uint64_t g_nativeRuns, g_nativeFallbacks, g_nativeMisses, g_nativeCycles; }
 bool ps2vu1nTryRun(VU1State &state, uint8_t *vuData, uint32_t dataSize, PS2Memory *memory,
                    uint64_t codeHash, uint32_t maxCycles, bool &ended);
+void ps2vu1nNoteCode(const uint8_t *code, uint32_t size); // vu1_native_glue.cpp
 
 namespace
 {
@@ -1744,6 +1745,7 @@ namespace
                 g_vu1SuppressKick = idx >= 0 && s_hashes[idx] == g_vu1CodeHash;
             }
         } skipCycleUpdate;
+        ps2vu1nNoteCode(code, size);
         if (generation != g_vu1CodeGen)
         {
             g_vu1CodeGen = generation;
