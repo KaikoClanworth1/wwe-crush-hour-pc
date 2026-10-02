@@ -759,6 +759,7 @@ namespace ps2recomp
         return fmt::format("{{ __m128 src = ctx->vu0_vf[{}]; "
                            "src = _mm_mul_ps(src, _mm_set1_ps({})); "
                            "__m128i res_i = _mm_cvttps_epi32(src); "
+                           "res_i = _mm_xor_si128(res_i, _mm_castps_si128(_mm_cmpge_ps(src, _mm_set1_ps(2147483648.0f)))); " // VU saturates
                            "__m128 res = _mm_castsi128_ps(res_i); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",

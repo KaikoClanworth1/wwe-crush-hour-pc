@@ -1447,11 +1447,13 @@ struct GSD3D11Backend::Impl
                 h = (h ^ rd32(p + i)) * 0x100000001B3ull;
             return h;
         };
-        const uint32_t sec = job.object;
-        const uint32_t verts = rd32(sec + 0x08), normals = rd32(sec + 0x0C), uvs = rd32(sec + 0x10), prelit = rd32(sec + 0x30);
-        const uint32_t numVerts = rd16(sec + 0x8A);
+        const uint32_t sec = job.object; // sector or atomic: vertex buffers are cached per object
+        const uint32_t verts = job.verts, normals = job.normals, uvs = job.uvs, prelit = job.prelit;
+        const uint32_t numVerts = job.numVerts;
+        const bool atomicNormals = job.kind == nrw::kAtomicMesh; // RwV3d floats, sectors pack RwInt8 x4
+        (void)rd16;
         if (!numVerts || !inRam(verts, numVerts * 12ull) || (uvs && !inRam(uvs, numVerts * 8ull)) ||
-            (prelit && !inRam(prelit, numVerts * 4ull)) || (normals && !inRam(normals, numVerts * 4ull)))
+            (prelit && !inRam(prelit, numVerts * 4ull)) || (normals && !inRam(normals, numVerts * (atomicNormals ? 12ull : 4ull))))
             return false;
         uint64_t key = 0xCBF29CE484222325ull;
         key = (key ^ uvs) * 0x100000001B3ull;
@@ -1474,9 +1476,14 @@ struct GSD3D11Backend::Impl
                 if (prelit)
                     std::memcpy(o.col, ee + ((prelit + i * 4u) & 0x1FFFFFFu), 4);
                 else
-                    o.col[0] = o.col[1] = o.col[2] = o.col[3] = 255;
+                {
+                    // No pre-lit colours: sectors start white, atomics start black (lights add on top).
+                    const uint8_t base = atomicNormals ? 0u : 255u;
+                    o.col[0] = o.col[1] = o.col[2] = base;
+                    o.col[3] = 255;
+                }
                 if (normals)
-                    std::memcpy(o.nrm, ee + ((normals + i * 4u) & 0x1FFFFFFu), 4);
+                    nrw::readNormal(ee, normals, i, atomicNormals, o.nrm);
                 else
                     o.nrm[0] = o.nrm[1] = o.nrm[2] = o.nrm[3] = 0;
             }

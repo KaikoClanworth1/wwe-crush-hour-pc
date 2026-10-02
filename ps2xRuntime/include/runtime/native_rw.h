@@ -23,6 +23,7 @@ namespace nrw
     enum JobKind : uint32_t
     {
         kWorldSectorMesh = 1,
+        kAtomicMesh = 2, // rigid RpAtomic (one morph target) on RenderWare's generic PS2All VU1 program
     };
 
     // VU1 data memory snapshot range: lights (976..) through per-object constants (..1023).
@@ -44,9 +45,34 @@ namespace nrw
         uint32_t vu1CodeIndex = 0;
         uint32_t surfProps = 0;       // RwSurfaceProperties (EE address)
         uint32_t pad[2]{};
+        // Vertex source (EE addresses; 0 = absent), taken from the sector or the atomic's geometry.
+        uint32_t verts = 0, normals = 0, uvs = 0, prelit = 0, numVerts = 0, geomFlags = 0, pad2[2]{};
         float vu[kVuQwCount][4]{};    // VU1 data memory kVuFirstQw..
     };
     static_assert(sizeof(MeshJob) % 16u == 0u, "job must be qword sized");
+
+    // Vertex normal i as the packed form the VU1 program gets (x, y, z * 128 as signed bytes, w 0).
+    // Sectors store that already; atomic morph targets store RwV3d floats.
+    inline void readNormal(const uint8_t *ee, uint32_t normals, uint32_t i, bool floats, int8_t out[4])
+    {
+        if (!floats)
+        {
+            const uint8_t *p = ee + ((normals + i * 4u) & 0x1FFFFFFu);
+            for (int k = 0; k < 4; ++k)
+                out[k] = static_cast<int8_t>(p[k]);
+            return;
+        }
+        for (int k = 0; k < 3; ++k)
+        {
+            float f;
+            const uint8_t *p = ee + ((normals + i * 12u + k * 4u) & 0x1FFFFFFu);
+            for (int b = 0; b < 4; ++b)
+                reinterpret_cast<uint8_t *>(&f)[b] = p[b];
+            const float v = f * 128.0f;
+            out[k] = static_cast<int8_t>(v >= 127.0f ? 127 : (v <= -128.0f ? -128 : static_cast<int>(v)));
+        }
+        out[3] = 0;
+    }
 
     // Which quadword of MeshJob::vu holds VU1 address a.
     constexpr uint32_t vuIndex(uint32_t a) { return a - kVuFirstQw; }

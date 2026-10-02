@@ -21,7 +21,9 @@ namespace nrw
         struct Entry
         {
             uint32_t object, mesh, meshFlags, primType, transType, matCol, texture, vu1CodeIndex, surfProps, code;
+            uint32_t kind, verts, normals, uvs, prelit, numVerts, geomFlags;
         };
+        uint32_t g_sectorCode = 0; // VU1 code pointer of RenderWare's generic PS2All program (seen on sectors)
         constexpr uint32_t kTableSize = 1u << 16;
         std::array<Entry, kTableSize> g_table{};
         std::atomic<uint32_t> g_next{0};
@@ -196,7 +198,8 @@ namespace nrw
         int g_expectCount = 0;
         bool g_expectArmed = false;
         uint32_t g_expectFlags = 0;
-        uint32_t g_expectLights = 0; // bit per light kind present: 1 ambient, 2 directional, 4 point
+        uint32_t g_expectLights = 0;
+        uint32_t g_expectKind = 0; // bit per light kind present: 1 ambient, 2 directional, 4 point
         int g_verifyReports = 0;
 
         // CPU twin of vs_native (gs_d3d11_backend.cpp).
@@ -220,11 +223,13 @@ namespace nrw
             const float off[3] = {vu(1016)[0] + vu(1017)[0], vu(1016)[1] + vu(1017)[1], vu(1016)[2]};
             const float *mat = vu(1019);
             const uint32_t sec = job.object;
-            const uint32_t verts = rd32(ee, sec + 0x08), uvs = rd32(ee, sec + 0x10), prelit = rd32(ee, sec + 0x30);
+            const uint32_t verts = job.verts, uvs = job.uvs, prelit = job.prelit;
+            (void)sec;
             const uint32_t indices = rd32(ee, job.mesh);
             const uint32_t n = std::min<uint32_t>(rd32(ee, job.mesh + 4), kExpect);
             g_expectCount = static_cast<int>(n);
             std::memcpy(&g_expectFlags, vu(1023), 4);
+            g_expectKind = job.kind;
             {
                 float lc[6 * 4], ld[6 * 4];
                 const int nl = parseLights(job, lc, ld, 6);
@@ -237,7 +242,8 @@ namespace nrw
                 uint16_t idx;
                 std::memcpy(&idx, ee + ((indices + k * 2u) & 0x1FFFFFFu), 2);
                 float pos[3], uv[2] = {0, 0};
-                uint8_t col[4] = {255, 255, 255, 255};
+                const uint8_t base = job.kind == kAtomicMesh ? 0u : 255u; // see prepareNative
+                uint8_t col[4] = {base, base, base, 255};
                 std::memcpy(pos, ee + ((verts + idx * 12u) & 0x1FFFFFFu), 12);
                 if (uvs)
                     std::memcpy(uv, ee + ((uvs + idx * 8u) & 0x1FFFFFFu), 8);
@@ -248,9 +254,9 @@ namespace nrw
                     float lc[6 * 4], ld[6 * 4];
                     const int nl = parseLights(job, lc, ld, 6);
                     int8_t nrm[4] = {0, 0, 0, 0};
-                    const uint32_t normals = rd32(ee, sec + 0x0C);
+                    const uint32_t normals = job.normals;
                     if (normals)
-                        std::memcpy(nrm, ee + ((normals + idx * 4u) & 0x1FFFFFFu), 4);
+                        readNormal(ee, normals, idx, job.kind == kAtomicMesh, nrm);
                     for (int li = 0; li < nl; ++li)
                     {
                         float f = 1.0f;
@@ -329,14 +335,14 @@ namespace nrw
                 off += nloop * nreg * 16u;
                 continue;
             }
-            static uint32_t s_perFlags[128] = {};
-            const uint32_t key = (g_expectFlags & 15u) | (g_expectLights << 4);
+            static uint32_t s_perFlags[256] = {};
+            const uint32_t key = (g_expectFlags & 15u) | (g_expectLights << 4) | ((g_expectKind & 1u) << 7);
             if (g_verifyReports < 60 && s_perFlags[key] < 3u)
             {
                 ++g_verifyReports;
                 ++s_perFlags[key];
                 const uint64_t prim = (tag >> 47) & 0x7FF;
-                std::printf("[nrw-verify] lights=%x flags=%04x prim=%03llx nloop=%u nreg=%u regs=%016llx\n", g_expectLights, g_expectFlags & 0xFFFF,
+                std::printf("[nrw-verify] kind=%u lights=%x flags=%04x prim=%03llx nloop=%u nreg=%u regs=%016llx\n", g_expectKind, g_expectLights, g_expectFlags & 0xFFFF,
                             static_cast<unsigned long long>(prim), nloop, nreg, static_cast<unsigned long long>(regs));
                 for (int k = 0; k < std::min(g_expectCount, 6) && static_cast<uint32_t>(k) < nloop; ++k)
                 {
@@ -508,7 +514,15 @@ namespace nrw
         insertBefore = verifyMode();
         static const bool s_dump = std::getenv("PS2X_NRW_DUMP") != nullptr;
         const uint32_t object = rd32(rdram, pipeData + 0x08);
-        const bool isSector = object != 0u && object == g_curSector;
+        // RpWorldSector.type is -1 (RpPlaneSector types are 0..2). Sectors drawn outside the default sector
+        // render callback (other worlds, the game's own callbacks) never pass sectorBegin(); their type marks them.
+        static const bool s_anySector = []()
+        {
+            const char *v = std::getenv("PS2X_NATIVE_ATOMICS"); // default on; =0 keeps them on VU1
+            return !(v && *v == '0');
+        }();
+        const bool isSector = object != 0u &&
+                              (object == g_curSector || (s_anySector && rd32(rdram, object) == 0xFFFFFFFFu));
         if (s_dump && isSector)
         {
             static int s_dumps = 0;
@@ -523,21 +537,121 @@ namespace nrw
                 std::fflush(stdout);
             }
         }
-        if (!enabled() || !isSector)
+        // PS2X_NRW_STATS: where bridge calls go (sector / atomic / why not native).
+        static const bool s_stats = std::getenv("PS2X_NRW_STATS") != nullptr;
+        static uint64_t s_n[8] = {};
+        auto stat = [&](int k)
+        {
+            if (!s_stats)
+                return;
+            ++s_n[k];
+            if ((++s_n[7] % 20000u) == 0u)
+                std::printf("[nrw-stats] sector=%llu atomic=%llu notAtomic=%llu otherCode=%llu morph=%llu noVerts=%llu off=%llu\n",
+                            (unsigned long long)s_n[0], (unsigned long long)s_n[1], (unsigned long long)s_n[2], (unsigned long long)s_n[3],
+                            (unsigned long long)s_n[4], (unsigned long long)s_n[5], (unsigned long long)s_n[6]);
+        };
+        if (!enabled() || object == 0u)
+        {
+            stat(6);
             return false;
+        }
+        const uint32_t vu1CodeIndex = rdram[(pipeData + 0x2B) & 0x1FFFFFF];
+        const uint32_t code = rd32(rdram, rd32(rdram, rd32(rdram, pipeData + 0x04) + 0x18) + vu1CodeIndex * 4u);
+        // Vertex source. Sector: RpWorldSector arrays. Atomic (RwObject type 1): RpAtomic.geometry (+24) ->
+        // RpGeometry numVertices (+20), numMorphTargets (+24), preLitLum (+48), texCoords[0] (+52),
+        // morphTarget (+92) -> verts (+20), normals (+24). Atomics only on the same VU1 program as the sectors,
+        // with one morph target; skinned / custom pipelines (their own bridge callbacks) never get here.
+        uint32_t kind, verts, normals, uvs, prelit, numVerts, geomFlags = 0;
+        if (isSector)
+        {
+            if (object != g_curSector && code != g_sectorCode)
+                return false; // only on the generic program, like atomics
+            if (object == g_curSector)
+                g_sectorCode = code;
+            kind = kWorldSectorMesh;
+            stat(0);
+            verts = rd32(rdram, object + 0x08);
+            normals = rd32(rdram, object + 0x0C);
+            uvs = rd32(rdram, object + 0x10);
+            prelit = rd32(rdram, object + 0x30);
+            uint16_t nv;
+            std::memcpy(&nv, rdram + ((object + 0x8A) & 0x1FFFFFFu), 2);
+            numVerts = nv;
+        }
+        else
+        {
+            static const bool s_atomics = []()
+            {
+                const char *v = std::getenv("PS2X_NATIVE_ATOMICS"); // default on; =0 keeps them on VU1
+                return !(v && *v == '0');
+            }();
+            if (!s_atomics)
+            {
+                stat(6);
+                return false;
+            }
+            if (rdram[object & 0x1FFFFFFu] != 1u)
+            {
+                if (s_stats)
+                {
+                    static int s_samples = 0;
+                    if (s_samples < 12)
+                    {
+                        ++s_samples;
+                        std::printf("[nrw-other] obj=%08x w0=%08x w1=%08x w2=%08x w3=%08x curSector=%08x code=%08x sectorCode=%08x callers ra-chain n/a\n",
+                                    object, rd32(rdram, object), rd32(rdram, object + 4), rd32(rdram, object + 8), rd32(rdram, object + 12),
+                                    g_curSector, code, g_sectorCode);
+                    }
+                }
+                stat(2);
+                return false;
+            }
+            if (code == 0u || code != g_sectorCode)
+            {
+                stat(3);
+                return false;
+            }
+            const uint32_t geom = rd32(rdram, object + 24u);
+            if (!geom || rd32(rdram, geom + 24u) != 1u || rd32(rdram, pipeData + 0x20) > 1u)
+            {
+                stat(4);
+                return false;
+            }
+            const uint32_t mt = rd32(rdram, geom + 92u);
+            kind = kAtomicMesh;
+            geomFlags = rd32(rdram, geom + 8u);
+            verts = rd32(rdram, mt + 20u);
+            normals = rd32(rdram, mt + 24u);
+            prelit = rd32(rdram, geom + 48u);
+            uvs = rd32(rdram, geom + 52u);
+            numVerts = rd32(rdram, geom + 20u);
+            if (!verts || numVerts == 0u || numVerts > 65535u)
+            {
+                stat(5);
+                return false;
+            }
+            stat(1);
+        }
         const uint32_t idx = g_next.fetch_add(1, std::memory_order_relaxed) & (kTableSize - 1u);
         Entry &e = g_table[idx];
+        e.kind = kind;
+        e.verts = verts;
+        e.normals = normals;
+        e.uvs = uvs;
+        e.prelit = prelit;
+        e.numVerts = numVerts;
+        e.geomFlags = geomFlags;
         e.object = object;
         e.mesh = rd32(rdram, pipeData + 0x2C);
         const uint32_t meshHeader = rd32(rdram, pipeData + 0x0C);
         e.meshFlags = meshHeader ? rd32(rdram, meshHeader) : 0u;
         e.transType = rdram[(pipeData + 0x28) & 0x1FFFFFF];
         e.primType = rdram[(pipeData + 0x29) & 0x1FFFFFF];
-        e.vu1CodeIndex = rdram[(pipeData + 0x2B) & 0x1FFFFFF];
+        e.vu1CodeIndex = vu1CodeIndex;
         e.surfProps = rd32(rdram, pipeData + 0x3C);
         e.texture = rd32(rdram, pipeData + 0x40);
         e.matCol = rd32(rdram, pipeData + 0x44);
-        e.code = rd32(rdram, rd32(rdram, rd32(rdram, pipeData + 0x04) + 0x18) + e.vu1CodeIndex * 4u);
+        e.code = code;
         // DMA CNT, qwc 0; with TTE its upper half goes to VIF1: MARK 0xC0DE, then NOP carrying the index.
         lo = 0x10000000ull;
         hi = (0x07000000ull | kMarkerMark) | (static_cast<uint64_t>(idx & 0xFFFFu) << 32);
@@ -550,7 +664,13 @@ namespace nrw
             return;
         const Entry &e = g_table[index & (kTableSize - 1u)];
         MeshJob job{};
-        job.kind = kWorldSectorMesh;
+        job.kind = e.kind;
+        job.verts = e.verts;
+        job.normals = e.normals;
+        job.uvs = e.uvs;
+        job.prelit = e.prelit;
+        job.numVerts = e.numVerts;
+        job.geomFlags = e.geomFlags;
         job.object = e.object;
         job.mesh = e.mesh;
         job.meshHeaderFlags = e.meshFlags;
