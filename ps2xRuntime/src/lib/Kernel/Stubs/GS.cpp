@@ -1,6 +1,13 @@
 #include "Common.h"
+#include <functional>
+#include <array>
 #include "GS.h"
 void ps2GsThreadDrain(); // ps2_runtime.cpp (PS2X_GS_THREAD)
+// Run GS-side work in stream order on the GS worker (false: no worker, run it now). The libgraph flip/env
+// calls below change display and drawing registers; applied straight from the EE they landed while the
+// worker was still drawing the previous frame (half-drawn frames: in-match sky flicker).
+bool ps2GsThreadDefer(std::function<void()> fn);
+bool ps2GsThreadDeferFlip(std::function<void()> fn);
 #include "ps2_log.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
@@ -769,7 +776,9 @@ namespace ps2_stubs
             setReturnS32(ctx, -1);
             return;
         }
-        applyGsDispEnv(runtime, env);
+        auto apply = [runtime, env]() { applyGsDispEnv(runtime, env); };
+        if (!ps2GsThreadDefer(apply))
+            apply();
         setReturnS32(ctx, 0);
     }
 
@@ -782,7 +791,11 @@ namespace ps2_stubs
             setReturnS32(ctx, -1);
             return;
         }
-        applyGsRegPairs(runtime, pairs, 8u);
+        std::array<GsRegPairMem, 8> regs{};
+        std::copy(pairs, pairs + 8, regs.begin());
+        auto apply = [runtime, regs]() { applyGsRegPairs(runtime, regs.data(), 8u); };
+        if (!ps2GsThreadDefer(apply))
+            apply();
         setReturnS32(ctx, 0);
     }
 
@@ -1173,50 +1186,55 @@ namespace ps2_stubs
             return;
         }
 
-        applyGsDispEnv(runtime, db.disp[which]);
-        static uint32_t s_swapDbuffLogCount = 0u;
-        if (s_swapDbuffLogCount < 32u)
+        auto apply = [runtime, db, which, envAddr]()
         {
-            const uint32_t dispFbp = static_cast<uint32_t>(db.disp[which].dispfb & 0x1FFu);
-            const uint32_t clearContext = (which == 0u)
-                                              ? static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u)
-                                              : static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
-            PS2_IF_AGRESSIVE_LOGS({
-                RUNTIME_LOG("[gs:swapdbuff] which=" << which
-                                                    << " env=0x" << std::hex << envAddr
-                                                    << " dispfb=0x" << db.disp[which].dispfb
-                                                    << " display=0x" << db.disp[which].display
-                                                    << " pmode=0x" << db.disp[which].pmode
-                                                    << " dispFbp=" << dispFbp
-                                                    << " clearCtxt=" << clearContext
-                                                    << std::dec << std::endl);
-            });
-            ++s_swapDbuffLogCount;
-        }
-        if (which == 0u)
-        {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw01), 8u);
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw02), 8u);
-            if (hasSeededGsClearPacket(db.clear0))
+            applyGsDispEnv(runtime, db.disp[which]);
+            static uint32_t s_swapDbuffLogCount = 0u;
+            if (s_swapDbuffLogCount < 32u)
             {
-                const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
-                ps2GsThreadDrain();
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
+                const uint32_t dispFbp = static_cast<uint32_t>(db.disp[which].dispfb & 0x1FFu);
+                const uint32_t clearContext = (which == 0u)
+                                                  ? static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u)
+                                                  : static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
+                PS2_IF_AGRESSIVE_LOGS({
+                    RUNTIME_LOG("[gs:swapdbuff] which=" << which
+                                                        << " env=0x" << std::hex << envAddr
+                                                        << " dispfb=0x" << db.disp[which].dispfb
+                                                        << " display=0x" << db.disp[which].display
+                                                        << " pmode=0x" << db.disp[which].pmode
+                                                        << " dispFbp=" << dispFbp
+                                                        << " clearCtxt=" << clearContext
+                                                        << std::dec << std::endl);
+                });
+                ++s_swapDbuffLogCount;
             }
-            applyGsClearPacket(runtime, db.clear0);
-        }
-        else
-        {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw11), 8u);
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw12), 8u);
-            if (hasSeededGsClearPacket(db.clear1))
+            if (which == 0u)
             {
-                const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
-                ps2GsThreadDrain();
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
+                applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw01), 8u);
+                applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw02), 8u);
+                if (hasSeededGsClearPacket(db.clear0))
+                {
+                    const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
+                    ps2GsThreadDrain();
+                    runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
+                }
+                applyGsClearPacket(runtime, db.clear0);
             }
-            applyGsClearPacket(runtime, db.clear1);
-        }
+            else
+            {
+                applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw11), 8u);
+                applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw12), 8u);
+                if (hasSeededGsClearPacket(db.clear1))
+                {
+                    const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
+                    ps2GsThreadDrain();
+                    runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
+                }
+                applyGsClearPacket(runtime, db.clear1);
+            }
+        };
+        if (!ps2GsThreadDeferFlip(apply))
+            apply();
 
         setReturnS32(ctx, static_cast<int32_t>(which ^ 1u));
     }
@@ -1233,15 +1251,20 @@ namespace ps2_stubs
             return;
         }
 
-        applyGsDispEnv(runtime, db.disp[which]);
-        if (which == 0u)
+        auto apply = [runtime, db, which]()
         {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw0), 8u);
-        }
-        else
-        {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw1), 8u);
-        }
+            applyGsDispEnv(runtime, db.disp[which]);
+            if (which == 0u)
+            {
+                applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw0), 8u);
+            }
+            else
+            {
+                applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw1), 8u);
+            }
+        };
+        if (!ps2GsThreadDeferFlip(apply))
+            apply();
 
         setReturnS32(ctx, static_cast<int32_t>(which ^ 1u));
     }

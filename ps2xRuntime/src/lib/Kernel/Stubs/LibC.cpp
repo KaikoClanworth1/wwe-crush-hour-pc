@@ -918,16 +918,31 @@ namespace ps2_stubs
         setReturnS32(ctx, ret);
     }
 
+    // libm's double functions are soft-float on the EE: a double arrives as raw bits in one 64-bit GPR
+    // ($a0, then $a1) and returns in $v0. (These stubs used to read $f12 / write $f0 as if single-float:
+    // every game call got garbage back -- including floor() in Havok's MOPP collision-tree build.)
+    static double ps2ArgD(R5900Context *ctx, int reg)
+    {
+        const uint64_t bits = static_cast<uint64_t>(GPR_U64(ctx, reg));
+        double d;
+        std::memcpy(&d, &bits, sizeof(d));
+        return d;
+    }
+    static void ps2RetD(R5900Context *ctx, double d)
+    {
+        uint64_t bits;
+        std::memcpy(&bits, &d, sizeof(bits));
+        setReturnU64(ctx, bits);
+    }
+
     void sqrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::sqrtf(arg);
+        ps2RetD(ctx, std::sqrt(ps2ArgD(ctx, 4)));
     }
 
     void sin(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::sinf(arg);
+        ps2RetD(ctx, std::sin(ps2ArgD(ctx, 4)));
     }
 
     void __kernel_sinf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -940,8 +955,7 @@ namespace ps2_stubs
 
     void cos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::cosf(arg);
+        ps2RetD(ctx, std::cos(ps2ArgD(ctx, 4)));
     }
 
     void __kernel_cosf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -989,9 +1003,7 @@ namespace ps2_stubs
 
     void pow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float base = ctx->f[12];
-        float exp = ctx->f[14];
-        ctx->f[0] = ::powf(base, exp);
+        ps2RetD(ctx, std::pow(ps2ArgD(ctx, 4), ps2ArgD(ctx, 5)));
     }
 
     void exp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1020,14 +1032,12 @@ namespace ps2_stubs
 
     void floor(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::floorf(arg);
+        ps2RetD(ctx, std::floor(ps2ArgD(ctx, 4)));
     }
 
     void fabs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::fabsf(arg);
+        ps2RetD(ctx, std::fabs(ps2ArgD(ctx, 4)));
     }
     void abs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -1042,21 +1052,7 @@ namespace ps2_stubs
 
     void atan(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float in = ctx ? ctx->f[12] : 0.0f;
-        if (in == 0.0f)
-        {
-            uint32_t raw = getRegU32(ctx, 4);
-            std::memcpy(&in, &raw, sizeof(in));
-        }
-        const float out = std::atan(in);
-        if (ctx)
-        {
-            ctx->f[0] = out;
-        }
-
-        uint32_t outRaw = 0u;
-        std::memcpy(&outRaw, &out, sizeof(outRaw));
-        setReturnU32(ctx, outRaw);
+        ps2RetD(ctx, std::atan(ps2ArgD(ctx, 4)));
     }
 
     void memchr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
