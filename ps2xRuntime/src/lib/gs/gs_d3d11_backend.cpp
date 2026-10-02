@@ -416,6 +416,8 @@ struct GSD3D11Backend::Impl
         uint32_t upY0 = 0xFFFFFFFFu, upY1 = 0u;
         // Native pixel rows written on the GPU since the last sync (inclusive range).
         uint32_t dirtyY0 = 0xFFFFFFFFu, dirtyY1 = 0u;
+        // Native pixel columns written on the GPU since the last sync (inclusive range).
+        uint32_t dirtyX0 = 0xFFFFFFFFu, dirtyX1 = 0u;
         uint64_t lastUse = 0;
     };
     std::list<RenderTarget> rts;
@@ -748,12 +750,16 @@ struct GSD3D11Backend::Impl
         // created; writing it back stamped stale copies over textures uploaded since (green car / HUD
         // garbage on texture-heavy arenas). PS2X_SYNC_ALL_ROWS=1 restores the old behaviour.
         static const bool s_allRows = std::getenv("PS2X_SYNC_ALL_ROWS") != nullptr;
+        // Same for columns: an effect drawn into a corner of a wide target must not write back the rest
+        // of its rows (stale textures over the HUD during the car-destroyed sequence).
         const uint32_t yFirst = s_allRows ? 0u : rt.dirtyY0;
         const uint32_t yEnd = s_allRows ? rt.h : std::min(rt.h, rt.dirtyY1 + 1u);
+        const uint32_t xFirst = (s_allRows || rt.dirtyX0 == 0xFFFFFFFFu) ? 0u : std::min(rt.dirtyX0, rt.w);
+        const uint32_t xEnd = (s_allRows || rt.dirtyX0 == 0xFFFFFFFFu) ? rt.w : std::min(rt.w, rt.dirtyX1 + 1u);
         for (uint32_t y = yFirst; y < yEnd; ++y)
         {
             const uint32_t *row = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(m.pData) + y * m.RowPitch);
-            for (uint32_t x = 0; x < rt.w; ++x)
+            for (uint32_t x = xFirst; x < xEnd; ++x)
             {
                 const uint32_t c = row[x];
                 const uint32_t aRaw = ((c >> 24) * 128u + 127u) / 255u;
@@ -773,6 +779,8 @@ struct GSD3D11Backend::Impl
         rt.gpuDirty = false;
         rt.dirtyY0 = 0xFFFFFFFFu;
         rt.dirtyY1 = 0u;
+        rt.dirtyX0 = 0xFFFFFFFFu;
+        rt.dirtyX1 = 0u;
         uint32_t first, last;
         rtPageSpan(rt, first, last);
         markPagesDirty(first, last);
@@ -870,6 +878,17 @@ struct GSD3D11Backend::Impl
                     rts.erase(it);
                     break;
                 }
+        }
+        {
+            static const bool s_log = std::getenv("PS2X_RT_NEW_LOG") != nullptr;
+            static const auto s_t0 = std::chrono::steady_clock::now();
+            if (s_log)
+            {
+                std::printf("[rt-new] t=%.1f fbp=%u fbw=%u psm=%u h=%u rts=%zu frame=%llu\n",
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count(), fbpBlock, fbw,
+                            psm, keepH, rts.size(), static_cast<unsigned long long>(frameCounter));
+                std::fflush(stdout);
+            }
         }
         RenderTarget nrt;
         nrt.fbpBlock = fbpBlock;
@@ -2050,16 +2069,29 @@ struct GSD3D11Backend::Impl
         }
         rt->gpuDirty = true;
         {
-            float minY = 1e9f, maxY = -1e9f;
+            float minY = 1e9f, maxY = -1e9f, minX = 1e9f, maxX = -1e9f;
             for (const Vtx &v : pending)
             {
                 minY = std::min(minY, v.y);
                 maxY = std::max(maxY, v.y);
+                minX = std::min(minX, v.x);
+                maxX = std::max(maxX, v.x);
             }
             if (nativeJob)
             {
                 minY = static_cast<float>(c.scissor.y0);
                 maxY = static_cast<float>(c.scissor.y1) + 1.0f;
+                minX = static_cast<float>(c.scissor.x0);
+                maxX = static_cast<float>(c.scissor.x1) + 1.0f;
+            }
+            {
+                const int xL = std::max<int>(static_cast<int>(c.scissor.x0), static_cast<int>(std::floor(minX)));
+                const int xR = std::min<int>({static_cast<int>(c.scissor.x1), static_cast<int>(std::ceil(maxX)), static_cast<int>(rt->w) - 1});
+                if (xR >= xL)
+                {
+                    rt->dirtyX0 = std::min<uint32_t>(rt->dirtyX0, static_cast<uint32_t>(std::max(0, xL)));
+                    rt->dirtyX1 = std::max<uint32_t>(rt->dirtyX1, static_cast<uint32_t>(xR));
+                }
             }
             // Rows whose pixel centres lie in [minY, maxY): a full 256-line sprite ends at y=256 but
             // only touches rows 0..255 (counting row 256 forced readbacks for CLUTs stored below).
@@ -2418,6 +2450,8 @@ bool GSD3D11Backend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
         rt->gpuDirty = true;
         rt->dirtyY0 = 0u;
         rt->dirtyY1 = rt->h ? rt->h - 1u : 0u;
+        rt->dirtyX0 = 0u;
+        rt->dirtyX1 = rt->w ? rt->w - 1u : 0u;
         return true;
     }
     return d.mem.ClearFramebuffer(context, rgba);

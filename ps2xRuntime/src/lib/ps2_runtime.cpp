@@ -2864,12 +2864,17 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
     m_memory.writeIORegister(GIF_TADR, tadr);
     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
-    if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
+    // The native GIF chain shortcuts drain the GS worker and then write the GS straight from the EE thread.
+    // With the worker that raced it (texture garbage on texture-streaming arenas: HARDCORE's jumbotron,
+    // car, HUD) and gained nothing measurable, so they only run without the worker (or PS2X_NATIVE_GIF=1).
+    static const bool s_noNativeGif = std::getenv("PS2X_NO_NATIVE_GIF") != nullptr ||
+                                      (ps2GsThreadEnabled() && std::getenv("PS2X_NATIVE_GIF") == nullptr);
+    if (!s_noNativeGif && m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
         return;
     }
-    if (m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
+    if (!s_noNativeGif && m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
         return;
