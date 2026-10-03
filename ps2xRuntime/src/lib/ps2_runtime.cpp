@@ -3182,6 +3182,25 @@ void PS2Runtime::run()
                     }
                     std::printf("\n");
                 }
+                if (const char *dir = std::getenv("PS2X_RAM_DUMP"))
+                {
+                    // PS2X_RAM_DUMP=<dir> with PS2X_RAM_DUMP_FROM=<sec>, PS2X_RAM_DUMP_COUNT=<n>: snapshot guest
+                    // RAM on status ticks (offline physics/object inspection).
+                    static const double s_from = std::getenv("PS2X_RAM_DUMP_FROM") ? std::atof(std::getenv("PS2X_RAM_DUMP_FROM")) : 0.0;
+                    static int s_left = std::getenv("PS2X_RAM_DUMP_COUNT") ? std::atoi(std::getenv("PS2X_RAM_DUMP_COUNT")) : 8;
+                    static int s_n = 0;
+                    if (s_left > 0 && ps2host::timeSeconds() >= s_from)
+                    {
+                        --s_left;
+                        char path[512];
+                        std::snprintf(path, sizeof(path), "%s\\ram_%03d_t%.0f.bin", dir, s_n++, ps2host::timeSeconds());
+                        if (FILE *fp = std::fopen(path, "wb"))
+                        {
+                            std::fwrite(m_memory.getRDRAM(), 1, PS2_RAM_SIZE, fp);
+                            std::fclose(fp);
+                        }
+                    }
+                }
                 if (std::getenv("PS2X_SYMBOLS"))
                 {
                     const auto snap = m_eeScheduler->snapshot();
