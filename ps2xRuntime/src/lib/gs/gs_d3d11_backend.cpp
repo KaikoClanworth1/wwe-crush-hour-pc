@@ -16,6 +16,8 @@ extern thread_local GifPathId g_gifCurrentPath;
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include <nmmintrin.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -469,6 +471,10 @@ struct GSD3D11Backend::Impl
     uint32_t uploadFirst = 1u, uploadLast = 0u;
     uint64_t statNativeDraws = 0;
     uint64_t statDraws = 0, statSyncs = 0, statUploads = 0, statTexDecodes = 0, statTexContentHits = 0;
+    const bool statsEnabled = std::getenv("PS2X_GS_STATS") != nullptr;
+    std::unordered_map<uint64_t, uint32_t> decodeHist; // PS2X_GS_STATS: decodes per tbp/psm/size since last report
+    std::vector<uint32_t> rawScratch;                  // decodedTexture: raw texels of the texture being looked up
+    uint64_t contentEvictFrame = 0;
     const char *syncReason = "?";
     char syncDetail[96] = "";
     const bool syncLogEnabled = std::getenv("PS2X_SYNC_LOG") != nullptr;
@@ -647,10 +653,11 @@ struct GSD3D11Backend::Impl
     {
         out.assign(static_cast<size_t>(w) * h, 0u);
         const uint32_t readPsm = is16(psm) ? psm : (is24(psm) ? GS_PSM_CT24 : GS_PSM_CT32);
+        mem.ReadVramRect(readPsm, fbpBlock, fbw, 0u, y0, w, h, out.data());
         for (uint32_t y = 0; y < h; ++y)
             for (uint32_t x = 0; x < w; ++x)
             {
-                uint32_t c = mem.ReadVram(readPsm, fbpBlock, fbw, x, y0 + y);
+                uint32_t c = out[static_cast<size_t>(y) * w + x];
                 uint32_t a;
                 if (is16(psm))
                 {
@@ -1105,20 +1112,51 @@ struct GSD3D11Backend::Impl
         }
 
         // RenderWare re-streams the same texture bytes into a shared VRAM area every frame, which
-        // bumps the page versions. Reuse an earlier decode of identical page contents.
+        // bumps the page versions. Reuse an earlier decode of identical contents, in two levels:
+        // 1) a cheap linear hash of the whole pages (the steady state: same bytes re-streamed);
+        // 2) a hash of the texture's own texels. Menu textures share pages, so a neighbour's upload
+        //    changes the page hash although this texture is unchanged; without level 2 every texture
+        //    in the page was re-decoded (thousands per menu transition).
+        const uint32_t tbw = std::max<uint32_t>(t.tbw, 1u);
+        std::vector<uint32_t> &raw = rawScratch;
+        bool rawRead = false;
         uint64_t contentKey = key;
+        uint64_t texelKey = 0;
         if (vram)
         {
+            // Hardware CRC32 over four independent lanes (pages are 8 KB, so words is a multiple of 4):
+            // this runs on every page-stamp miss, i.e. for most textures every frame.
             const uint64_t *w = reinterpret_cast<const uint64_t *>(vram + static_cast<size_t>(first) * 8192u);
             const size_t words = static_cast<size_t>(last - first + 1u) * 8192u / 8u;
-            uint64_t h = contentKey ^ 0x9E3779B97F4A7C15ull;
-            for (size_t i = 0; i < words; ++i)
+            uint64_t c0 = contentKey, c1 = contentKey >> 16, c2 = contentKey >> 32, c3 = ~contentKey;
+            for (size_t i = 0; i < words; i += 4)
             {
-                h = (h ^ w[i]) * 0x100000001B3ull;
-                h ^= h >> 29;
+                c0 = _mm_crc32_u64(c0, w[i]);
+                c1 = _mm_crc32_u64(c1, w[i + 1]);
+                c2 = _mm_crc32_u64(c2, w[i + 2]);
+                c3 = _mm_crc32_u64(c3, w[i + 3]);
             }
-            contentKey = h;
+            contentKey = ((c0 << 32) | c1) ^ (((c2 << 32) | c3) * 0x9E3779B97F4A7C15ull) ^ key;
             auto cit = contentCache.find(contentKey);
+            if (cit == contentCache.end())
+            {
+                raw.resize(static_cast<size_t>(tw) * th);
+                mem.ReadVramRect(t.psm, t.tbp0, tbw, 0u, 0u, tw, th, raw.data());
+                rawRead = true;
+                uint64_t th2 = key ^ 0xC2B2AE3D27D4EB4Full;
+                for (const uint32_t v : raw)
+                {
+                    th2 = (th2 ^ v) * 0x100000001B3ull;
+                    th2 ^= th2 >> 29;
+                }
+                texelKey = th2;
+                cit = contentCache.find(texelKey);
+                if (cit != contentCache.end())
+                {
+                    contentCache[contentKey] = cit->second; // later page-hash lookups hit level 1
+                    cit = contentCache.find(contentKey);
+                }
+            }
             if (cit != contentCache.end())
             {
                 cit->second.lastUse = frameCounter;
@@ -1132,12 +1170,16 @@ struct GSD3D11Backend::Impl
             }
         }
 
+        if (!rawRead)
+        {
+            raw.resize(static_cast<size_t>(tw) * th);
+            mem.ReadVramRect(t.psm, t.tbp0, tbw, 0u, 0u, tw, th, raw.data());
+        }
         std::vector<uint32_t> px(static_cast<size_t>(tw) * th);
-        const uint32_t tbw = std::max<uint32_t>(t.tbw, 1u);
         for (uint32_t y = 0; y < th; ++y)
             for (uint32_t x = 0; x < tw; ++x)
             {
-                uint32_t v = mem.ReadVram(t.psm, t.tbp0, tbw, x, y);
+                const uint32_t v = raw[static_cast<size_t>(y) * tw + x];
                 uint32_t c;
                 if (isIndexed(t.psm))
                     c = clutColor(t, st.texa, v);
@@ -1186,14 +1228,21 @@ struct GSD3D11Backend::Impl
         texCache[key] = ct;
         if (vram)
         {
-            if (contentCache.size() > 1500u)
+            // Evict idle entries at most once a second: during a menu transition every entry is recent,
+            // and a full scan on each insert made texture streaming quadratic.
+            if (contentCache.size() > 6000u && frameCounter >= contentEvictFrame + 60u)
             {
+                contentEvictFrame = frameCounter;
                 for (auto ci = contentCache.begin(); ci != contentCache.end();)
                     ci = (ci->second.lastUse + 300u < frameCounter) ? contentCache.erase(ci) : std::next(ci);
             }
             contentCache[contentKey] = ct;
+            if (rawRead)
+                contentCache[texelKey] = ct;
         }
         ++statTexDecodes;
+        if (statsEnabled)
+            ++decodeHist[(static_cast<uint64_t>(t.tbp0) << 40) | (static_cast<uint64_t>(t.psm) << 32) | (tw << 16) | th];
         outW = tw;
         outH = th;
         return texCache[key].srv.Get();
@@ -2429,6 +2478,19 @@ PresentationFrame GSD3D11Backend::Present(const GSPresentationRequest &request)
             for (const auto &[k, n] : d.fmtStats)
                 std::printf("[gs-d3d11]   tex psm=%u cpsm=%u csm=%u draws=%llu\n", k >> 16, (k >> 8) & 0xFF, k & 0xFF,
                             static_cast<unsigned long long>(n));
+        if (d.statsEnabled && !d.decodeHist.empty())
+        {
+            std::vector<std::pair<uint32_t, uint64_t>> top;
+            for (const auto &[k, n] : d.decodeHist)
+                top.emplace_back(n, k);
+            std::sort(top.rbegin(), top.rend());
+            for (size_t i = 0; i < top.size() && i < 6u; ++i)
+                std::printf("[gs-d3d11]   decodes tbp=%llu psm=%llu %llux%llu: %u\n", (unsigned long long)(top[i].second >> 40),
+                            (unsigned long long)((top[i].second >> 32) & 0xFF), (unsigned long long)((top[i].second >> 16) & 0xFFFF),
+                            (unsigned long long)(top[i].second & 0xFFFF), top[i].first);
+            std::printf("[gs-d3d11]   decode keys: %zu\n", d.decodeHist.size());
+            d.decodeHist.clear();
+        }
         if (std::getenv("PS2X_GS_STATS"))
             for (const auto &[r, n] : d.syncReasons)
                 std::printf("[gs-d3d11]   sync %s: %llu\n", r.c_str(), static_cast<unsigned long long>(n));

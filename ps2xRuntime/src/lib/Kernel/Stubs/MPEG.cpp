@@ -1195,7 +1195,9 @@ namespace ps2_stubs
             uint32_t interleave = 512;
             std::vector<uint8_t> pending;
             IXAudio2SourceVoice *voice = nullptr;
-            std::deque<std::vector<int16_t>> queued;
+            std::deque<std::vector<int16_t>> queued; // submitted to the voice (kept alive until played)
+            std::deque<std::vector<int16_t>> ready;  // complete chunks waiting for queue space
+            std::vector<int16_t> building;           // chunk being assembled
             bool started = false;
         };
         std::mutex g_pssAudioMutex;
@@ -1211,6 +1213,8 @@ namespace ps2_stubs
                 a.voice = nullptr;
             }
             a.queued.clear();
+            a.ready.clear();
+            a.building.clear();
         }
 
         void stopPssAudio(uint32_t mpegAddr)
@@ -1273,11 +1277,16 @@ namespace ps2_stubs
             }
             if (!a.pcm || !a.voice)
                 return;
+            // De-interleave into ~40 ms buffers. One XAudio2 buffer per 512-byte interleave block (~5 ms)
+            // overran the 64-buffer queue whenever the demuxer fed in bursts; the rejected submits were
+            // dropped audio (static in movies and entrance music).
             const size_t block = static_cast<size_t>(a.interleave) * a.channels;
+            const size_t chunkFrames = std::max<size_t>(a.rate / 25u, a.interleave / 2u);
             while (a.pending.size() >= block)
             {
                 const size_t frames = a.interleave / 2u;
-                std::vector<int16_t> out(frames * a.channels);
+                const size_t base = a.building.size();
+                a.building.resize(base + frames * a.channels);
                 for (uint32_t c = 0; c < a.channels; ++c)
                 {
                     const uint8_t *src = a.pending.data() + static_cast<size_t>(c) * a.interleave;
@@ -1285,21 +1294,37 @@ namespace ps2_stubs
                     {
                         int16_t v;
                         std::memcpy(&v, src + f * 2u, 2);
-                        out[f * a.channels + c] = v;
+                        a.building[base + f * a.channels + c] = v;
                     }
                 }
                 a.pending.erase(a.pending.begin(), a.pending.begin() + static_cast<std::ptrdiff_t>(block));
-                a.queued.push_back(std::move(out));
-                XAUDIO2_BUFFER buf{};
-                buf.AudioBytes = static_cast<UINT32>(a.queued.back().size() * 2u);
-                buf.pAudioData = reinterpret_cast<const BYTE *>(a.queued.back().data());
-                a.voice->SubmitSourceBuffer(&buf);
+                if (a.building.size() >= chunkFrames * a.channels)
+                {
+                    a.ready.push_back(std::move(a.building));
+                    a.building.clear();
+                }
             }
             XAUDIO2_VOICE_STATE st{};
             a.voice->GetState(&st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
             while (a.queued.size() > st.BuffersQueued)
                 a.queued.pop_front();
-            if (!a.started && st.BuffersQueued > 0)
+            // Never drop audio: chunks the voice cannot take yet wait in `ready`.
+            while (!a.ready.empty() && a.queued.size() < XAUDIO2_MAX_QUEUED_BUFFERS - 2u)
+            {
+                a.queued.push_back(std::move(a.ready.front()));
+                a.ready.pop_front();
+                XAUDIO2_BUFFER buf{};
+                buf.AudioBytes = static_cast<UINT32>(a.queued.back().size() * 2u);
+                buf.pAudioData = reinterpret_cast<const BYTE *>(a.queued.back().data());
+                if (FAILED(a.voice->SubmitSourceBuffer(&buf)))
+                {
+                    a.ready.push_front(std::move(a.queued.back()));
+                    a.queued.pop_back();
+                    break;
+                }
+            }
+            // Pre-buffer ~120 ms so decode jitter does not starve the voice right away.
+            if (!a.started && a.queued.size() >= 3u)
             {
                 a.voice->Start();
                 a.started = true;
