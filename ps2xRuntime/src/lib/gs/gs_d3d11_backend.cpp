@@ -489,10 +489,12 @@ struct GSD3D11Backend::Impl
         std::array<uint32_t, 256> raw{};
     };
     std::unordered_map<uint64_t, ClutCacheEntry> clutCache;
-    // Sampling a texture that lies inside a render target straight from the GPU target (screen-grab effects)
-    // gave the car reflections stale frame pixels (green garbage) on several arenas; the VRAM path costs no
-    // measurable fps now. PS2X_RT_SUBTEX=1 re-enables it.
-    const bool disableRtSubTex = std::getenv("PS2X_RT_SUBTEX") == nullptr;
+    // A texture that lies inside a render target (screen-grab effects: the burning-car heat haze samples
+    // 256x256 of the frame buffer every frame) is sampled straight from the GPU target. The VRAM path meant
+    // a full GPU->CPU readback per such draw (two per frame, match fps 5-20 while cars burn). The stale
+    // green car reflections this was once blamed for came from the sceGszbufaddr VRAM-layout bug.
+    // PS2X_NO_RT_SUBTEX=1 restores the readback path.
+    const bool disableRtSubTex = std::getenv("PS2X_NO_RT_SUBTEX") != nullptr;
     char lastPresent[160] = "none";
     std::unordered_map<std::string, uint64_t> syncReasons;
     std::unordered_map<uint32_t, uint64_t> fmtStats;
