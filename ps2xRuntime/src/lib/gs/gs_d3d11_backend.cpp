@@ -1101,9 +1101,19 @@ struct GSD3D11Backend::Impl
             const uint32_t k4[] = {st.texa.ta0, st.texa.ta1, st.texa.aem ? 1u : 0u};
             key = fnv1a(k4, sizeof(k4), key);
         }
+        // A texture wider than its buffer width spills into the next page row (GS page index is
+        // (y/ph)*bufferPages + x/pw), past the span computed from the rows alone.
+        {
+            uint32_t pw, ph;
+            pageSize(t.psm, pw, ph);
+            const uint32_t bwp = std::max<uint32_t>(1u, (std::max<uint32_t>(t.tbw, 1u) * 64u + pw - 1u) / pw);
+            const uint32_t widest = t.tbp0 / 32u + ((th - 1u) / ph) * bwp + (tw - 1u) / pw + ((t.tbp0 & 31u) ? 1u : 0u);
+            last = std::max(last, std::min<uint32_t>(widest, 511u));
+        }
+        static const bool s_noCache = std::getenv("PS2X_TEX_NOCACHE") != nullptr; // debug: decode every lookup
         const uint64_t stamp = texturePageStamp(first, last);
         auto it = texCache.find(key);
-        if (it != texCache.end() && it->second.pageStamp == stamp)
+        if (!s_noCache && it != texCache.end() && it->second.pageStamp == stamp)
         {
             it->second.lastUse = frameCounter;
             outW = it->second.w;
@@ -1157,7 +1167,7 @@ struct GSD3D11Backend::Impl
                     cit = contentCache.find(contentKey);
                 }
             }
-            if (cit != contentCache.end())
+            if (!s_noCache && cit != contentCache.end())
             {
                 cit->second.lastUse = frameCounter;
                 CachedTexture shared = cit->second;

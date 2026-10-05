@@ -2271,6 +2271,20 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
 {
     if (m_path3Masked || m_path3MaskedFifo.empty())
         return;
+    {
+        // PS2X_P3_STATS: report bulk releases of masked PATH3 packets (uploads that may overtake draws).
+        static const bool s_stats = std::getenv("PS2X_P3_STATS") != nullptr;
+        static int s_left = 300;
+        if (s_stats && m_path3MaskedFifo.size() > 1u && s_left > 0)
+        {
+            --s_left;
+            size_t bytes = 0;
+            for (const auto &p : m_path3MaskedFifo)
+                bytes += p.size();
+            std::printf("[p3-bulk] release %zu packets (%zu bytes) drain=%d\n", m_path3MaskedFifo.size(), bytes,
+                        drainImmediately ? 1 : 0);
+        }
+    }
 
     auto emit = [&](const uint8_t *packetData, uint32_t packetSize)
     {
