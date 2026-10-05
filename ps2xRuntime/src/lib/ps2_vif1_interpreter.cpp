@@ -34,6 +34,12 @@ namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
 
+    // VIF1 DIRECT/DIRECTHL payload that spans several DMA transfers: reassembled here and submitted as one
+    // PATH2 GIF packet once all quadwords have arrived (the GIF frontend needs packets to start on a GIFtag).
+    std::vector<uint8_t> g_vif1DirectBuf;
+    uint32_t g_vif1DirectRemainingQw = 0u;
+    bool g_vif1DirectBufHl = false;
+
     uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
     {
         if (!data || sizeBytes < 16u)
@@ -299,6 +305,13 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+void ps2Vif1DirectReset()
+{
+    g_vif1DirectBuf.clear();
+    g_vif1DirectRemainingQw = 0u;
+    g_vif1DirectBufHl = false;
+}
+
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
@@ -306,8 +319,32 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     uint32_t pos = 0;
 
+    static const bool s_directLegacy = std::getenv("PS2X_DIRECT_LEGACY") != nullptr;
+
     while (pos + 4 <= sizeBytes)
     {
+        if (g_vif1DirectRemainingQw != 0u)
+        {
+            // Continuation of a DIRECT/DIRECTHL payload from an earlier DMA transfer (REF/CNT tags): append and
+            // submit the whole GIF stream once complete. The old path re-tagged only a cut-off IMAGE tag's data;
+            // a second IMAGE tag in the same DIRECT (RenderWare splits >32767-qword images, e.g. 512x256x32
+            // menu panels) was dropped and its bytes parsed as VIF codes.
+            const uint32_t availableQw = (sizeBytes - pos) / 16u;
+            if (availableQw == 0u)
+                break;
+            const uint32_t chunkQw = std::min<uint32_t>(g_vif1DirectRemainingQw, availableQw);
+            g_vif1DirectBuf.insert(g_vif1DirectBuf.end(), data + pos, data + pos + static_cast<size_t>(chunkQw) * 16u);
+            pos += chunkQw * 16u;
+            g_vif1DirectRemainingQw -= chunkQw;
+            if (g_vif1DirectRemainingQw == 0u)
+            {
+                submitGifPacket(GifPathId::Path2, g_vif1DirectBuf.data(), static_cast<uint32_t>(g_vif1DirectBuf.size()), true,
+                                g_vif1DirectBufHl);
+                g_vif1DirectBuf.clear();
+                g_vif1DirectBufHl = false;
+            }
+            continue;
+        }
         if (m_vif1PendingPath2ImageQwc != 0u)
         {
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
@@ -559,6 +596,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > availableQw)
                 qwCount = availableQw;
 
+            if (truncated && !s_directLegacy)
+            {
+                // Payload continues in the next DMA transfer: buffer what is here and finish it later.
+                const bool directHl = (opcode == VIF_DIRECTHL);
+                g_vif1DirectBuf.assign(data + pos, data + pos + static_cast<size_t>(qwCount) * 16u);
+                g_vif1DirectBuf.reserve(static_cast<size_t>(imm ? imm : 65536u) * 16u);
+                g_vif1DirectRemainingQw = (imm ? imm : 65536u) - qwCount;
+                g_vif1DirectBufHl = directHl;
+                pos = sizeBytes;
+                break;
+            }
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);

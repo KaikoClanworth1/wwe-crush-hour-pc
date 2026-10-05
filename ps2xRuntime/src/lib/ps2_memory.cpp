@@ -18,6 +18,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+void ps2Vif1DirectReset(); // ps2_vif1_interpreter.cpp: drops a half-received VIF1 DIRECT payload
 
 void ps2GsThreadDrain(); // ps2_runtime.cpp (PS2X_GS_THREAD)
 bool ps2GsThreadDefer(std::function<void()> fn); // ps2_runtime.cpp
@@ -491,6 +492,7 @@ bool PS2Memory::initialize(size_t ramSize)
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
+    ps2Vif1DirectReset();
     resetEeTimers();
 
     try
@@ -1402,6 +1404,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2ImageQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
+                ps2Vif1DirectReset();
                 m_path3Masked = false;
                 if (wasPath3Masked)
                     flushMaskedPath3Packets();
@@ -1523,7 +1526,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // Hardware has no tag limit. The old cap of 4096 silently dropped the rest of a chain; this
+                    // game's VIF1 frames average ~3000 tags and busy ones exceed 4096 (missing geometry, texture
+                    // uploads and VIF state lost for the rest of the frame). Keep only a runaway guard.
+                    const int kMaxChainTags = 1 << 20;
+                    const size_t kMaxChainBytes = 256u << 20;
                     // Reuse the previous chain buffer: fresh multi-MB vectors cost page faults every frame.
                     std::vector<uint8_t> chainBuf;
                     if (channelBase == 0x10009000u && !asyncDmaEnabled())
@@ -1719,6 +1726,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             endChain = true;
                         if (endChain)
                             break;
+                        if (chainBuf.size() > kMaxChainBytes)
+                            break;
+                    }
+                    if (tagsProcessed >= kMaxChainTags || chainBuf.size() > kMaxChainBytes)
+                    {
+                        static int s_warn = 20;
+                        if (s_warn-- > 0)
+                            std::printf("[dma] chain guard hit: channel=%x tags=%d bytes=%zu (rest of chain dropped)\n", channelBase,
+                                        tagsProcessed, chainBuf.size());
                     }
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;

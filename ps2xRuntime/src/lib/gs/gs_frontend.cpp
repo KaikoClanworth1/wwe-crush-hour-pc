@@ -1263,8 +1263,9 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
         {
             // PS2X_TEX0_LOG: raw TEX0 writes of 16-bit direct-colour textures (flare/particle garbage hunt).
-            static int s_left = std::getenv("PS2X_TEX0_LOG") ? 200 : 0;
-            if (s_left > 0 && (t.psm == 10u || t.psm == 2u) && t.tbp0 >= 9000u)
+            static int s_left = std::getenv("PS2X_TEX0_LOG") ? std::max(200, std::atoi(std::getenv("PS2X_TEX0_LOG"))) : 0;
+            static const long s_onlyTbp = std::getenv("PS2X_TEX0_TBP") ? std::atol(std::getenv("PS2X_TEX0_TBP")) : -1; // log only this TBP
+            if (s_left > 0 && (s_onlyTbp >= 0 ? static_cast<long>(t.tbp0) == s_onlyTbp : ((t.psm == 10u || t.psm == 2u) && t.tbp0 >= 9000u)))
             {
                 --s_left;
                 std::printf("[tex0] ctx=%d raw=%016llx tbp=%u tbw=%u psm=%u tw=%u th=%u cbp=%u cpsm=%u cld=%u\n", ci,

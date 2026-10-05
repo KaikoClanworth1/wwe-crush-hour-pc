@@ -445,6 +445,11 @@ struct GSD3D11Backend::Impl
     std::unordered_map<uint64_t, CachedTexture> contentCache; // keyed by texture params + VRAM page contents
 
     std::array<uint32_t, 512> pageVersion{};
+    // PS2X_STALE_LOG: last host->local upload that touched each page (who overwrote a bound texture).
+    struct PageWrite { uint32_t seq = 0, dbp = 0, dbw = 0, dpsm = 0, w = 0, h = 0, y = 0; };
+    std::array<PageWrite, 512> pageHist{};
+    uint32_t uploadSeq = 0;
+    const bool staleLog = std::getenv("PS2X_STALE_LOG") != nullptr;
     std::array<uint16_t, 512> clut{};
     std::array<uint32_t, 2> clutCbp{0xFFFFFFFFu, 0xFFFFFFFFu};
     uint32_t clutVersion = 0;
@@ -1830,6 +1835,27 @@ struct GSD3D11Backend::Impl
             {
                 uint32_t w = 1, h = 1;
                 texSrv = decodedTexture(st, w, h);
+                static const long s_staleTbp = std::getenv("PS2X_STALE_TBP") ? std::atol(std::getenv("PS2X_STALE_TBP")) : -1;
+                if (staleLog && (t.psm == 10u || t.psm == 2u || static_cast<long>(t.tbp0) == s_staleTbp))
+                {
+                    // 16-bit textures are uploaded natively, so the last writer of their first page should be
+                    // a same-format upload starting at TBP0; anything else means the draw reads another texture.
+                    // PS2X_STALE_TBP=<tbp> reports every new writer state for that texture address.
+                    static int s_left = 80;
+                    static uint32_t s_lastSeqForTbp = ~0u;
+                    const uint32_t page = std::min<uint32_t>(511u, t.tbp0 / 32u);
+                    const PageWrite &pw = pageHist[page];
+                    const bool watched = static_cast<long>(t.tbp0) == s_staleTbp && pw.seq != s_lastSeqForTbp;
+                    if (watched)
+                        s_lastSeqForTbp = pw.seq;
+                    if (s_left > 0 && (watched || (t.psm == 10u || t.psm == 2u) && (pw.seq == 0u || pw.dpsm != t.psm || pw.dbp != t.tbp0)))
+                    {
+                        --s_left;
+                        std::printf("[stale] draw tbp=%u tbw=%u psm=%u %ux%u <- page %u last upload #%u (now #%u): dbp=%u dbw=%u dpsm=%u %ux%u y=%u\n",
+                                    t.tbp0, t.tbw, t.psm, w, h, page, pw.seq, uploadSeq, pw.dbp, pw.dbw, pw.dpsm, pw.w, pw.h, pw.y);
+                        std::fflush(stdout);
+                    }
+                }
                 texDims[2] = static_cast<float>(w);
                 texDims[3] = static_cast<float>(h);
             }
@@ -2357,6 +2383,12 @@ void GSD3D11Backend::BeginTransfer(const GSTransferCommand &command)
         d.markPagesDirty(df, dl);
         d.uploadFirst = df;
         d.uploadLast = dl;
+        if (d.staleLog)
+        {
+            ++d.uploadSeq;
+            for (uint32_t p = df; p <= dl && p < 512u; ++p)
+                d.pageHist[p] = {d.uploadSeq, bb.dbp, bb.dbw, bb.dpsm, tr.rrw, tr.rrh, tp.dsay};
+        }
     }
     else if (command.direction == 1u)
     {
@@ -2379,11 +2411,17 @@ void GSD3D11Backend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     {
         // Append every host->local payload to one file per destination pointer (diagnostics).
         static int s_files = 0;
+        // PS2X_UPLOAD_DUMP_SEC=<s> starts the dump later; PS2X_UPLOAD_DUMP_MIN=<pixels> keeps only big transfers.
+        static const double s_dumpSec = std::getenv("PS2X_UPLOAD_DUMP_SEC") ? std::atof(std::getenv("PS2X_UPLOAD_DUMP_SEC")) : 0.0;
+        static const uint32_t s_dumpMin = std::getenv("PS2X_UPLOAD_DUMP_MIN") ? static_cast<uint32_t>(std::atol(std::getenv("PS2X_UPLOAD_DUMP_MIN"))) : 0u;
+        static const auto s_dumpBoot = std::chrono::steady_clock::now();
         const GSTransferSnapshot snap = m_impl->mem.GetTransferSnapshot();
-        if (snap.direction == 0u && s_files < 64 && sizeBytes >= 64u && m_impl->lastUploadDbp != 15008u)
+        if (snap.direction == 0u && s_files < 64 && sizeBytes >= 64u && m_impl->lastUploadDbp != 15008u &&
+            snap.totalPixels >= s_dumpMin &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_dumpBoot).count() >= s_dumpSec)
         {
             char path[512];
-            std::snprintf(path, sizeof(path), "%s/upload_%03d.bin", dumpDir, s_files);
+            std::snprintf(path, sizeof(path), "%s/upload_%03d_dbp%u.bin", dumpDir, s_files, m_impl->lastUploadDbp);
             if (snap.copiedPixels == 0u)
                 ++s_files;
             if (FILE *f = std::fopen(path, "ab"))
