@@ -2051,12 +2051,20 @@ struct GSD3D11Backend::Impl
         // which does not drift with menu/load timing the way wall-clock windows do.
         static const double s_traceBank1 = std::getenv("PS2X_GS_TRACE_BANK1") ? std::atof(std::getenv("PS2X_GS_TRACE_BANK1")) : -1.0;
         extern std::atomic<double> g_ps2xBank1LoadedAt;
+        extern std::atomic<double> g_ps2xTraceAnchorAt;
+        // PS2X_GS_TRACE_ANCHOR=<sec>: count from the first call of PS2X_TRACE_ANCHOR_PC (see ps2_runtime.cpp).
+        static const double s_traceAnchor = std::getenv("PS2X_GS_TRACE_ANCHOR") ? std::atof(std::getenv("PS2X_GS_TRACE_ANCHOR")) : -1.0;
         const double bank1At = g_ps2xBank1LoadedAt.load();
-        const bool traceTimeOk = s_traceBank1 >= 0.0
+        const double anchorAt = g_ps2xTraceAnchorAt.load();
+        const bool traceTimeOk = s_traceAnchor >= 0.0 ? (anchorAt >= 0.0 && ps2host::timeSeconds() - anchorAt >= s_traceAnchor)
+                                 : s_traceBank1 >= 0.0
                                      ? (bank1At >= 0.0 && ps2host::timeSeconds() - bank1At >= s_traceBank1)
                                      : (s_traceSec <= 0.0 ||
                                         std::chrono::duration<double>(std::chrono::steady_clock::now() - s_firstDraw).count() >= s_traceSec);
-        if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk && !pending.empty())
+        // PS2X_GS_TRACE_TBP=<tbp>: only draws sampling that texture address count (e.g. a locked env map).
+        static const long s_traceTbp = std::getenv("PS2X_GS_TRACE_TBP") ? std::atol(std::getenv("PS2X_GS_TRACE_TBP")) : -1;
+        const bool traceTexOk = s_traceTbp < 0 || (pendingState.prim.tme && static_cast<long>(pendingState.context.tex0.tbp0) == s_traceTbp);
+        if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk && traceTexOk && !pending.empty())
         {
             if (s_traced == 0)
                 std::printf("[gs-trace] start at frame %llu\n", static_cast<unsigned long long>(frameCounter));

@@ -1766,6 +1766,8 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+// Time of the first call of PS2X_TRACE_ANCHOR_PC (-1 until then); see dispatchGuestBranch.
+std::atomic<double> g_ps2xTraceAnchorAt{-1.0};
 #if defined(PS2X_NATIVE_HOST)
 namespace ps2host
 {
@@ -1793,6 +1795,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         g_dbgRdram = rdram;
         ps2RecordBranch(sourcePc, targetPc, GPR_U32(ctx, 31), GPR_U32(ctx, 29));
         // PS2X_AUTOINPUT "@t:BUTTON" entries count from the first call of PS2X_AUTOINPUT_ANCHOR.
+        // PS2X_TRACE_ANCHOR_PC=<hex pc>: the first call stamps g_ps2xTraceAnchorAt, which
+        // PS2X_GS_TRACE_ANCHOR=<sec> / PS2X_RAM_DUMP_ANCHOR=<sec> windows count from.
+        static const uint32_t s_traceAnchorPc = std::getenv("PS2X_TRACE_ANCHOR_PC") ? static_cast<uint32_t>(std::strtoul(std::getenv("PS2X_TRACE_ANCHOR_PC"), nullptr, 16)) : 0u;
+        if (s_traceAnchorPc != 0u && targetPc == s_traceAnchorPc && g_ps2xTraceAnchorAt.load() < 0.0)
+        {
+            g_ps2xTraceAnchorAt.store(ps2host::timeSeconds());
+            std::printf("[trace-anchor] %08x first call at t=%.1f\n", targetPc, ps2host::timeSeconds());
+        }
         if (ps2host::g_autoAnchorPc != 0u || ps2host::g_autoWatchN != 0)
         {
             static int s_anchorHits = 0;
@@ -3221,8 +3231,12 @@ void PS2Runtime::run()
                     static const double s_bank1 = std::getenv("PS2X_RAM_DUMP_BANK1") ? std::atof(std::getenv("PS2X_RAM_DUMP_BANK1")) : -1.0;
                     extern std::atomic<double> g_ps2xBank1LoadedAt;
                     const double bank1At = g_ps2xBank1LoadedAt.load();
-                    const bool due = s_bank1 >= 0.0 ? (bank1At >= 0.0 && ps2host::timeSeconds() - bank1At >= s_bank1)
-                                                    : ps2host::timeSeconds() >= s_from;
+                    // PS2X_RAM_DUMP_ANCHOR=<sec>: count from the first call of PS2X_TRACE_ANCHOR_PC instead.
+                    static const double s_anch = std::getenv("PS2X_RAM_DUMP_ANCHOR") ? std::atof(std::getenv("PS2X_RAM_DUMP_ANCHOR")) : -1.0;
+                    const double anchAt = g_ps2xTraceAnchorAt.load();
+                    const bool due = s_anch >= 0.0    ? (anchAt >= 0.0 && ps2host::timeSeconds() - anchAt >= s_anch)
+                                     : s_bank1 >= 0.0 ? (bank1At >= 0.0 && ps2host::timeSeconds() - bank1At >= s_bank1)
+                                                      : ps2host::timeSeconds() >= s_from;
                     if (s_left > 0 && due)
                     {
                         --s_left;
