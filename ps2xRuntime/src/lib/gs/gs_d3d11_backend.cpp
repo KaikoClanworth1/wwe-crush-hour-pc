@@ -1,6 +1,8 @@
 ﻿#include "runtime/gs/gs_d3d11_backend.h"
 #include "runtime/ps2_prof.h"
 #include "runtime/gs/ps2_gs_common.h"
+#include "runtime/gs/ps2_gs_psmct16.h"
+#include "runtime/gs/ps2_gs_psmct32.h"
 #include "host/win32_host.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 extern thread_local GifPathId g_gifCurrentPath;
@@ -80,6 +82,44 @@ namespace
     }
 
     bool spansOverlap(uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) { return a0 <= b1 && b0 <= a1; }
+
+    // Highest block index (0-31, within its page) a transfer rectangle touches, for the 16/32-bit formats whose
+    // block tables we have; 31 (whole page) for anything else or when the rectangle leaves its first page.
+    uint32_t maxBlockInRect(uint8_t psm, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
+    {
+        uint32_t bwPx, bhPx, cols, rows;
+        const uint8_t *table = nullptr;
+        if (psm == 2u || psm == 10u)
+        {
+            bwPx = 16u; bhPx = 8u; cols = 4u; rows = 8u;
+            table = psm == 2u ? &GSPSMCT16::blockTable16[0][0] : &GSPSMCT16::blockTable16S[0][0];
+        }
+        else if (psm == 0u || psm == 1u)
+        {
+            bwPx = 8u; bhPx = 8u; cols = 8u; rows = 4u;
+            table = &GSPSMCT32::blockTable32[0][0];
+        }
+        else
+            return 31u;
+        const uint32_t pw = bwPx * cols, ph = bhPx * rows;
+        if (w == 0u || h == 0u || x0 + w > pw || y0 + h > ph)
+            return 31u;
+        uint32_t best = 0u;
+        for (uint32_t r = y0 / bhPx; r <= (y0 + h - 1u) / bhPx; ++r)
+            for (uint32_t c = x0 / bwPx; c <= (x0 + w - 1u) / bwPx; ++c)
+                best = std::max<uint32_t>(best, table[r * cols + c]);
+        return best;
+    }
+
+    // pageSpan for a transfer rectangle: an unaligned base only spills into the following page when the
+    // rectangle's blocks actually reach it (RenderWare packs small textures right before render targets).
+    void pageSpanRect(uint32_t baseBlock, uint32_t bw, uint8_t psm, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h,
+                      uint32_t &first, uint32_t &last)
+    {
+        pageSpan(baseBlock, bw, psm, y0, h, first, last);
+        if ((baseBlock & 31u) && last > first && (baseBlock & 31u) + maxBlockInRect(psm, x0, y0, w, h) < 32u)
+            last -= 1u; // pageSpan's unconditional spill page is not reached
+    }
 
     uint32_t expand16(uint32_t c, const GSTexaReg &texa, bool applyTexa)
     {
@@ -414,6 +454,7 @@ struct GSD3D11Backend::Impl
         ComPtr<ID3D11ShaderResourceView> srv;
         bool gpuDirty = false;
         bool needsUpload = false;
+        bool skipNextSync = false; // the pending upload replaces this target's dirty rows: no readback
         // Native rows whose VRAM contents changed since the last upload (inclusive).
         uint32_t upY0 = 0xFFFFFFFFu, upY1 = 0u;
         // Native pixel rows written on the GPU since the last sync (inclusive range).
@@ -475,7 +516,7 @@ struct GSD3D11Backend::Impl
     // Page span of the host->local transfer in progress (pixel data arrives after BeginTransfer).
     uint32_t uploadFirst = 1u, uploadLast = 0u;
     uint64_t statNativeDraws = 0;
-    uint64_t statDraws = 0, statSyncs = 0, statUploads = 0, statTexDecodes = 0, statTexContentHits = 0;
+    uint64_t statDraws = 0, statSyncs = 0, statUploads = 0, statTexDecodes = 0, statTexContentHits = 0, statSkippedSyncs = 0;
     const bool statsEnabled = std::getenv("PS2X_GS_STATS") != nullptr;
     std::unordered_map<uint64_t, uint32_t> decodeHist; // PS2X_GS_STATS: decodes per tbp/psm/size since last report
     std::vector<uint32_t> rawScratch;                  // decodedTexture: raw texels of the texture being looked up
@@ -731,8 +772,8 @@ struct GSD3D11Backend::Impl
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - s_logBoot).count() >= s_logSec)
             {
                 ++s_logged;
-                std::printf("[sync] reason=%s fbp=%u psm=%u %ux%u dirtyRows=%u-%u frame=%llu %s\n", syncReason,
-                            rt.fbpBlock / 32u, rt.psm, rt.w, rt.h, rt.dirtyY0, rt.dirtyY1,
+                std::printf("[sync] reason=%s fbp=%u (block %u) fbw=%u psm=%u %ux%u dirtyRows=%u-%u frame=%llu %s\n", syncReason,
+                            rt.fbpBlock / 32u, rt.fbpBlock, rt.fbw, rt.psm, rt.w, rt.h, rt.dirtyY0, rt.dirtyY1,
                             static_cast<unsigned long long>(frameCounter), syncDetail);
             }
         }
@@ -806,6 +847,11 @@ struct GSD3D11Backend::Impl
     {
         for (auto &rt : rts)
         {
+            if (rt.skipNextSync)
+            {
+                rt.skipNextSync = false; // BeginTransfer: this upload rewrites the rows it would read back
+                continue;
+            }
             if (!rt.gpuDirty)
                 continue;
             uint32_t a, b;
@@ -986,7 +1032,7 @@ struct GSD3D11Backend::Impl
             pageSpan(tex0.cbp, 1, tex0.cpsm, 0, 16, first, last);
         syncReason = "clut";
         if (syncLogEnabled)
-            std::snprintf(syncDetail, sizeof(syncDetail), "cbp=%u cpsm=%u csm=%u tex psm=%u tbp=%u pages=%u-%u", tex0.cbp, tex0.cpsm,
+            if (syncLogEnabled) std::snprintf(syncDetail, sizeof(syncDetail), "cbp=%u cpsm=%u csm=%u tex psm=%u tbp=%u pages=%u-%u", tex0.cbp, tex0.cpsm,
                           tex0.csm, tex0.psm, tex0.tbp0, first, last);
         syncOverlapping(first, last);
         syncDetail[0] = 0;
@@ -1088,7 +1134,7 @@ struct GSD3D11Backend::Impl
         pageSpan(t.tbp0, t.tbw, t.psm, 0, th, first, last);
         syncReason = "texture";
         if (syncLogEnabled)
-            std::snprintf(syncDetail, sizeof(syncDetail), "tbp=%u tbw=%u psm=%u %ux%u pages=%u-%u", t.tbp0, t.tbw, t.psm, tw, th,
+            if (syncLogEnabled) std::snprintf(syncDetail, sizeof(syncDetail), "tbp=%u tbw=%u psm=%u %ux%u pages=%u-%u", t.tbp0, t.tbw, t.psm, tw, th,
                           first, last);
         syncOverlapping(first, last);
         syncDetail[0] = 0;
@@ -2375,8 +2421,8 @@ void GSD3D11Backend::BeginTransfer(const GSTransferCommand &command)
     const auto &tp = command.trxpos;
     const auto &tr = command.trxreg;
     uint32_t sf = 0, sl = 0, df = 0, dl = 0;
-    pageSpan(bb.dbp, bb.dbw, bb.dpsm, tp.dsay, tr.rrh, df, dl);
-    pageSpan(bb.sbp, bb.sbw, bb.spsm, tp.ssay, tr.rrh, sf, sl);
+    pageSpanRect(bb.dbp, bb.dbw, bb.dpsm, tp.dsax, tp.dsay, tr.rrw, tr.rrh, df, dl);
+    pageSpanRect(bb.sbp, bb.sbw, bb.spsm, tp.ssax, tp.ssay, tr.rrw, tr.rrh, sf, sl);
     {
         static int s_xferTrace = std::getenv("PS2X_XFER_TRACE") ? std::atoi(std::getenv("PS2X_XFER_TRACE")) : 0;
         if (s_xferTrace > 0)
@@ -2400,10 +2446,43 @@ void GSD3D11Backend::BeginTransfer(const GSTransferCommand &command)
     }
     d.lastUploadDbp = bb.dbp;
     d.syncReason = command.direction == 0u ? "upload" : command.direction == 1u ? "readback" : "copy";
+    if (d.syncLogEnabled)
+        std::snprintf(d.syncDetail, sizeof(d.syncDetail), "xfer dbp=%u dbw=%u dpsm=%u dst=(%u,%u) %ux%u", bb.dbp, bb.dbw, bb.dpsm,
+                      tp.dsax, tp.dsay, tr.rrw, tr.rrh);
     d.uploadFirst = 1u;
     d.uploadLast = 0u;
     if (command.direction == 0u)
     {
+        // An upload that covers every row the GPU wrote in a live render target replaces that content
+        // (RenderWare's texture cache re-uploads an unlocked env-map raster every frame): skip the GPU
+        // readback that syncOverlapping would do just to have the upload overwrite it.
+        // The upload usually arrives as row chunks, so trim the target's GPU-dirty row range by the rows this
+        // chunk rewrites; rows the GPU still owns stay dirty and keep their readback.
+        for (auto &rt : d.rts)
+        {
+            if (!rt.gpuDirty || rt.dirtyY0 == 0xFFFFFFFFu || bb.dbp != rt.fbpBlock || bb.dbw != rt.fbw ||
+                bitsPerPixel(bb.dpsm) != bitsPerPixel(rt.psm) || tp.dsax != 0u || tr.rrw < rt.w || tr.rrh == 0u)
+                continue;
+            const uint32_t y0 = tp.dsay, y1 = tp.dsay + tr.rrh - 1u; // rows this upload replaces (inclusive)
+            if (y0 > rt.dirtyY1 || y1 < rt.dirtyY0)
+                continue; // no overlap with the dirty rows: syncOverlapping skips it anyway
+            if (y0 <= rt.dirtyY0 && y1 >= rt.dirtyY1)
+            {
+                rt.gpuDirty = false;
+                rt.dirtyY0 = 0xFFFFFFFFu;
+                rt.dirtyY1 = 0u;
+                rt.dirtyX0 = 0xFFFFFFFFu;
+                rt.dirtyX1 = 0u;
+            }
+            else if (y0 <= rt.dirtyY0)
+                rt.dirtyY0 = y1 + 1u; // chunk at the top of the dirty range
+            else if (y1 >= rt.dirtyY1)
+                rt.dirtyY1 = y0 - 1u; // chunk at the bottom
+            else
+                continue;              // chunk in the middle: keep the readback
+            rt.skipNextSync = true;
+            ++d.statSkippedSyncs;
+        }
         d.syncOverlapping(df, dl);
         d.invalidateOverlapping(df, dl);
         d.markPagesDirty(df, dl);
@@ -2537,10 +2616,10 @@ PresentationFrame GSD3D11Backend::Present(const GSPresentationRequest &request)
                 ++it;
         }
         if (std::getenv("PS2X_GS_STATS"))
-            std::printf("[gs-d3d11] draws=%llu syncs=%llu uploads=%llu texDecodes=%llu rts=%zu tex=%zu\n",
+            std::printf("[gs-d3d11] draws=%llu syncs=%llu skippedSyncs=%llu uploads=%llu texDecodes=%llu rts=%zu tex=%zu\n",
                         static_cast<unsigned long long>(d.statDraws), static_cast<unsigned long long>(d.statSyncs),
-                        static_cast<unsigned long long>(d.statUploads), static_cast<unsigned long long>(d.statTexDecodes),
-                        d.rts.size(), d.texCache.size());
+                        static_cast<unsigned long long>(d.statSkippedSyncs), static_cast<unsigned long long>(d.statUploads),
+                        static_cast<unsigned long long>(d.statTexDecodes), d.rts.size(), d.texCache.size());
         if (std::getenv("PS2X_GS_STATS"))
         {
             std::printf("[gs-d3d11]   present: %s\n", d.lastPresent);
