@@ -1766,6 +1766,16 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+#if defined(PS2X_NATIVE_HOST)
+namespace ps2host
+{
+    extern uint32_t g_autoAnchorPc;
+    extern int g_autoAnchorCount;
+    extern std::atomic<double> g_autoAnchorAt;
+    extern uint32_t g_autoWatchPc[8];
+    extern int g_autoWatchN;
+}
+#endif
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1782,6 +1792,24 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         extern uint8_t *g_dbgRdram;
         g_dbgRdram = rdram;
         ps2RecordBranch(sourcePc, targetPc, GPR_U32(ctx, 31), GPR_U32(ctx, 29));
+        // PS2X_AUTOINPUT "@t:BUTTON" entries count from the first call of PS2X_AUTOINPUT_ANCHOR.
+        if (ps2host::g_autoAnchorPc != 0u || ps2host::g_autoWatchN != 0)
+        {
+            static int s_anchorHits = 0;
+            if (targetPc == ps2host::g_autoAnchorPc && ps2host::g_autoAnchorAt.load() < 0.0 && ++s_anchorHits >= ps2host::g_autoAnchorCount)
+            {
+                ps2host::g_autoAnchorAt.store(ps2host::timeSeconds());
+                std::printf("[autoinput] anchor %08x hit #%d at t=%.1f\n", targetPc, s_anchorHits, ps2host::timeSeconds());
+            }
+            for (int i = 0; i < ps2host::g_autoWatchN; ++i)
+            {
+                if (targetPc != ps2host::g_autoWatchPc[i])
+                    continue;
+                static int s_left[8] = {40, 40, 40, 40, 40, 40, 40, 40};
+                if (s_left[i]-- > 0)
+                    std::printf("[autoinput] watch %08x call at t=%.1f\n", targetPc, ps2host::timeSeconds());
+            }
+        }
     }
 #endif
 

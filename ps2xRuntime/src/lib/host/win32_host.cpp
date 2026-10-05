@@ -78,6 +78,12 @@ static LONG WINAPI ps2xCrashFilter(EXCEPTION_POINTERS *ep)
 
 namespace ps2host
 {
+    // Anchored auto-input: the dispatcher stamps g_autoAnchorAt when the guest first calls g_autoAnchorPc.
+    uint32_t g_autoAnchorPc = 0;
+    int g_autoAnchorCount = 1;          // PS2X_AUTOINPUT_ANCHOR=<hex pc>[:<n>] = the n-th call
+    std::atomic<double> g_autoAnchorAt{-1.0};
+    uint32_t g_autoWatchPc[8] = {};     // PS2X_AUTOINPUT_WATCH=<hex pc>,... : log call times (finding anchors)
+    int g_autoWatchN = 0;
     namespace
     {
         HostConfig g_config;
@@ -86,8 +92,8 @@ namespace ps2host
         double g_shotInterval = 5.0;    // PS2X_SCREENSHOT_SEC
         double g_nextShot = 0.0;
         int g_shotIndex = 0;
-        struct AutoPress { double t, until; uint16_t button; };
-        std::vector<AutoPress> g_autoPress; // PS2X_AUTOINPUT="12:START,15:CROSS"
+        struct AutoPress { double t, until; uint16_t button; bool anchored; };
+        std::vector<AutoPress> g_autoPress; // PS2X_AUTOINPUT="12:START,15:CROSS,@0.5:RIGHT" ('@' = after the anchor call)
         HWND g_hwnd = nullptr;
         std::atomic<bool> g_quit{false};
         bool g_ready = false;
@@ -617,6 +623,26 @@ float4 ps_main(VsOut i) : SV_Target
                 g_shotInterval = std::max(0.5, std::atof(iv));
             g_nextShot = g_shotInterval;
         }
+        if (const char *an = std::getenv("PS2X_AUTOINPUT_ANCHOR"))
+        {
+            char *endp = nullptr;
+            g_autoAnchorPc = static_cast<uint32_t>(std::strtoul(an, &endp, 16));
+            if (endp && *endp == ':')
+                g_autoAnchorCount = std::max(1, std::atoi(endp + 1));
+        }
+        if (const char *aw = std::getenv("PS2X_AUTOINPUT_WATCH"))
+        {
+            const char *q = aw;
+            while (*q && g_autoWatchN < 8)
+            {
+                char *endp = nullptr;
+                const unsigned long v = std::strtoul(q, &endp, 16);
+                if (endp == q)
+                    break;
+                g_autoWatchPc[g_autoWatchN++] = static_cast<uint32_t>(v);
+                q = (*endp == ',') ? endp + 1 : endp;
+            }
+        }
         if (const char *ai = std::getenv("PS2X_AUTOINPUT"))
         {
             // "seconds:BUTTON" (0.25 s press) or "from-to:BUTTON" (held) entries separated by commas.
@@ -629,7 +655,12 @@ float4 ps_main(VsOut i) : SV_Target
                 size_t colon = item.find(':');
                 if (colon != std::string::npos)
                 {
-                    const std::string when = item.substr(0, colon);
+                    std::string when = item.substr(0, colon);
+                    // "@seconds" entries count from the first guest call of PS2X_AUTOINPUT_ANCHOR=<hex pc>
+                    // (menu timing drifts with load; e.g. anchor OnInitLevelSelect_Tag for the arena chooser).
+                    const bool anchored = !when.empty() && when[0] == '@';
+                    if (anchored)
+                        when.erase(0, 1);
                     const size_t dash = when.find('-', 1);
                     const double t = std::atof(when.c_str());
                     const double until = dash != std::string::npos ? std::atof(when.c_str() + dash + 1) : t + 0.25;
@@ -640,7 +671,7 @@ float4 ps_main(VsOut i) : SV_Target
                         {"LEFT", kBtnLeft}, {"RIGHT", kBtnRight}, {"L1", kBtnL1}, {"R1", kBtnR1}, {"L2", kBtnL2}, {"R2", kBtnR2}};
                     for (const auto &n : names)
                         if (b == n.first)
-                            g_autoPress.push_back({t, until, n.second});
+                            g_autoPress.push_back({t, until, n.second, anchored});
                 }
                 if (end == std::string::npos)
                     break;
@@ -887,9 +918,15 @@ float4 ps_main(VsOut i) : SV_Target
         if (!g_autoPress.empty())
         {
             const double t = nowSeconds();
+            const double anchorAt = g_autoAnchorAt.load();
             for (const auto &ap : g_autoPress)
-                if (t >= ap.t && t < ap.until)
+            {
+                if (ap.anchored && anchorAt < 0.0)
+                    continue;
+                const double rt = ap.anchored ? t - anchorAt : t;
+                if (rt >= ap.t && rt < ap.until)
                     pads[0].buttons |= ap.button;
+            }
         }
         std::lock_guard lock(g_inputMutex);
         // Keyboard drives player 1 (merged with XInput pad 0).
