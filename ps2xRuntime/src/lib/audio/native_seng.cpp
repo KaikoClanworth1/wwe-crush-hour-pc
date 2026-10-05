@@ -1,6 +1,11 @@
 #include "runtime/native_seng.h"
 #include "ps2_runtime.h"
 #include "host/win32_host.h"
+#include <atomic>
+
+// Time the arena sound bank (bank 1) finished loading: a load-independent anchor for the match-start
+// debug windows (PS2X_GS_TRACE_BANK1, PS2X_RAM_DUMP_BANK1). -1 until it happens.
+std::atomic<double> g_ps2xBank1LoadedAt{-1.0};
 
 #include <xaudio2.h>
 
@@ -262,6 +267,8 @@ namespace ps2native
                     s.loop = decodeVag(vbk.data() + off, end - static_cast<size_t>(off), s.pcm) || (flags & 1u);
             }
             std::printf("[seng] loaded bank %u %s (%zu samples)\n", id, n.c_str(), count);
+            if (id == 1u) // arena bank: PS2X_GS_TRACE_BANK1 / PS2X_RAM_DUMP_BANK1 count from here (match-start anchor)
+                g_ps2xBank1LoadedAt.store(ps2host::timeSeconds());
         }
 
         // ------------------------------------------------------------ voices

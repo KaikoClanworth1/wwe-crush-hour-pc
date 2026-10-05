@@ -2047,8 +2047,15 @@ struct GSD3D11Backend::Impl
         // PS2X_GS_TRACE_SEC: start tracing this many seconds after the first draw (frame counts vary per run).
         static const double s_traceSec = std::getenv("PS2X_GS_TRACE_SEC") ? std::atof(std::getenv("PS2X_GS_TRACE_SEC")) : 0.0;
         static const auto s_firstDraw = std::chrono::steady_clock::now();
-        const bool traceTimeOk = s_traceSec <= 0.0 ||
-                                 std::chrono::duration<double>(std::chrono::steady_clock::now() - s_firstDraw).count() >= s_traceSec;
+        // PS2X_GS_TRACE_BANK1=<sec>: start that many seconds after the arena sound bank loaded (match start),
+        // which does not drift with menu/load timing the way wall-clock windows do.
+        static const double s_traceBank1 = std::getenv("PS2X_GS_TRACE_BANK1") ? std::atof(std::getenv("PS2X_GS_TRACE_BANK1")) : -1.0;
+        extern std::atomic<double> g_ps2xBank1LoadedAt;
+        const double bank1At = g_ps2xBank1LoadedAt.load();
+        const bool traceTimeOk = s_traceBank1 >= 0.0
+                                     ? (bank1At >= 0.0 && ps2host::timeSeconds() - bank1At >= s_traceBank1)
+                                     : (s_traceSec <= 0.0 ||
+                                        std::chrono::duration<double>(std::chrono::steady_clock::now() - s_firstDraw).count() >= s_traceSec);
         if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk && !pending.empty())
         {
             if (s_traced == 0)
@@ -2070,6 +2077,15 @@ struct GSD3D11Backend::Impl
                 cmax = std::max({cmax, v.r, v.g, v.b});
             }
             std::printf("[gs-bbox] %.0f,%.0f-%.0f,%.0f col=%.0f..%.0f ", bx0, by0, bx1, by1, cmin, cmax);
+            // PS2X_GS_TRACE_VERTS=1: the first vertices of each traced draw (collapsed vs merely tiny meshes).
+            static const bool s_traceVerts = std::getenv("PS2X_GS_TRACE_VERTS") != nullptr;
+            if (s_traceVerts)
+            {
+                std::printf("[gs-verts]");
+                for (size_t i = 0; i < pending.size() && i < 8; ++i)
+                    std::printf(" (%.2f,%.2f,%.6f)", pending[i].x, pending[i].y, pending[i].z);
+                std::printf(" ");
+            }
             std::printf("[gs-trace] #%llu n=%zu fbp=%u psm=%u fbmsk=%08x tme=%d tex=%u/%u psm=%u %ux%u tfx=%u tcc=%u abe=%d alpha=%llx test=%llx "
                         "sc=%u,%u-%u,%u v0=(%.1f,%.1f z=%.4f rgba=%.0f,%.0f,%.0f,%.0f st=%.3f,%.3f,%.3f) zte=%u ztst=%u zmsk=%d zbp=%u zpsm=%u\n",
                         static_cast<unsigned long long>(statDraws), pending.size(), c.frame.fbp, c.frame.psm, c.frame.fbmsk,

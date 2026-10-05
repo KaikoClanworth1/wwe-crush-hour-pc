@@ -1771,7 +1771,7 @@ namespace ps2host
 {
     extern uint32_t g_autoAnchorPc;
     extern int g_autoAnchorCount;
-    extern std::atomic<double> g_autoAnchorAt;
+    extern std::atomic<double> g_autoAnchorAt[32];
     extern uint32_t g_autoWatchPc[8];
     extern int g_autoWatchN;
 }
@@ -1796,9 +1796,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (ps2host::g_autoAnchorPc != 0u || ps2host::g_autoWatchN != 0)
         {
             static int s_anchorHits = 0;
-            if (targetPc == ps2host::g_autoAnchorPc && ps2host::g_autoAnchorAt.load() < 0.0 && ++s_anchorHits >= ps2host::g_autoAnchorCount)
+            if (targetPc == ps2host::g_autoAnchorPc && s_anchorHits < 32)
             {
-                ps2host::g_autoAnchorAt.store(ps2host::timeSeconds());
+                ps2host::g_autoAnchorAt[s_anchorHits++].store(ps2host::timeSeconds());
                 std::printf("[autoinput] anchor %08x hit #%d at t=%.1f\n", targetPc, s_anchorHits, ps2host::timeSeconds());
             }
             for (int i = 0; i < ps2host::g_autoWatchN; ++i)
@@ -3217,7 +3217,13 @@ void PS2Runtime::run()
                     static const double s_from = std::getenv("PS2X_RAM_DUMP_FROM") ? std::atof(std::getenv("PS2X_RAM_DUMP_FROM")) : 0.0;
                     static int s_left = std::getenv("PS2X_RAM_DUMP_COUNT") ? std::atoi(std::getenv("PS2X_RAM_DUMP_COUNT")) : 8;
                     static int s_n = 0;
-                    if (s_left > 0 && ps2host::timeSeconds() >= s_from)
+                    // PS2X_RAM_DUMP_BANK1=<sec>: count from the arena sound-bank load (match start) instead.
+                    static const double s_bank1 = std::getenv("PS2X_RAM_DUMP_BANK1") ? std::atof(std::getenv("PS2X_RAM_DUMP_BANK1")) : -1.0;
+                    extern std::atomic<double> g_ps2xBank1LoadedAt;
+                    const double bank1At = g_ps2xBank1LoadedAt.load();
+                    const bool due = s_bank1 >= 0.0 ? (bank1At >= 0.0 && ps2host::timeSeconds() - bank1At >= s_bank1)
+                                                    : ps2host::timeSeconds() >= s_from;
+                    if (s_left > 0 && due)
                     {
                         --s_left;
                         char path[512];
