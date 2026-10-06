@@ -3364,6 +3364,18 @@ void PS2Runtime::run()
         {
             extern const EeScheduler *g_hitchScheduler;
             g_hitchScheduler = m_eeScheduler.get();
+            {
+                // PS2X_P3_TRACE_AT=<sec>[,<events>]: arm the PATH3 trace (ps2_memory.cpp) once the clock passes <sec>.
+                static const char *s_p3At = std::getenv("PS2X_P3_TRACE_AT");
+                static bool s_p3Armed = false;
+                if (s_p3At && !s_p3Armed && ps2host::timeSeconds() >= std::atof(s_p3At))
+                {
+                    extern int g_p3Trace;
+                    s_p3Armed = true;
+                    const char *comma = std::strchr(s_p3At, ',');
+                    g_p3Trace = comma ? std::atoi(comma + 1) : 20000;
+                }
+            }
             static const bool s_status = std::getenv("PS2X_STATUS") != nullptr;
             static double s_nextStatus = 0.0;
             if (s_status && ps2host::timeSeconds() >= s_nextStatus)

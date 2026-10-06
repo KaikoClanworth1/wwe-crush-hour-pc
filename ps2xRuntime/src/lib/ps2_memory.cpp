@@ -2340,6 +2340,22 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         }
         if (m_path3Masked)
         {
+            // The GIF channel cannot be kicked again before its previous chain has transferred: packets of an
+            // earlier kick still queued here went to the GS before this one starts. Without this, frames whose
+            // draws release fewer packets than RenderWare queued (natively drawn MatFX env objects) left a few
+            // behind every frame, and the backlog grew without bound -- textures arrived seconds late (garbage
+            // on the Match Type panel). PS2X_P3_KICK_DRAIN=0 keeps them queued.
+            static const bool s_kickDrain = []()
+            {
+                const char *v = std::getenv("PS2X_P3_KICK_DRAIN");
+                return !(v && *v == '0');
+            }();
+            if (s_kickDrain && !m_path3MaskedFifo.empty())
+            {
+                m_path3Masked = false;
+                flushMaskedPath3Packets(false);
+                m_path3Masked = true;
+            }
             // Queue whole GIF packets (tag chains ending in EOP). While masked, the GIF DMA stalls at
             // packet boundaries, and each brief VIF1 MSKPATH3 unmask lets one packet through.
             uint32_t pos = 0u, start = 0u;
@@ -2366,6 +2382,18 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
             }
             if (start < sizeBytes)
                 m_path3MaskedFifo.push_back(ps2TakePath3Buffer(data + start, data + sizeBytes));
+            {
+                // PS2X_P3_DEPTH: masked PATH3 queue depth after every 30th masked GIF kick (one per frame).
+                static const bool s_depth = std::getenv("PS2X_P3_DEPTH") != nullptr;
+                static uint32_t s_kicks = 0;
+                static const auto s_t0 = std::chrono::steady_clock::now();
+                if (s_depth && (++s_kicks % 30u) == 0u)
+                {
+                    std::printf("[p3q] t=%.1f depth=%zu\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count(),
+                                m_path3MaskedFifo.size());
+                    std::fflush(stdout);
+                }
+            }
             return;
         }
         flushMaskedPath3Packets(false);
