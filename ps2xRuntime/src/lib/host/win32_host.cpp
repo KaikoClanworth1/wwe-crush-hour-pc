@@ -580,6 +580,8 @@ float4 ps_main(VsOut i) : SV_Target
         g_config.keepAspect = GetPrivateProfileIntA("Display", "KeepAspect", g_config.keepAspect, iniPath) != 0;
         g_config.widescreen = GetPrivateProfileIntA("Display", "Widescreen", g_config.widescreen, iniPath) != 0;
         g_showFps = GetPrivateProfileIntA("Display", "ShowFPS", g_showFps ? 1 : 0, iniPath) != 0;
+        if (const char *ws = std::getenv("PS2X_WIDESCREEN")) // test override
+            g_config.widescreen = *ws != '0';
         return true;
     }
 

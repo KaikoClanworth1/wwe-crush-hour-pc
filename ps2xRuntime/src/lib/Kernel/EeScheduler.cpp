@@ -2012,11 +2012,17 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                // After a host stall the vblank clock restarts from now: replaying the missed vblanks back to back
+                // ran the game fast-forward for a moment (game logic keeps real time on its own).
+                auto hostBase = scheduled.hostDeadline;
+                const auto hostNow = std::chrono::steady_clock::now();
+                if (hostNow - hostBase > 2 * kVBlankPeriod)
+                    hostBase = hostNow;
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              scheduled.hostDeadline + kVBlankDuration,
+                              hostBase + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                              hostBase + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

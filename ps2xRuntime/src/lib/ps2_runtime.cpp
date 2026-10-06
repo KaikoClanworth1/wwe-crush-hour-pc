@@ -2912,6 +2912,50 @@ extern "C" uint32_t ps2x_frame_vsync_threshold()
     return s_threshold;
 }
 
+// Widescreen=1: the game's screen cameras get a 16:9 view window, called from RwCameraSetViewWindow's entry
+// (tools/patch_widescreen.py). Only calls from the game's camera API (pcpl_set_camera_fov / _width_fov /
+// _aspect_ratio / _view_window, 0x26f740-0x26fa6c) for a camera drawing to a screen-sized camera raster are
+// widened: texture cameras (env maps, the arena screen feed) keep theirs. The 4:3 frame is shown stretched to
+// 16:9, so the picture keeps its proportions and shows more at the sides.
+extern "C" void ps2x_widescreen_view_window(uint8_t *rdram, uint32_t camera, uint32_t viewWindow, uint32_t ra)
+{
+#if defined(PS2X_NATIVE_HOST)
+    static const bool s_on = ps2host::config().widescreen;
+    static const bool s_log = std::getenv("PS2X_WS_LOG") != nullptr;
+    if (!s_on || !rdram)
+        return;
+    if (ra < 0x26f740u || ra >= 0x26fa6cu)
+        return;
+    auto rd32 = [rdram](uint32_t a)
+    {
+        uint32_t v = 0;
+        std::memcpy(&v, rdram + (a & 0x01FFFFFCu), 4);
+        return v;
+    };
+    const uint32_t raster = rd32(camera + 0x60u); // RwCamera::frameBuffer
+    const uint32_t projection = rd32(camera + 0x14u);
+    const uint32_t type = raster ? (rdram[(raster + 0x20u) & 0x01FFFFFFu] & 7u) : 0u; // RwRaster::cType
+    const uint32_t width = raster ? rd32(raster + 0x0Cu) : 0u;
+    float x = 0.0f, y = 0.0f;
+    std::memcpy(&x, rdram + (viewWindow & 0x01FFFFFCu), 4);
+    std::memcpy(&y, rdram + ((viewWindow + 4u) & 0x01FFFFFCu), 4);
+    const bool screen = raster != 0u && type == 2u && width >= 512u; // rwRASTERTYPECAMERA, full screen
+    if (s_log)
+    {
+        static int s_shown = 0;
+        if (s_shown++ < 64)
+            std::printf("[widescreen] camera 0x%x proj %u raster 0x%x type %u width %u view %.3f x %.3f ra 0x%x -> %s\n",
+                        camera, projection, raster, type, width, x, y, ra, screen ? "16:9" : "kept");
+    }
+    if (!screen)
+        return;
+    x *= (16.0f / 9.0f) / (4.0f / 3.0f);
+    std::memcpy(rdram + (viewWindow & 0x01FFFFFCu), &x, 4);
+#else
+    (void)rdram, (void)camera, (void)viewWindow, (void)ra;
+#endif
+}
+
 static void eeWatchStore(const R5900Context *ctx, uint32_t vaddr, uint32_t size, uint64_t lo, uint64_t hi)
 {
     static const long long s_watch = std::getenv("PS2X_EE_WATCH") ? std::strtoll(std::getenv("PS2X_EE_WATCH"), nullptr, 16) : -1;
