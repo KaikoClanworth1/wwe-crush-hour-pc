@@ -2081,6 +2081,22 @@ struct GSD3D11Backend::Impl
 
     void submitNative(const GSDrawState &st, const nrw::MeshJob &job)
     {
+        {
+            static const bool s_log = std::getenv("PS2X_NRW_ENVLOG") != nullptr;
+            static uint64_t s_n = 0, s_nat = 0, s_env = 0;
+            if (s_log)
+            {
+                ++s_n;
+                s_nat += (job.stateFlags & nrw::kStateNative) ? 1u : 0u;
+                s_env += job.envTexture ? 1u : 0u;
+                if ((s_n % 20000u) == 0u)
+                {
+                    std::printf("[nrw-jobs] total=%llu nativeState=%llu env=%llu prepared=%d\n", (unsigned long long)s_n,
+                                (unsigned long long)s_nat, (unsigned long long)s_env, prepareNative(job) ? 1 : 0);
+                    std::fflush(stdout);
+                }
+            }
+        }
         flushPending();
         if (!prepareNative(job))
             return;
@@ -2118,7 +2134,19 @@ struct GSD3D11Backend::Impl
             es.prim.fst = false;
             es.prim.fge = (job.transType & 1u) != 0u;
             es.fogR = es.fogG = es.fogB = 0;
-            rasterTex0(es, job.envTexture);
+            rasterTex0(es, job.envTexture, (job.envFlags & nrw::kEnvRenderTarget) != 0u);
+            static int s_envLog = std::getenv("PS2X_NRW_ENVLOG") ? 40 : 0;
+            if (s_envLog > 0)
+            {
+                --s_envLog;
+                const auto &bc = pendingState.context;
+                std::printf("[nrw-env] obj=%08x rt=%u base fbp=%u fbw=%u psm=%u zbp=%u zmsk=%d sc=%u,%u-%u,%u tex tbp=%u psm=%u %ux%u | env tbp=%u tbw=%u psm=%u %ux%u tfx=%u tcc=%u alpha=%llx coef=%.3f\n",
+                              job.object, job.envFlags, bc.frame.fbp, bc.frame.fbw, bc.frame.psm, bc.zbuf.zbp, bc.zbuf.zmask ? 1 : 0,
+                              bc.scissor.x0, bc.scissor.y0, bc.scissor.x1, bc.scissor.y1, bc.tex0.tbp0, bc.tex0.psm,
+                              pendingState.textureWidth, pendingState.textureHeight, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm,
+                              es.textureWidth, es.textureHeight, c.tex0.tfx, c.tex0.tcc, (unsigned long long)c.alpha, job.envCoef);
+                std::fflush(stdout);
+            }
             if (prepareNative(job))
             {
                 pendingState = es;
@@ -2136,7 +2164,8 @@ struct GSD3D11Backend::Impl
 
     // TEX0 of a native draw from its RenderWare raster (sky raster extension lsb/msb; TBP/CBP are not used, the
     // texture comes from the raster itself via rasterTexture).
-    void rasterTex0(GSDrawState &s, uint32_t texture)
+    // inVram: a camera texture -- keep its VRAM placement (TBP0) so the draw samples its render target.
+    void rasterTex0(GSDrawState &s, uint32_t texture, bool inVram = false)
     {
         const uint8_t *ee = nrw::rdram();
         const uint32_t raster = (ee && texture) ? rd32ee(ee, texture) : 0u;
@@ -2144,7 +2173,7 @@ struct GSD3D11Backend::Impl
             return;
         const uint32_t lsb = rd32ee(ee, raster + 52u + 8u), msb = rd32ee(ee, raster + 52u + 12u);
         GSTex0Reg &t = s.context.tex0;
-        t.tbp0 = 0;
+        t.tbp0 = inVram ? (lsb & 0x3FFFu) : 0u;
         t.tbw = static_cast<uint8_t>((lsb >> 14) & 0x3Fu);
         t.psm = static_cast<uint8_t>((lsb >> 20) & 0x3Fu);
         t.tw = static_cast<uint8_t>((lsb >> 26) & 0xFu);
@@ -2200,7 +2229,9 @@ struct GSD3D11Backend::Impl
             texDims[0] = static_cast<float>(st.textureWidth);
             texDims[1] = static_cast<float>(st.textureHeight);
             // Native-state draws (native node path) always sample their raster texture, never a render target.
-            const bool nativeState = nativeJob && (nativeJob->stateFlags & nrw::kStateNative) != 0u;
+            // (except an env pass whose env raster is a camera texture: that one is a render target).
+            const bool envRt = nativeEnvPass && (nativeJob->envFlags & nrw::kEnvRenderTarget) != 0u;
+            const bool nativeState = nativeJob && (nativeJob->stateFlags & nrw::kStateNative) != 0u && !envRt;
             RenderTarget *srcRt = (!isIndexed(t.psm) && !nativeState) ? findRt(t.tbp0) : nullptr;
             if (!srcRt && !isIndexed(t.psm) && !disableRtSubTex && !nativeState)
             {
@@ -2305,7 +2336,7 @@ struct GSD3D11Backend::Impl
             {
                 uint32_t w = 1, h = 1;
                 texSrv = nullptr;
-                const uint32_t nativeTex = nativeJob ? (nativeEnvPass ? nativeJob->envTexture : nativeJob->texture) : 0u;
+                const uint32_t nativeTex = (nativeJob && !envRt) ? (nativeEnvPass ? nativeJob->envTexture : nativeJob->texture) : 0u;
                 if (nativeTex && rasterTexMode() != 0)
                 {
                     uint32_t rw = 1, rh = 1;

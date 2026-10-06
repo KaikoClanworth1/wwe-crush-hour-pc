@@ -27,10 +27,11 @@ namespace nrw
             bool native; // native node path: constants and GS state below, not VU1 memory / GS registers
             uint64_t gsTest, gsTex1, gsClamp;
             uint32_t geomGen; // bumped whenever the game edited the geometry (vertex buffer cache key)
-            uint32_t envTexture; // G3x Gem env pass (MeshJob::envTexture..)
+            uint32_t envTexture, envFlags; // G3x Gem env pass (MeshJob::envTexture..)
             float envCoef, envR[3], envU[3];
             uint64_t envAlpha, envTex1;
         };
+        uint64_t g_nodeMarkersWritten = 0; // PS2X_NRW_ENVLOG diagnostics
         // Edit generation per RpGeometry: RpGeometryLock marks lockedSinceLastInst, RenderWare re-instances.
         std::unordered_map<uint32_t, uint32_t> g_geomGen;
         // VU1 constants of native node entries, by marker index (a frame's markers are consumed long before
@@ -1205,6 +1206,7 @@ namespace nrw
         // RenderWare DMA manager globals (gp-relative in its code).
         constexpr uint32_t kDmaPktType = 0x48FDECu, kDmaBufTop = 0x48FE08u, kDmaBufData = 0x48FE0Cu;
         constexpr uint32_t kDmaPktPtr = 0x48FE2Cu, kDmaSprInMem = 0x48FE40u, kDmaSprBase = 0x48FE44u;
+        constexpr uint32_t kDmaDirectHdr = 0x48FDF4u; // header tag of an open GIF DIRECT section (back-patched)
     }
 
     namespace
@@ -1385,6 +1387,7 @@ namespace nrw
         const uint32_t idx = g_next.fetch_add(1, std::memory_order_relaxed) & (kTableSize - 1u);
         Entry &e = g_table[idx];
         e.native = false;
+        e.envTexture = 0;
         e.kind = kind;
         e.verts = verts;
         e.normals = normals;
@@ -1480,6 +1483,19 @@ namespace nrw
                 // Which object setup callbacks keep objects on RenderWare's pipeline (finalize CB alongside).
                 static std::unordered_map<uint64_t, uint64_t> s_cbs;
                 static uint64_t s_n = 0;
+                static int s_pipeDumps = 0;
+                if (s_pipeDumps < 6 && !s_cbs.count((static_cast<uint64_t>(setupCB) << 32) | rd32(ee, objPvt + 20u)))
+                {
+                    // First object of each unsupported setup: its group material pipeline (bridge, code array).
+                    ++s_pipeDumps;
+                    const uint32_t gp = rd32(ee, objPvt + 24u), nodes = gp ? rd32(ee, gp + 8u) : 0u;
+                    const uint32_t mp = nodes ? rd32(ee, nodes + 20u) : 0u;
+                    std::printf("[nrw-node-setup-pipe] setup=%08x obj=%08x group=%08x bridge=%08x post=%08x code=%08x codes=%08x,%08x,%08x,%08x\n",
+                                setupCB, object, gp, mp ? rd32(ee, mp + 12u) : 0u, mp ? rd32(ee, mp + 16u) : 0u,
+                                mp ? rd32(ee, mp + 24u) : 0u, mp ? rd32(ee, rd32(ee, mp + 24u)) : 0u,
+                                mp ? rd32(ee, rd32(ee, mp + 24u) + 4u) : 0u, mp ? rd32(ee, rd32(ee, mp + 24u) + 8u) : 0u,
+                                mp ? rd32(ee, rd32(ee, mp + 24u) + 12u) : 0u);
+                }
                 ++s_cbs[(static_cast<uint64_t>(setupCB) << 32) | rd32(ee, objPvt + 20u)];
                 if ((++s_n % 50000u) == 0u)
                 {
@@ -1644,7 +1660,10 @@ namespace nrw
                 };
                 if (!envRaster)
                     return reject(0);
-                if ((ee[(envRaster + 32u) & 0x1FFFFFFu] & 7u) != 4u || !rd32(ee, envRaster + 36u))
+                // A texture raster with its upload chain, or a camera texture (rendered by the GS, sampled from
+                // its render target at the raster's VRAM address).
+                const uint32_t envType = ee[(envRaster + 32u) & 0x1FFFFFFu] & 7u;
+                if (envType != 5u && (envType != 4u || !rd32(ee, envRaster + 36u)))
                     return reject(1);
                 uint32_t envFrame = rd32(ee, fx);
                 if (!envFrame)
@@ -1705,10 +1724,19 @@ namespace nrw
         }
         // Room for one marker qword per mesh in RenderWare's open VIF packet (what its _rwDMAOpenVIFPkt fast
         // path checks before letting a caller write into the same packet).
+        // A VIF packet may have a GIF DIRECT section open (type flag 0x80000000): its header tag at 0x48FDF4 is
+        // back-patched with the section length when the next non-DIRECT writer opens the packet, so anything
+        // appended before that becomes GIF data. Close it first like _rwDMAOpenVIFPkt does (an empty section
+        // gives its reserved header qword back).
+        const uint32_t pktType = rd32(ee, kDmaPktType);
         const uint32_t ptr = rd32(ee, kDmaPktPtr), sprBase = rd32(ee, kDmaSprBase), inMem = rd32(ee, kDmaSprInMem);
+        const bool directOpen = (pktType & 0x80000000u) != 0u;
+        const uint32_t directHdr = directOpen ? rd32(ee, kDmaDirectHdr) : 0u;
+        const uint32_t directQwc = directOpen ? ((((inMem - directHdr) + (ptr - sprBase)) >> 4) - 1u) : 0u;
+        const uint32_t inMemAfter = (directOpen && directQwc == 0u) ? inMem - 16u : inMem;
         const uint32_t need = numMeshes * 16u;
-        if (mode == 1 && ((rd32(ee, kDmaPktType) & 0x7FFFFFFFu) != 0x1101u || (ptr - sprBase) + need > 0x2000u ||
-                          inMem + (ptr - sprBase) + need >= rd32(ee, kDmaBufData)))
+        if (mode == 1 && ((pktType & 0x7FFFFFFFu) != 0x1101u || (directOpen && !directHdr) || (ptr - sprBase) + need > 0x2000u ||
+                          inMemAfter + (ptr - sprBase) + need >= rd32(ee, kDmaBufData)))
         {
             nstat(kNsNoRoom);
             return false;
@@ -1815,11 +1843,14 @@ namespace nrw
                         e.envR[i] = (ltm.r[i][0] * env.r[0][0] + ltm.r[i][1] * env.r[0][1] + ltm.r[i][2] * env.r[0][2]) * q;
                         e.envU[i] = (ltm.r[i][0] * env.r[1][0] + ltm.r[i][1] * env.r[1][1] + ltm.r[i][2] * env.r[1][2]) * q;
                     }
-                    e.envTexture = rd32(ee, fx + 4u);
+                    float coef;
+                    std::memcpy(&coef, ee + ((fx + 8u) & 0x1FFFFFFu), 4);
+                    e.envTexture = coef > 0.0f ? rd32(ee, fx + 4u) : 0u; // coefficient 0: the pass adds nothing
+                    e.envFlags = (e.envTexture && (ee[(rd32(ee, e.envTexture) + 32u) & 0x1FFFFFFu] & 7u) == 5u) ? kEnvRenderTarget : 0u;
                     std::memcpy(&e.envCoef, ee + ((fx + 8u) & 0x1FFFFFFu), 4);
                     const uint32_t fbAlpha = rd32(ee, fx + 12u);
                     e.envAlpha = 0x8000000048ull | (0x20u >> (fbAlpha & 31u));
-                    const uint32_t envExt = rd32(ee, e.envTexture) + rd32(ee, kGp - 0x798Cu);
+                    const uint32_t envExt = (e.envTexture ? rd32(ee, e.envTexture) : 0u) + rd32(ee, kGp - 0x798Cu);
                     const uint64_t kl = ee[(envExt + 20u) & 0x1FFFFFFu] | (static_cast<uint64_t>(ee[(envExt + 21u) & 0x1FFFFFFu]) << 8);
                     e.envTex1 = (tex1 & 0xFFFFF000FFE7FDE3ull) | ((kl & 0xFFFu) << 32) | ee[(envExt + 22u) & 0x1FFFFFFu] |
                                 (((kl >> 12) & 3u) << 19);
@@ -1836,6 +1867,19 @@ namespace nrw
         // which every writer starts with its own tag (openVU1SetupPktNew writes CNT qwc first; bridges write CALL
         // tags), so each marker is a tag too: CNT qwc 0 whose TTE upper half carries MARK 0xC0DE + NOP index --
         // the same qword the bridge hook stores in place of a mesh's CALL.
+        if (directOpen)
+        {
+            if (directQwc != 0u)
+            {
+                // DMA CNT qwc, TTE upper half: VIF NOP + DIRECT qwc.
+                const uint32_t hdrTag[4] = {0x10000000u | directQwc, 0u, 0u, 0x50000000u | directQwc};
+                std::memcpy(ee + (directHdr & 0x1FFFFF0u), hdrTag, 16);
+            }
+            else
+                wr32(ee, kDmaSprInMem, inMemAfter);
+            wr32(ee, kDmaDirectHdr, 0u);
+            wr32(ee, kDmaPktType, pktType & 0x7FFFFFFFu);
+        }
         uint8_t *dst = (ptr & 0xF0000000u) == 0x70000000u ? memory.getScratchpad() + (ptr & 0x3FFFu) : ee + (ptr & 0x1FFFFFFu);
         for (uint32_t i = 0; i < numMeshes; ++i)
         {
@@ -1843,7 +1887,8 @@ namespace nrw
             std::memcpy(dst + i * 16u, w, 16);
         }
         wr32(ee, kDmaPktPtr, ptr + need);
-        wr32(ee, kDmaBufTop, inMem + (ptr - sprBase) + need);
+        wr32(ee, kDmaBufTop, inMemAfter + (ptr - sprBase) + need);
+        g_nodeMarkersWritten += numMeshes;
         nstat(kNsNative);
         return true;
     }
@@ -1889,6 +1934,7 @@ namespace nrw
                 }
                 job.envAlpha = e.envAlpha;
                 job.envTex1 = e.envTex1;
+                job.envFlags = e.envFlags;
             }
         }
         else if (const uint8_t *vu = memory.getVU1Data())
@@ -1917,6 +1963,24 @@ namespace nrw
                             e.code, e.transType, e.primType, flags & 0xFFFFu, e.object, job.vu[vuIndex(1019)][0], job.vu[vuIndex(1019)][1],
                             job.vu[vuIndex(1019)][2], job.vu[vuIndex(1019)][3], light0[0], light0[1], light0[2], light0[3]);
                 std::fflush(stdout);
+            }
+        }
+        {
+            static const bool s_log = std::getenv("PS2X_NRW_ENVLOG") != nullptr;
+            static uint64_t s_m = 0, s_mNative = 0, s_mEnv = 0;
+            if (s_log)
+            {
+                ++s_m;
+                s_mNative += e.native ? 1u : 0u;
+                s_mEnv += e.envTexture ? 1u : 0u;
+                if ((s_m % 20000u) == 0u)
+                {
+                    std::printf("[nrw-markers] total=%llu native=%llu env=%llu nodeMarkersWritten=%llu ptr=%08x spr=%08x inMem=%08x\n",
+                                (unsigned long long)s_m, (unsigned long long)s_mNative, (unsigned long long)s_mEnv,
+                                (unsigned long long)g_nodeMarkersWritten, rd32(g_rdram, kDmaPktPtr), rd32(g_rdram, kDmaSprBase),
+                                rd32(g_rdram, kDmaSprInMem));
+                    std::fflush(stdout);
+                }
             }
         }
         const auto *bytes = reinterpret_cast<const uint8_t *>(&job);

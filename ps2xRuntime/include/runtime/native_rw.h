@@ -59,12 +59,14 @@ namespace nrw
         // TEST 0x50002, CLAMP 0 (repeat), FOGCOL 0, PRIM ABE|TME|IIP (+FGE).
         uint32_t envTexture = 0; // RwTexture, 0 = no env pass
         float envCoef = 0.0f;
-        uint32_t pad4[2]{};
+        uint32_t envFlags = 0;   // kEnvRenderTarget: the env raster is a camera texture (sampled from its GS render target)
+        uint32_t pad4 = 0;
         float envR[4]{}, envU[4]{};
         uint64_t envAlpha = 0, envTex1 = 0;
     };
     static_assert(sizeof(MeshJob) % 16u == 0u, "job must be qword sized");
     constexpr uint32_t kStateNative = 1u;
+    constexpr uint32_t kEnvRenderTarget = 1u;
 
     // Vertex normal i as the packed form the VU1 program gets (x, y, z * 128 as signed bytes, w 0).
     // Sectors store that already; atomic morph targets store RwV3d floats.
