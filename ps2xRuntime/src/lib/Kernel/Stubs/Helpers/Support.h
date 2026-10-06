@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include "runtime/host_file_cache.h"
 
 namespace
 {
@@ -413,6 +414,11 @@ namespace
         }
 
         std::memset(dst, 0, byteCount);
+        if (ps2cache::read(path, offsetBytes, dst, byteCount))
+        {
+            g_lastCdError = 0;
+            return true;
+        }
 
         // Keep a few host files open: streamed reads (movies, audio) hit the same file thousands
         // of times and reopening it per sector dominated frame time.

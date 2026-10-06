@@ -1,3 +1,4 @@
+#include "runtime/host_file_cache.h"
 #include "runtime/native_seng.h"
 #include "ps2_runtime.h"
 #include "host/win32_host.h"
@@ -91,6 +92,15 @@ namespace ps2native
 
         bool readFile(const std::filesystem::path &path, std::vector<uint8_t> &out)
         {
+            // Streams start inside a sound RPC the game waits on: serve them from memory when preloaded.
+            std::error_code error;
+            const uint64_t size = std::filesystem::file_size(path, error);
+            if (!error && size != 0)
+            {
+                out.resize(static_cast<size_t>(size));
+                if (ps2cache::read(path, 0, out.data(), out.size()))
+                    return true;
+            }
             std::ifstream f(path, std::ios::binary);
             if (!f)
                 return false;

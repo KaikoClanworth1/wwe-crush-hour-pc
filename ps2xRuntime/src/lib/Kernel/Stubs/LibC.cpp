@@ -821,6 +821,19 @@ namespace ps2_stubs
             std::string rendered = formatPs2StringWithArgs(rdram, ctx, runtime, formatOwned.c_str(), 2);
             ret = std::fprintf(fp, "%s", rendered.c_str());
         }
+        else if (format_addr != 0)
+        {
+            // The guest's own stdio streams (e.g. Lua error messages to its stderr): show the first few.
+            const std::string rendered = formatPs2StringWithArgs(rdram, ctx, runtime, formatOwned.c_str(), 2);
+            static int s_shown = 0;
+            if (s_shown < 64)
+            {
+                ++s_shown;
+                std::fprintf(stderr, "[guest-fprintf 0x%x] %s", file_handle, rendered.c_str());
+                std::fflush(stderr);
+            }
+            ret = static_cast<int>(rendered.size());
+        }
         else
         {
             std::cerr << "fprintf error: Invalid file handle or format address."

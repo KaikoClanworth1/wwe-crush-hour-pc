@@ -29,6 +29,8 @@
 #include <vector>
 #include <unordered_map>
 
+extern std::atomic<double> g_hitchLastFlip; // ps2_runtime.cpp (PS2X_HITCH_LOG): host time of the last flip
+
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -322,11 +324,22 @@ float4 ps_main(VsOut i) : SV_Target
             D3D11_MAPPED_SUBRESOURCE m{};
             if (FAILED(g_ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m)))
                 return;
+            // Copy the pixels out and write the file on a worker: a 6 MB write to a busy disk under the D3D
+            // lock stalled the GS thread for seconds (test runs only).
+            const uint32_t w = td.Width, h = td.Height;
+            std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * 4u);
+            for (uint32_t y = 0; y < h; ++y)
+                std::memcpy(pixels.data() + static_cast<size_t>(y) * w * 4u,
+                            static_cast<const uint8_t *>(m.pData) + static_cast<size_t>(y) * m.RowPitch, w * 4u);
+            g_ctx->Unmap(staging.Get(), 0);
             char path[512];
             std::snprintf(path, sizeof(path), "%s/shot_%04d.bmp", g_shotDir.c_str(), g_shotIndex++);
-            if (FILE *f = std::fopen(path, "wb"))
+            std::thread([pixels = std::move(pixels), w, h, file = std::string(path)]()
             {
-                const uint32_t w = td.Width, h = td.Height, row = w * 3u, pad = (4u - row % 4u) % 4u;
+                FILE *f = std::fopen(file.c_str(), "wb");
+                if (!f)
+                    return;
+                const uint32_t row = w * 3u, pad = (4u - row % 4u) % 4u;
                 const uint32_t dataSize = (row + pad) * h;
                 BITMAPFILEHEADER fh{};
                 fh.bfType = 0x4D42;
@@ -343,7 +356,7 @@ float4 ps_main(VsOut i) : SV_Target
                 std::vector<uint8_t> line(row + pad, 0);
                 for (int y = static_cast<int>(h) - 1; y >= 0; --y)
                 {
-                    const uint8_t *src = static_cast<const uint8_t *>(m.pData) + static_cast<size_t>(y) * m.RowPitch;
+                    const uint8_t *src = pixels.data() + static_cast<size_t>(y) * w * 4u;
                     for (uint32_t x = 0; x < w; ++x)
                     {
                         line[x * 3 + 0] = src[x * 4 + 2];
@@ -353,8 +366,7 @@ float4 ps_main(VsOut i) : SV_Target
                     std::fwrite(line.data(), 1, line.size(), f);
                 }
                 std::fclose(f);
-            }
-            g_ctx->Unmap(staging.Get(), 0);
+            }).detach();
         }
 
         // 5x7 glyphs (one byte per row, low 5 bits, bit 4 = left column) for the FPS box.
@@ -1065,6 +1077,22 @@ float4 ps_main(VsOut i) : SV_Target
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             while (g_profRun.load())
             {
+                // PS2X_PROFILE_STALL=1 (with PS2X_HITCH_LOG): sample only while no frame has been flipped for 50 ms.
+                static const bool s_stallOnly = std::getenv("PS2X_PROFILE_STALL") != nullptr;
+                if (s_stallOnly)
+                {
+                    const double lastFlip = g_hitchLastFlip.load(std::memory_order_relaxed);
+                    if (lastFlip <= 0.0 || nowSeconds() - lastFlip < 0.05)
+                    {
+                        Sleep(1);
+                        if (std::chrono::steady_clock::now() - lastDump > std::chrono::seconds(5))
+                        {
+                            dump();
+                            lastDump = std::chrono::steady_clock::now();
+                        }
+                        continue;
+                    }
+                }
                 // PS2X_PROFILE_ALL=1 samples every thread of the process (guest threads run on their own
                 // host threads, so the game thread alone mostly shows hand-off waits).
                 static const bool s_all = std::getenv("PS2X_PROFILE_ALL") != nullptr;

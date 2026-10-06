@@ -190,6 +190,10 @@ bool ps2GsThreadDeferFlip(std::function<void()> fn)
 {
     if (t_gsWorker || !ps2GsThreadEnabled())
         return false;
+    // PS2X_HITCH_LOG=1: frames (flip to flip) longer than 25 ms, with how long the EE waited here for the GS worker.
+    static const bool s_hitchLog = std::getenv("PS2X_HITCH_LOG") != nullptr;
+    static auto s_lastFlip = std::chrono::steady_clock::now();
+    const auto t0 = std::chrono::steady_clock::now();
     {
         std::unique_lock lock(g_gsThread.m);
         if (!g_gsThread.started)
@@ -206,6 +210,29 @@ bool ps2GsThreadDeferFlip(std::function<void()> fn)
         g_gsThread.jobs.emplace_back();
     }
     g_gsThread.cv.notify_one();
+    if (s_hitchLog)
+    {
+        extern void ps2HitchSamplerStart();
+        extern void ps2HitchReport(double fromT, double toT);
+        ps2HitchSamplerStart();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double frameMs = std::chrono::duration<double, std::milli>(t1 - s_lastFlip).count();
+        const double waitMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        s_lastFlip = t1;
+        extern std::atomic<double> g_hitchLastFlip;
+        g_hitchLastFlip.store(ps2host::timeSeconds(), std::memory_order_relaxed);
+        if (frameMs > 25.0)
+        {
+            const double now = ps2host::timeSeconds();
+            std::printf("[hitch] t=%.2f frame=%.1f ms (waited for GS worker %.1f ms, queue %zu)\n", now, frameMs,
+                        waitMs, g_gsThread.jobs.size());
+            // PS2X_HITCH_SAMPLE_MS: frames at least this long also list where the EE was (default 45).
+            static const double s_sampleMs = std::getenv("PS2X_HITCH_SAMPLE_MS") ? std::atof(std::getenv("PS2X_HITCH_SAMPLE_MS")) : 45.0;
+            if (frameMs > s_sampleMs)
+                ps2HitchReport(now - frameMs / 1000.0, now);
+            std::fflush(stdout);
+        }
+    }
     return true;
 }
 
@@ -2660,6 +2687,91 @@ namespace
     struct BranchRec { uint32_t source, target, ra, sp; };
     BranchRec g_branchRing[64];
     uint32_t g_branchRingPos = 0;
+
+    // PS2X_HITCH_LOG: the last guest transfer, sampled every millisecond (racy reads; debug only).
+    struct HitchSample { double t; uint32_t source, target, pos; };
+    constexpr uint32_t kHitchSamples = 8192;
+    HitchSample g_hitchSamples[kHitchSamples];
+    std::atomic<uint32_t> g_hitchPos{0};
+}
+const EeScheduler *g_hitchScheduler = nullptr;
+std::atomic<double> g_hitchLastFlip{0.0};
+
+// A stall in progress (no flip for 100 ms): what every guest thread waits on.
+static void ps2HitchDumpThreads(double stallMs)
+{
+    if (!g_hitchScheduler)
+        return;
+    static const char *const kStatus[] = {"run", "ready", "wait", "waitsusp", "susp", "dormant"};
+    static const char *const kWait[] = {"-", "sleep", "sema", "evflag", "vsync", "external", "mpeg"};
+    const EeKernelSnapshot snap = g_hitchScheduler->snapshot();
+    std::printf("[hitch-threads] stall %.0f ms, running thread %d\n", stallMs, snap.runningThreadId);
+    for (const EeThreadSnapshot &t : snap.threads)
+    {
+        if (t.status == EeThreadStatus::Dormant)
+            continue;
+        std::printf("[hitch-threads]   thread %d prio %d %s/%s id %d pc 0x%x ra 0x%x entry 0x%x\n", t.id, t.currentPriority,
+                    kStatus[static_cast<int>(t.status) % 6], kWait[static_cast<int>(t.waitReason) % 7], t.waitId, t.pc, t.ra, t.entry);
+    }
+    for (const EeSemaphoreSnapshot &sm : snap.semaphores)
+        if (sm.waiters)
+            std::printf("[hitch-threads]   sema %d count %d/%d waiters %u\n", sm.id, sm.count, sm.maxCount, sm.waiters);
+    std::fflush(stdout);
+}
+void ps2HitchSamplerStart()
+{
+    static std::once_flag s_once;
+    std::call_once(s_once, []()
+    {
+        std::thread([]()
+        {
+            for (;;)
+            {
+                const uint32_t pos = *reinterpret_cast<volatile uint32_t *>(&g_branchRingPos);
+                const BranchRec r = g_branchRing[(pos - 1u) & 63u];
+                const uint32_t i = g_hitchPos.load(std::memory_order_relaxed);
+                g_hitchSamples[i % kHitchSamples] = {ps2host::timeSeconds(), r.source, r.target, pos};
+                g_hitchPos.store(i + 1u, std::memory_order_release);
+                static double s_dumpedFlip = -1.0;
+                const double lastFlip = g_hitchLastFlip.load(std::memory_order_relaxed);
+                const double stallMs = (ps2host::timeSeconds() - lastFlip) * 1000.0;
+                if (lastFlip > 0.0 && stallMs > 100.0 && s_dumpedFlip != lastFlip)
+                {
+                    s_dumpedFlip = lastFlip;
+                    ps2HitchDumpThreads(stallMs);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }).detach();
+    });
+}
+// Where a long frame went: the most frequent (call site -> target) pairs sampled in [fromT, toT].
+void ps2HitchReport(double fromT, double toT)
+{
+    std::unordered_map<uint64_t, uint32_t> hist;
+    uint32_t total = 0, still = 0, prevPos = 0;
+    const uint32_t end = g_hitchPos.load(std::memory_order_acquire);
+    for (uint32_t k = 1; k < kHitchSamples && k <= end; ++k)
+    {
+        const HitchSample &s = g_hitchSamples[(end - k) % kHitchSamples];
+        if (s.t < fromT)
+            break;
+        if (s.t > toT)
+            continue;
+        ++hist[(static_cast<uint64_t>(s.source) << 32) | s.target];
+        if (total && s.pos == prevPos)
+            ++still; // no guest transfer for 1 ms: host code (I/O, wait) or a call-free loop
+        prevPos = s.pos;
+        ++total;
+    }
+    std::vector<std::pair<uint32_t, uint64_t>> top;
+    for (const auto &[key, n] : hist)
+        top.emplace_back(n, key);
+    std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+    std::printf("[hitch]   %u samples, %u without guest transfers\n", total, still);
+    for (size_t k = 0; k < top.size() && k < 6u; ++k)
+        std::printf("[hitch]   %3u/%u samples: last transfer 0x%x -> 0x%x\n", top[k].first, total,
+                    static_cast<uint32_t>(top[k].second >> 32), static_cast<uint32_t>(top[k].second));
 }
 void ps2RecordBranch(uint32_t source, uint32_t target, uint32_t ra, uint32_t sp)
 {
@@ -3181,6 +3293,8 @@ void PS2Runtime::run()
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
 #if defined(PS2X_NATIVE_HOST)
         {
+            extern const EeScheduler *g_hitchScheduler;
+            g_hitchScheduler = m_eeScheduler.get();
             static const bool s_status = std::getenv("PS2X_STATUS") != nullptr;
             static double s_nextStatus = 0.0;
             if (s_status && ps2host::timeSeconds() >= s_nextStatus)

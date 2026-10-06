@@ -90,6 +90,7 @@ namespace
     // D_STAT channel bits latch while the cause is disabled; the interrupt is raised when the game
     // re-enables it (EnableDmac). Matters once DMA completes asynchronously (PS2X_ASYNC_DMA).
     uint32_t g_latchedDmacCauses = 0u;
+    uint32_t g_latchedIntcCauses = 0u;
     bool g_dmacDispatchNow = false; // delivering a delayed DMAC interrupt (bypass the delay)
 
     // Debug: ring of scheduler events (invocation start/finish, thread switches) dumped when a thread
@@ -157,6 +158,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_enabledIntcMask = 0xFFFFFFFFu;
     m_enabledDmacMask = 0xFFFFFFFFu;
     g_latchedDmacCauses = 0u;
+    g_latchedIntcCauses = 0u;
     m_currentThreadId = 0;
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
@@ -1371,6 +1373,15 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
             g_latchedDmacCauses &= ~(1u << cause);
             dispatchIrq(true, cause);
         }
+        // INTC_STAT stays set while a cause is masked: the interrupt is taken when it is enabled again
+        // (PS2X_INTC_LATCH=1 experiment).
+        static const bool s_intcLatch = std::getenv("PS2X_INTC_LATCH") != nullptr;
+        if (!dmac && enabled && (g_latchedIntcCauses & (1u << cause)) != 0u)
+        {
+            g_latchedIntcCauses &= ~(1u << cause);
+            if (s_intcLatch)
+                dispatchIrq(false, cause);
+        }
     }
     return KE_OK;
 }
@@ -1383,6 +1394,18 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     {
         if (dmac)
             g_latchedDmacCauses |= 1u << cause;
+        else
+        {
+            g_latchedIntcCauses |= 1u << cause;
+            static const bool s_log = std::getenv("PS2X_INTC_LOG") != nullptr;
+            static int s_shown = 0;
+            if (s_log && s_shown < 200)
+            {
+                ++s_shown;
+                std::printf("[intc] cause %u raised while masked (mask 0x%x) at vsync %llu\n", cause, mask,
+                            static_cast<unsigned long long>(m_vsyncTick));
+            }
+        }
         return;
     }
     if (dmac && !g_dmacDispatchNow)

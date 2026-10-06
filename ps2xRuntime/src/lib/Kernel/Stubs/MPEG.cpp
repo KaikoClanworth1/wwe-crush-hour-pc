@@ -2668,7 +2668,16 @@ namespace ps2_stubs
                     playback.nextPictureTickQ32 = currentTickQ32;
                 }
 
-                if (currentTickQ32 < presentationTargetQ32)
+                // A small video is a texture the game polls from its main loop (arena screens, menu backdrops):
+                // on a PS2 sceMpegGetPicture returns at once, so a picture that is not due yet keeps the previous
+                // one instead of blocking the game thread until the movie's next frame (that held the whole game
+                // at the movie's frame rate). Fullscreen movies keep their pacing.
+                static const bool s_textureWait = std::getenv("PS2X_MPEG_TEXTURE_WAIT") != nullptr; // old behaviour
+                const bool textureVideo = static_cast<uint64_t>(std::max(nextFrame.width, 0)) *
+                                              static_cast<uint64_t>(std::max(nextFrame.height, 0)) <= 256u * 256u &&
+                                          playback.picturesServed > 0u && !s_textureWait;
+                const bool keepPrevious = textureVideo && currentTickQ32 < presentationTargetQ32;
+                if (!keepPrevious && currentTickQ32 < presentationTargetQ32)
                 {
                     const uint64_t eligibleTick = (presentationTargetQ32 + kPictureClockOne - 1u) >> 32u;
                     lock.unlock();
@@ -2685,27 +2694,36 @@ namespace ps2_stubs
                         });
                 }
 
-                frame = std::move(playback.decodedFrames.front());
-                playback.decodedFrames.pop_front();
-                playback.width = static_cast<uint32_t>(frame.width);
-                playback.height = static_cast<uint32_t>(frame.height);
-                width = playback.width;
-                height = playback.height;
-                frameCount = playback.picturesServed;
-                playback.picturesServed += 1u;
-                playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
-                playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
-                haveFrame = true;
-                if (g_mpeg_stub_state.pictureTraceCount < 32u)
+                if (keepPrevious)
                 {
-                    PS2_IF_AGRESSIVE_LOGS({
-                        std::cerr << "[MPEG:GetPicture:FRAME] mpeg=0x" << std::hex << mpegAddr
-                                  << std::dec << " generation=" << g_mpeg_stub_state.cdStreamGeneration
-                                  << " frame=" << frameCount
-                                  << " queued=" << playback.decodedFrames.size()
-                                  << " size=" << width << "x" << height << std::endl;
-                    });
-                    ++g_mpeg_stub_state.pictureTraceCount;
+                    width = playback.width;
+                    height = playback.height;
+                    frameCount = playback.picturesServed;
+                }
+                else
+                {
+                    frame = std::move(playback.decodedFrames.front());
+                    playback.decodedFrames.pop_front();
+                    playback.width = static_cast<uint32_t>(frame.width);
+                    playback.height = static_cast<uint32_t>(frame.height);
+                    width = playback.width;
+                    height = playback.height;
+                    frameCount = playback.picturesServed;
+                    playback.picturesServed += 1u;
+                    playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
+                    playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
+                    haveFrame = true;
+                    if (g_mpeg_stub_state.pictureTraceCount < 32u)
+                    {
+                        PS2_IF_AGRESSIVE_LOGS({
+                            std::cerr << "[MPEG:GetPicture:FRAME] mpeg=0x" << std::hex << mpegAddr
+                                      << std::dec << " generation=" << g_mpeg_stub_state.cdStreamGeneration
+                                      << " frame=" << frameCount
+                                      << " queued=" << playback.decodedFrames.size()
+                                      << " size=" << width << "x" << height << std::endl;
+                        });
+                        ++g_mpeg_stub_state.pictureTraceCount;
+                    }
                 }
             }
             else

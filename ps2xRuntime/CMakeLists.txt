@@ -14,7 +14,7 @@ option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" ON)
 option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" ON)
 option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
-option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
+option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" OFF)
 option(PS2X_ENABLE_DEBUG_UI "Build the desktop runtime debug UI" ON)
 
 if(PS2X_ENABLE_SCCACHE)
@@ -387,6 +387,7 @@ endfunction()
 
 add_library(ps2_runtime STATIC
     src/lib/game_overrides.cpp
+    src/lib/host_file_cache.cpp
     src/lib/gs/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
@@ -608,7 +609,11 @@ endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_runtime)
     EnableFastReleaseMode(ps2EntryRunner)
+endif()
 
+# No console window in Release (the multi-config Visual Studio generator leaves CMAKE_BUILD_TYPE empty, so this
+# must not sit under the check above). Tests that capture stdout still work: redirected handles are inherited.
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo" OR CMAKE_CONFIGURATION_TYPES)
     if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
         if(MSVC)
             target_link_options(ps2EntryRunner PRIVATE
