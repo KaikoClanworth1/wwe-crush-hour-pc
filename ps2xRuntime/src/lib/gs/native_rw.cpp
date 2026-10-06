@@ -8,6 +8,7 @@
 #include <vector>
 #include <unordered_map>
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +16,9 @@
 
 bool ps2GsThreadEnabled();                                         // ps2_runtime.cpp
 void ps2GsThreadSubmit(GS &gs, const uint8_t *data, uint32_t size); // ps2_runtime.cpp
+extern int g_p3Trace;                                               // ps2_memory.cpp
+bool ps2vu1nRunPrivate(const uint8_t *image, uint64_t key, uint8_t *data, uint32_t pc, // vu1_native_glue.cpp
+                       void (*onKick)(void *user, const uint8_t *packet, uint32_t bytes), void *user);
 
 namespace nrw
 {
@@ -1248,6 +1252,21 @@ namespace nrw
             uint32_t pktType = 0, ptr = 0, sprBase = 0, inMem = 0, directHdr = 0, directQwc = 0, inMemAfter = 0;
             bool directOpen = false;
         };
+        // Native jobs that sample their texture from VRAM (RwIm3D / ISO / Im2D: GS state from the registers) also get
+        // the PATH3 release their RenderWare packet would have carried: masked GIF texture uploads are released one per
+        // MSKPATH3 unmask, and every RenderWare batch releases the upload queued for its own draw. Without it the
+        // native draw sampled VRAM before its texture arrived once no RenderWare batch happened to sit in between
+        // (native ISO + native MatFX Gem: the Match Type panel's sprites). PS2X_NRW_P3RELEASE=0 turns it off.
+        bool path3Release()
+        {
+            static const bool s_on = []()
+            {
+                const char *v = std::getenv("PS2X_NRW_P3RELEASE");
+                return !(v && *v == '0');
+            }();
+            return s_on;
+        }
+
         bool reserveMarkers(const uint8_t *ee, uint32_t n, MarkerSlot &m)
         {
             m.pktType = rd32(ee, kDmaPktType);
@@ -1267,7 +1286,8 @@ namespace nrw
         // chain in which every writer starts with its own tag (openVU1SetupPktNew writes CNT qwc first; bridges write
         // CALL tags), so each marker is a tag too: CNT qwc 0 whose TTE upper half carries MARK 0xC0DE + NOP index --
         // the same qword the bridge hook stores in place of a mesh's CALL.
-        void writeMarkers(uint8_t *ee, PS2Memory &memory, const MarkerSlot &m, const uint32_t *idxs, uint32_t n)
+        void writeMarkers(uint8_t *ee, PS2Memory &memory, const MarkerSlot &m, const uint32_t *idxs, uint32_t n,
+                          bool releasePath3 = false)
         {
             if (m.directOpen)
             {
@@ -1283,25 +1303,34 @@ namespace nrw
                 wr32(ee, kDmaPktType, m.pktType & 0x7FFFFFFFu);
             }
             uint8_t *dst = (m.ptr & 0xF0000000u) == 0x70000000u ? memory.getScratchpad() + (m.ptr & 0x3FFFu) : ee + (m.ptr & 0x1FFFFFFu);
-            for (uint32_t i = 0; i < n; ++i)
+            uint32_t q = 0;
+            if (releasePath3)
+            {
+                // DMA CNT qwc 0, TTE: MSKPATH3 0 (unmask: release one masked upload), MSKPATH3 1 (mask again).
+                const uint32_t w[4] = {0x10000000u, 0u, 0x06000000u, 0x06008000u};
+                std::memcpy(dst, w, 16);
+                q = 1;
+            }
+            for (uint32_t i = 0; i < n; ++i, ++q)
             {
                 const uint32_t w[4] = {0x10000000u, 0u, 0x07000000u | kMarkerMark, idxs[i] & 0xFFFFu};
-                std::memcpy(dst + i * 16u, w, 16);
+                std::memcpy(dst + q * 16u, w, 16);
             }
-            wr32(ee, kDmaPktPtr, m.ptr + n * 16u);
-            wr32(ee, kDmaBufTop, m.inMemAfter + (m.ptr - m.sprBase) + n * 16u);
+            wr32(ee, kDmaPktPtr, m.ptr + q * 16u);
+            wr32(ee, kDmaBufTop, m.inMemAfter + (m.ptr - m.sprBase) + q * 16u);
             g_nodeMarkersWritten += n;
         }
 
         // Ring of transient vertex data snapshotted on the EE side (RwIm3D vertices live in the game's buffers only
         // until the call returns); consumed by the GS side in stream order, long before the ring wraps.
         constexpr uint32_t kRingSize = 32u << 20;
+        constexpr uint32_t kEeRingSize = kRingSize - (8u << 20); // the top 8 MB: marker-side allocations (PGen)
         std::vector<uint8_t> g_ring(kRingSize);
         uint32_t g_ringPos = 0;
         uint32_t ringAlloc(uint32_t bytes)
         {
             bytes = (bytes + 15u) & ~15u;
-            if (g_ringPos + bytes > kRingSize)
+            if (g_ringPos + bytes > kEeRingSize)
                 g_ringPos = 0;
             const uint32_t at = g_ringPos;
             g_ringPos += bytes;
@@ -1638,8 +1667,8 @@ namespace nrw
     {
         static const char *s_mode = []()
         {
-            const char *v = std::getenv("PS2X_NRW_IM2D"); // =1: native (off by default: same PATH3 pairing risk as G3 Gem)
-            return v ? v : "0";
+            const char *v = std::getenv("PS2X_NRW_IM2D"); // default native; =0: RenderWare's Im2D VU1 program; =log
+            return v ? v : "1";
         }();
         if (!ee || !verts)
             return false;
@@ -1698,7 +1727,7 @@ namespace nrw
             if (v >= numVerts)
                 return false;
         MarkerSlot slot;
-        if (!reserveMarkers(ee, 1u, slot))
+        if (!reserveMarkers(ee, 2u, slot)) // marker + PATH3 release
         {
             static uint64_t s_noRoom = 0;
             if (std::getenv("PS2X_NRW_STATS") && (++s_noRoom % 2000u) == 1u)
@@ -1761,7 +1790,7 @@ namespace nrw
         std::memset(vu, 0, sizeof(float) * 4u * kVuQwCount);
         const uint64_t tag = 0x8000ull | (1ull << 46) | ((3ull | (skyPrim & 0x6F8ull)) << 47); // EOP, PRE, TRIANGLE (FST 0)
         std::memcpy(vu[vuIndex(1018)], &tag, 8);
-        writeMarkers(ee, memory, slot, &idx, 1u);
+        writeMarkers(ee, memory, slot, &idx, 1u, path3Release());
         return true;
     }
 
@@ -1837,7 +1866,7 @@ namespace nrw
             return false;
         }
         MarkerSlot slot;
-        if (!reserveMarkers(ee, 1u, slot))
+        if (!reserveMarkers(ee, 2u, slot)) // marker + PATH3 release
         {
             nstat(kNsNoRoom);
             return false;
@@ -1929,12 +1958,495 @@ namespace nrw
         e.ringIndices = iAt;
         e.numIndices = numIndices;
         std::memcpy(g_nativeVu[idx & (kNativeVuRing - 1u)], ex.vu, sizeof(ex.vu));
-        writeMarkers(ee, memory, slot, &idx, 1u);
+        writeMarkers(ee, memory, slot, &idx, 1u, path3Release());
         nstat(kNsNative);
         return true;
     }
 
     const uint8_t *ring() { return g_ring.data(); }
+
+    // ---- Game particles (PGen) ------------------------------------------------------------------------------------
+    // The game's particle generators ("_$VUCCode_particleGenerator*": Sprite, Streak, Instanced and their 2Cam split-
+    // screen versions) are VU C programs that age, place, colour and expand every particle from the effect's parameter
+    // block and its emitter history, then kick 20 triangles per batch. Natively, the inputs RenderWare's PS2All
+    // pipeline would upload are gathered from the game's own structures, the game's particle program runs as compiled
+    // x64 code against a private data memory (ps2vu1nRunPrivate: no VIF, no VU1, nothing reaches the GS), and its
+    // triangles are drawn as one D3D11 job with the texture decoded from the raster. Variants without compiled code
+    // (2Cam) stay on RenderWare. PS2X_NRW_PGEN=0: all particles on RenderWare; =verify: RenderWare draws, and every
+    // run is repeated natively and compared (inputs and kicked triangles, [nrw-pgen] lines).
+    //
+    // Timing: the bridge copies the parameter block (and RenderWare the object constants) into its packet, but the
+    // emitter history is only referenced, so the VU saw it as the DMA read it -- after the game wrote this frame's
+    // newest entry. The node path therefore snapshots params and constants at render time and runs the program when
+    // the VIF reaches the marker (marker()), reading the history then.
+    int pgenMode()
+    {
+        static const int s_mode = []()
+        {
+            const char *v = std::getenv("PS2X_NRW_PGEN");
+            if (v && std::strcmp(v, "verify") == 0)
+                return 2;
+            return (v && *v == '0') ? 0 : 1;
+        }();
+        return s_mode;
+    }
+
+    namespace
+    {
+        constexpr uint32_t kPGenCodeArray = 0x402980u;    // PGen's VU1 code array (Sprite, Streak, Instanced, 2Cam x3)
+        constexpr uint32_t kPGenPluginOffset = 0x4B5C68u; // RpAtomic plugin offset of the PGen data
+        constexpr uint32_t kPGenBridge = 0x296FB0u;       // PGenBridgeCallback (the material pipeline's bridge)
+        constexpr uint32_t kPGenEntry = 0x80000000u;      // Entry.code flag: a PGen job (index in the low bits)
+
+        // A variant as its code-array DMA chain uploads it (one RET tag, VIF codes inline): the micro image (MPG) and
+        // the initial data memory (STCYCL 4/4 + UNPACK V4-32: constants, the output GIF tag at 270, UV frame tables).
+        struct PGenProgram
+        {
+            bool tried = false, ok = false;
+            uint64_t key = 0;
+            std::vector<uint8_t> image, data;
+            std::vector<uint16_t> uploaded; // data qwords the chain writes
+        };
+
+        const PGenProgram *pgenProgram(const uint8_t *ee, uint32_t variant)
+        {
+            static PGenProgram s_prog[6];
+            PGenProgram &p = s_prog[variant % 6u];
+            if (p.tried)
+                return p.ok ? &p : nullptr;
+            p.tried = true;
+            const uint32_t chain = rd32(ee, kPGenCodeArray + (variant % 6u) * 4u);
+            if (!chain)
+                return nullptr;
+            const uint32_t qwc = static_cast<uint32_t>(rd64(ee, chain) & 0xFFFFu);
+            p.image.assign(0x4000, 0);
+            p.data.assign(0x4000, 0);
+            uint32_t pos = chain + 8u;
+            const uint32_t end = chain + 16u + qwc * 16u;
+            bool mpg = false;
+            while (pos + 4u <= end)
+            {
+                const uint32_t code = rd32(ee, pos), cmd = (code >> 24) & 0x7Fu;
+                uint32_t num = (code >> 16) & 0xFFu;
+                if (cmd == 0x4Au) // MPG
+                {
+                    num = num ? num : 256u;
+                    const uint32_t at = (code & 0xFFFFu) * 8u;
+                    if (at + num * 8u > 0x4000u)
+                        return nullptr;
+                    std::memcpy(p.image.data() + at, ee + ((pos + 4u) & 0x1FFFFFFu), num * 8u);
+                    pos += 4u + num * 8u;
+                    mpg = true;
+                }
+                else if (cmd == 0x6Cu && !(code & 0x8000u)) // UNPACK V4-32 to an absolute address
+                {
+                    num = num ? num : 256u;
+                    const uint32_t at = code & 0x3FFu;
+                    if (at + num > 1024u)
+                        return nullptr;
+                    std::memcpy(p.data.data() + at * 16u, ee + ((pos + 4u) & 0x1FFFFFFu), num * 16u);
+                    for (uint32_t k = 0; k < num; ++k)
+                        p.uploaded.push_back(static_cast<uint16_t>(at + k));
+                    pos += 4u + num * 16u;
+                }
+                else if (cmd == 0x00u || (cmd == 0x01u && (code & 0xFFFFu) == 0x0404u)) // NOP, STCYCL 4/4
+                    pos += 4u;
+                else
+                    return nullptr;
+            }
+            uint32_t w0;
+            std::memcpy(&w0, p.image.data(), 4);
+            if (!mpg || w0 != 0x100E03D4u) // the PGen start stub: iaddiu vi14, vi00, 0x3d4
+                return nullptr;
+            uint64_t h = 1469598103934665603ull;
+            for (uint8_t b : p.image)
+                h = (h ^ b) * 1099511628211ull;
+            p.key = h ^ 0x5047454E00000000ull;
+            p.ok = true;
+            return &p;
+        }
+
+        // Render-time snapshot of one effect: what RenderWare copies into its packet, and where the history lives.
+        struct PGenJob
+        {
+            const PGenProgram *prog = nullptr;
+            uint32_t variant = 0, numVerts = 0, atomic = 0;
+            uint32_t cl[3] = {};            // emitter history clusters (V4-32): position, direction, velocity
+            uint8_t params[24 * 16];        // PGenUploadParameterBlock -> VU1 984..1007
+            uint8_t cam[11 * 16];           // object constants -> VU1 1008..1018
+            uint32_t camMask = 0;           // bit i: 1008 + i computed
+        };
+        constexpr uint32_t kPGenJobs = 4096u; // ring; consumed at the marker within a frame or two
+        PGenJob g_pgenJobs[kPGenJobs];
+        uint32_t g_pgenJobNext = 0;
+
+        // Marker-side vertex ring (the top of g_ring, VIF thread only; the EE side allocates below it).
+        uint32_t g_markerRingPos = 0;
+        uint32_t markerRingAlloc(uint32_t bytes)
+        {
+            bytes = (bytes + 15u) & ~15u;
+            if (g_markerRingPos < kEeRingSize || g_markerRingPos + bytes > kRingSize)
+                g_markerRingPos = kEeRingSize;
+            const uint32_t at = g_markerRingPos;
+            g_markerRingPos += bytes;
+            return at;
+        }
+
+        struct PGenOut
+        {
+            std::vector<Im2DVertex> verts;
+            std::vector<uint8_t> raw; // kicked packets (verify)
+            uint64_t tag = 0;
+        };
+
+        // Kicked packets -> vertices, decoded like the GS's PACKED mode: ST sets S/T/Q (Q 0 -> 1), RGBAQ the colour,
+        // XYZF2 / XYZ2 kick a vertex (X/Y 12.4 fixed; Z bits 4..27 / the whole 32-bit word; fog unused: FGE is off).
+        void pgenKick(void *user, const uint8_t *pkt, uint32_t bytes)
+        {
+            PGenOut &o = *static_cast<PGenOut *>(user);
+            o.raw.insert(o.raw.end(), pkt, pkt + bytes);
+            float s = 0.0f, t = 0.0f, q = 1.0f;
+            uint8_t rgba[4] = {0, 0, 0, 0};
+            uint32_t p = 0;
+            while (p + 16u <= bytes)
+            {
+                uint64_t lo, hi;
+                std::memcpy(&lo, pkt + p, 8);
+                std::memcpy(&hi, pkt + p + 8, 8);
+                p += 16u;
+                const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu), flg = static_cast<uint32_t>((lo >> 58) & 3u);
+                uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
+                nreg = nreg ? nreg : 16u;
+                if ((lo >> 46) & 1u)
+                    o.tag = lo;
+                if (flg != 0u)
+                {
+                    p += flg == 2u ? nloop * 16u : ((nloop * nreg + 1u) / 2u) * 16u;
+                    continue;
+                }
+                for (uint32_t l = 0; l < nloop; ++l)
+                    for (uint32_t r = 0; r < nreg; ++r)
+                    {
+                        if (p + 16u > bytes)
+                            return;
+                        uint32_t w[4];
+                        std::memcpy(w, pkt + p, 16);
+                        p += 16u;
+                        const uint32_t reg = static_cast<uint32_t>((hi >> (4u * r)) & 0xFu);
+                        if (reg == 2u)
+                        {
+                            std::memcpy(&s, &w[0], 4);
+                            std::memcpy(&t, &w[1], 4);
+                            std::memcpy(&q, &w[2], 4);
+                            if (q == 0.0f)
+                                q = 1.0f;
+                        }
+                        else if (reg == 1u)
+                        {
+                            for (int k = 0; k < 4; ++k)
+                                rgba[k] = static_cast<uint8_t>(w[k] & 0xFFu);
+                        }
+                        else if (reg == 4u || reg == 5u) // XYZF2 (the particle programs' choice) / XYZ2
+                        {
+                            Im2DVertex v;
+                            v.x = static_cast<float>(w[0] & 0xFFFFu) / 16.0f;
+                            v.y = static_cast<float>(w[1] & 0xFFFFu) / 16.0f;
+                            v.z = static_cast<float>(reg == 4u ? (w[2] >> 4) & 0xFFFFFFu : w[2]);
+                            v.s = s;
+                            v.t = t;
+                            v.q = q;
+                            std::memcpy(v.rgba, rgba, 4);
+                            v.pad = 0;
+                            o.verts.push_back(v);
+                        }
+                    }
+                // EOP ends a kick; `pkt` may hold several (verify decodes RenderWare's kicks in one call).
+            }
+        }
+
+        // The program's data memory for a job, with the history as it is in EE memory now, then the program run.
+        alignas(16) uint8_t g_pgenMem[0x4000]; // VIF thread
+        PGenOut g_pgenOut;
+        bool pgenRun(const PGenJob &j)
+        {
+            const uint8_t *ee = g_rdram;
+            if (!ee || !j.prog)
+                return false;
+            std::memcpy(g_pgenMem, j.prog->data.data(), sizeof(g_pgenMem));
+            for (uint32_t i = 0; i < j.numVerts; ++i)
+                for (uint32_t c = 0; c < 3u; ++c)
+                    std::memcpy(g_pgenMem + (3u * i + c) * 16u, ee + ((j.cl[c] + i * 16u) & 0x1FFFFFFu), 16);
+            std::memcpy(g_pgenMem + 984u * 16u, j.params, sizeof(j.params));
+            for (uint32_t i = 0; i < 11u; ++i)
+                if (j.camMask & (1u << i))
+                    std::memcpy(g_pgenMem + (1008u + i) * 16u, j.cam + i * 16u, 16);
+            g_pgenOut.verts.clear();
+            g_pgenOut.raw.clear();
+            g_pgenOut.tag = 0;
+            return ::ps2vu1nRunPrivate(j.prog->image.data(), j.prog->key, g_pgenMem, 0u, pgenKick, &g_pgenOut);
+        }
+
+        // Verify mode: render-time snapshots waiting for RenderWare's run of the same effect (VIF thread).
+        std::mutex g_pgenMx;
+        std::vector<PGenJob> g_pgenExpect;
+    }
+
+    bool pgenVerifyWanted() { return pgenMode() == 2; }
+
+    // VU1 glue (vu1_native_glue.cpp): RenderWare just ran a PGen program on `vuBefore` and kicked `kicks`.
+    void pgenVerifyRun(const uint8_t *vuBefore, const uint8_t *kicks, uint32_t kickBytes)
+    {
+        static uint64_t s_runs = 0, s_unpaired = 0, s_inBad = 0, s_outBad = 0, s_exact = 0, s_variant[6] = {}, s_tris = 0;
+        static int s_shown = 0;
+        PGenJob j;
+        {
+            // This effect's snapshot: same parameter block and object matrix (984..1011). RenderWare also draws
+            // effects the native path declined (no snapshot), so arrival order alone does not pair them.
+            std::lock_guard<std::mutex> lock(g_pgenMx);
+            auto it = std::find_if(g_pgenExpect.begin(), g_pgenExpect.end(), [&](const PGenJob &e)
+                                   { return std::memcmp(e.params, vuBefore + 984u * 16u, sizeof(e.params)) == 0 &&
+                                            std::memcmp(e.cam, vuBefore + 1008u * 16u, 4u * 16u) == 0; });
+            if (it == g_pgenExpect.end())
+            {
+                ++s_unpaired;
+                return;
+            }
+            j = *it;
+            g_pgenExpect.erase(it);
+        }
+        if (!pgenRun(j))
+            return;
+        ++s_runs;
+        ++s_variant[j.variant % 6u];
+        // Inputs: the history clusters, the chain's constants (minus what the program computes before reading:
+        // 729..733 / Streak 633..637, and its output buffers 271..632), params and camera.
+        uint32_t badQw = 0, firstBad = 0xFFFFu;
+        auto check = [&](uint32_t a)
+        {
+            if (std::memcmp(g_pgenMem + a * 16u, vuBefore + a * 16u, 16) != 0)
+            {
+                if (!badQw)
+                    firstBad = a;
+                ++badQw;
+            }
+        };
+        for (uint32_t a = 0; a < 3u * j.numVerts; ++a)
+            check(a);
+        for (uint16_t a : j.prog->uploaded)
+            if (!(a >= 271u && a < 638u) && !(a >= 729u && a < 734u))
+                check(a);
+        for (uint32_t a = 984u; a <= 1017u; ++a)
+            check(a);
+        // Output: what gets drawn -- the vertices both runs decode to (the GS ignores some bits RenderWare's run leaves
+        // with stale memory, e.g. XYZF2 word 3 bits 0..3), and the GIF tag.
+        const std::vector<uint8_t> &raw = g_pgenOut.raw;
+        static PGenOut s_rw;
+        s_rw.verts.clear();
+        s_rw.raw.clear();
+        s_rw.tag = 0;
+        if (kickBytes)
+            pgenKick(&s_rw, kicks, kickBytes);
+        const std::vector<Im2DVertex> &nv = g_pgenOut.verts;
+        const bool outOk = nv.size() == s_rw.verts.size() && g_pgenOut.tag == s_rw.tag &&
+                           (nv.empty() || std::memcmp(nv.data(), s_rw.verts.data(), nv.size() * sizeof(Im2DVertex)) == 0);
+        s_tris += nv.size() / 3u;
+        s_inBad += badQw ? 1u : 0u;
+        s_outBad += outOk ? 0u : 1u;
+        s_exact += (!badQw && outOk) ? 1u : 0u;
+        uint32_t firstOut = 0;
+        while (firstOut < kickBytes && firstOut < raw.size() && raw[firstOut] == kicks[firstOut])
+            ++firstOut;
+        if ((badQw || !outOk) && s_shown < 40)
+        {
+            ++s_shown;
+            std::printf("[nrw-pgen] MISMATCH variant=%u atomic=%08x verts=%u inputs: %u qwords differ (first %u: native %08x %08x %08x %08x "
+                        "rw %08x %08x %08x %08x) kicks: native %zu bytes, rw %u bytes%s\n",
+                        j.variant, j.atomic, j.numVerts, badQw, firstBad, rd32(g_pgenMem, (firstBad & 0x3FFu) * 16u),
+                        rd32(g_pgenMem, (firstBad & 0x3FFu) * 16u + 4u), rd32(g_pgenMem, (firstBad & 0x3FFu) * 16u + 8u),
+                        rd32(g_pgenMem, (firstBad & 0x3FFu) * 16u + 12u), rd32(vuBefore, (firstBad & 0x3FFu) * 16u),
+                        rd32(vuBefore, (firstBad & 0x3FFu) * 16u + 4u), rd32(vuBefore, (firstBad & 0x3FFu) * 16u + 8u),
+                        rd32(vuBefore, (firstBad & 0x3FFu) * 16u + 12u), raw.size(), kickBytes, outOk ? "" : " (triangles differ)");
+            if (!outOk && firstOut + 16u <= kickBytes && firstOut + 16u <= raw.size())
+            {
+                const uint32_t q = firstOut & ~15u;
+                std::printf("[nrw-pgen]   first triangle difference at byte %u (qword %u): native %08x %08x %08x %08x rw %08x %08x %08x %08x\n",
+                            firstOut, q / 16u, rd32(raw.data(), q), rd32(raw.data(), q + 4u), rd32(raw.data(), q + 8u),
+                            rd32(raw.data(), q + 12u), rd32(kicks, q), rd32(kicks, q + 4u), rd32(kicks, q + 8u), rd32(kicks, q + 12u));
+            }
+            std::fflush(stdout);
+        }
+        if ((s_runs % 500u) == 0u)
+        {
+            std::printf("[nrw-pgen] verified %llu runs (%llu triangles; sprite %llu streak %llu instanced %llu, 2cam %llu): %llu exact, "
+                        "inputs differ %llu, triangles differ %llu, unpaired %llu\n",
+                        (unsigned long long)s_runs, (unsigned long long)s_tris, (unsigned long long)s_variant[0],
+                        (unsigned long long)s_variant[1], (unsigned long long)s_variant[2],
+                        (unsigned long long)(s_variant[3] + s_variant[4] + s_variant[5]), (unsigned long long)s_exact,
+                        (unsigned long long)s_inBad, (unsigned long long)s_outBad, (unsigned long long)s_unpaired);
+            std::fflush(stdout);
+        }
+    }
+
+    // marker(): run a PGen job's program now and fill the job's vertices / indices / GIF tag. False: nothing to draw.
+    bool pgenMarker(const Entry &e, MeshJob &job)
+    {
+        const PGenJob &j = g_pgenJobs[e.code & (kPGenJobs - 1u)];
+        if (!pgenRun(j))
+            return false;
+        // Triangles (the padding the program kicks to fill its last batch is degenerate: dropped).
+        static std::vector<uint16_t> tri;
+        tri.clear();
+        const std::vector<Im2DVertex> &v = g_pgenOut.verts;
+        const uint32_t n = std::min<uint32_t>(static_cast<uint32_t>(v.size()) / 3u * 3u, 65535u / 3u * 3u);
+        for (uint32_t i = 0; i < n; i += 3u)
+        {
+            const Im2DVertex &a = v[i], &b = v[i + 1u], &c = v[i + 2u];
+            if ((a.x == b.x && a.y == b.y) || (a.x == c.x && a.y == c.y) || (b.x == c.x && b.y == c.y))
+                continue;
+            tri.insert(tri.end(), {static_cast<uint16_t>(i), static_cast<uint16_t>(i + 1u), static_cast<uint16_t>(i + 2u)});
+        }
+        if (tri.empty())
+            return false;
+        const uint32_t vAt = markerRingAlloc(n * static_cast<uint32_t>(sizeof(Im2DVertex)));
+        std::memcpy(g_ring.data() + vAt, v.data(), n * sizeof(Im2DVertex));
+        const uint32_t iAt = markerRingAlloc(static_cast<uint32_t>(tri.size()) * 2u);
+        std::memcpy(g_ring.data() + iAt, tri.data(), tri.size() * 2u);
+        job.verts = vAt;
+        job.numVerts = n;
+        job.ringIndices = iAt;
+        job.numIndices = static_cast<uint32_t>(tri.size());
+        std::memcpy(job.vu[vuIndex(1018)], &g_pgenOut.tag, 8); // the program's GIF tag: PRE + PRIM (textured, blended)
+        return true;
+    }
+
+    bool pgenNode(uint8_t *ee, PS2Memory &memory, uint32_t objPvt, uint32_t atomic, int mode)
+    {
+        const int pm = pgenMode();
+        if (pm == 0 || mode != 1)
+            return false;
+        if (rd32(ee, objPvt + 20u))
+            return false; // finalize callback: RenderWare
+        const uint32_t geom = rd32(ee, atomic + 24u), frame = rd32(ee, atomic + 4u);
+        if (ee[atomic & 0x1FFFFFFu] != 1u || !geom || !frame)
+            return false;
+        const uint32_t pg = atomic + rd32(ee, kPGenPluginOffset);
+        const uint32_t params = rd32(ee, pg + 0x10u), numVerts = rd32(ee, geom + 20u);
+        // RenderWare instances the effect once (PGenInstanceCallback): the game then writes its emitter history
+        // (position, direction, velocity: V4-32) straight into those cluster buffers. One batch of up to 90.
+        if (ee[pg & 0x1FFFFFFu] != 1u || !params || numVerts == 0u || numVerts > 90u)
+            return false;
+        const uint32_t cl[3] = {rd32(ee, pg + 4u), rd32(ee, pg + 8u), rd32(ee, pg + 12u)};
+        if (!cl[0] || !cl[1] || !cl[2])
+            return false;
+        const uint32_t header = rd32(ee, geom + 84u);
+        uint16_t numMeshes = 0;
+        if (header)
+            std::memcpy(&numMeshes, ee + ((header + 4u) & 0x1FFFFFFu), 2);
+        if (numMeshes != 1u)
+            return false;
+        const uint32_t mesh = header + 16u + rd32(ee, header + 12u), material = rd32(ee, mesh + 8u);
+        const uint32_t groupPipe = rd32(ee, objPvt + 24u), pipe = groupPipe ? groupPipe : (material ? rd32(ee, material + 8u) : 0u);
+        const uint32_t nodes = pipe ? rd32(ee, pipe + 8u) : 0u, matPvt = nodes ? rd32(ee, nodes + 20u) : 0u;
+        if (!material || !matPvt || rd32(ee, matPvt + 12u) != kPGenBridge || rd32(ee, matPvt + 16u) != 0u)
+            return false;
+        const uint32_t texture = rd32(ee, material), raster = texture ? rd32(ee, texture) : 0u;
+        if (!raster || (ee[(raster + 32u) & 0x1FFFFFFu] & 7u) != 4u || !rd32(ee, raster + 36u))
+            return false; // untextured or camera-texture particles: RenderWare
+        // PGenBridgeCallback's program choice: 2Cam if param 0xC0, then Streak (0xE8) or Instanced (0xCC > 0).
+        float fC0, fE8, fCC;
+        std::memcpy(&fC0, ee + ((params + 0xC0u) & 0x1FFFFFFu), 4);
+        std::memcpy(&fE8, ee + ((params + 0xE8u) & 0x1FFFFFFu), 4);
+        std::memcpy(&fCC, ee + ((params + 0xCCu) & 0x1FFFFFFu), 4);
+        const uint32_t variant = (fC0 != 0.0f ? 3u : 0u) + (fE8 != 0.0f ? 1u : (fCC > 0.0f ? 2u : 0u));
+        const PGenProgram *prog = pgenProgram(ee, variant);
+        if (!prog)
+            return false;
+        // A variant whose program has no compiled code (2Cam) stays on RenderWare: probe once per variant.
+        static int s_compiled[6] = {};
+        if (s_compiled[variant] == 0)
+        {
+            alignas(16) static uint8_t probe[0x4000];
+            std::memcpy(probe, prog->data.data(), sizeof(probe));
+            s_compiled[variant] = ::ps2vu1nRunPrivate(prog->image.data(), prog->key, probe, 0u, nullptr, nullptr) ? 1 : -1;
+        }
+        if (s_compiled[variant] < 0)
+            return false;
+        // Object constants: PGenObjectSetupCallback's LTM x view and the camera block (VU1 1008..1018).
+        static ObjExpect obj;
+        computeObjectConstants(ee, atomic, false, objPvt, obj, false, true);
+        if (obj.unsupported)
+            return false;
+        MarkerSlot slot;
+        if (pm == 1 && !reserveMarkers(ee, 1u, slot))
+        {
+            nstat(kNsNoRoom);
+            return false;
+        }
+        PGenJob snap;
+        PGenJob &j = pm == 2 ? snap : g_pgenJobs[g_pgenJobNext & (kPGenJobs - 1u)];
+        j.prog = prog;
+        j.variant = variant;
+        j.numVerts = numVerts;
+        j.atomic = atomic;
+        std::memcpy(j.cl, cl, sizeof(j.cl));
+        std::memcpy(j.params, ee + (params & 0x1FFFFFFu), sizeof(j.params)); // PGenUploadParameterBlock
+        j.camMask = 0;
+        for (uint32_t i = 0; i < 11u; ++i)
+            if (obj.mask & (1ull << vuIndex(1008u + i)))
+            {
+                std::memcpy(j.cam + i * 16u, obj.vu[vuIndex(1008u + i)], 16);
+                j.camMask |= 1u << i;
+            }
+        if (pm == 2)
+        {
+            std::lock_guard<std::mutex> lock(g_pgenMx);
+            if (g_pgenExpect.size() >= 256u)
+                g_pgenExpect.erase(g_pgenExpect.begin()); // never matched (RenderWare dropped the effect)
+            g_pgenExpect.push_back(snap);
+            return false; // RenderWare draws; its run is repeated natively and compared
+        }
+        const uint32_t jobIndex = g_pgenJobNext++ & (kPGenJobs - 1u);
+        // PGenBridgeCallback's GS state: alpha test for alpha rasters, TEX1 / CLAMP from the texture (as the generic
+        // bridge: mip K/L/MXL from the raster extension, the filter mode, wrap/clamp per axis).
+        const uint32_t fmt = ee[(raster + 35u) & 0x1FFFFFFu] & 0xFu;
+        const uint64_t testGlobal = rd64(ee, kGp - 0x79F8u), tex1Global = rd64(ee, kGp - 0x79D8u);
+        const uint32_t fa = rd32(ee, texture + 80u);
+        const uint32_t rext = raster + rd32(ee, kGp - 0x798Cu);
+        const uint64_t kl = ee[(rext + 20u) & 0x1FFFFFFu] | (static_cast<uint64_t>(ee[(rext + 21u) & 0x1FFFFFFu]) << 8);
+        uint64_t tex1 = (tex1Global & 0xFFFFF000FFE7FDE3ull) | ((kl & 0xFFFu) << 32) | ee[(rext + 22u) & 0x1FFFFFFu] | (((kl >> 12) & 3u) << 19);
+        tex1 = (tex1 & ~0x1E0ull) | texFilterBits(fa & 0xFFu);
+        const uint32_t idx = g_next.fetch_add(1, std::memory_order_relaxed) & (kTableSize - 1u);
+        Entry &e = g_table[idx];
+        e.native = true;
+        e.gsFromRegs = false;
+        e.kind = kIm2DMesh;
+        e.object = atomic;
+        e.mesh = mesh;
+        e.meshFlags = 0;
+        e.primType = 3u;
+        e.transType = 0;
+        e.matCol = 0xFFFFFFFFu;
+        e.texture = texture;
+        e.vu1CodeIndex = variant;
+        e.surfProps = 0;
+        e.code = kPGenEntry | jobIndex; // vertices come from the program run at the marker
+        e.verts = 0;
+        e.normals = e.uvs = e.prelit = 0;
+        e.numVerts = 0;
+        e.geomFlags = 0;
+        e.gsTest = (testGlobal & ~1ull) | ((fmt == 1u || fmt == 5u) ? 1u : 0u);
+        e.gsTex1 = tex1;
+        e.gsClamp = (((fa >> 8) & 0xFu) == 3u ? 1u : 0u) | (((fa >> 12) & 0xFu) == 3u ? 4u : 0u);
+        e.geomGen = 0;
+        e.envTexture = 0;
+        e.envFlags = 0;
+        e.ringIndices = 0;
+        e.numIndices = 0;
+        std::memset(g_nativeVu[idx & (kNativeVuRing - 1u)], 0, sizeof(float) * 4u * kVuQwCount);
+        writeMarkers(ee, memory, slot, &idx, 1u);
+        nstat(kNsNative);
+        return true;
+    }
 
     bool nodeBody(uint8_t *ee, PS2Memory &memory, uint32_t self, uint32_t params)
     {
@@ -1949,6 +2461,8 @@ namespace nrw
         const uint32_t setupCB = rd32(ee, objPvt + 16u);
         if (setupCB == 0x300250u)
             return im3dNode(ee, memory, objPvt, object, mode);
+        if (setupCB == 0x2976F0u && pgenNode(ee, memory, objPvt, object, mode))
+            return true;
         bool sector, gameCB = false, g3x = false, pgen = false, skin = false;
         if (setupCB == 0x2976F0u)
         {
@@ -2235,14 +2749,13 @@ namespace nrw
                                 (unsigned long long)s_fx[2], (unsigned long long)s_fx[3], (unsigned long long)s_fx[4],
                                 (unsigned long long)s_fx[5], sector ? 1 : 0);
             }
-            // PS2X_NRW_G3GEM=1: MatFX env maps on generic objects natively. Off by default: together with native
-            // ISO draws it corrupted the Match Type panel (a render-to-texture camera) -- skipping these objects'
-            // packets shifts which masked PATH3 texture upload each MSKPATH3 unmask releases, so the panel's
-            // sprites sampled VRAM before their textures arrived.
+            // MatFX env maps on generic objects natively (PS2X_NRW_G3GEM=0: RenderWare). Together with native ISO
+            // draws they once corrupted the Match Type panel: the masked PATH3 upload queue fell behind for good
+            // (fixed in PS2Memory::submitGifPacket, a new GIF kick drains the previous one).
             static const bool s_g3Gem = []()
             {
                 const char *v = std::getenv("PS2X_NRW_G3GEM");
-                return v && *v == '1';
+                return !(v && *v == '0');
             }();
             if (effect == 2u && s_gem && s_g3Gem) // Gem: the generic programs plus an additive env pass
             {
@@ -2507,6 +3020,14 @@ namespace nrw
         if (!g_gs)
             return;
         const Entry &e = g_table[index & (kTableSize - 1u)];
+        {
+            if (g_p3Trace > 0) // PS2X_P3_TRACE: native markers in the PATH3 mask / upload sequence
+            {
+                --g_p3Trace;
+                std::printf("[p3] marker kind=%u native=%d regs=%d tex=%08x env=%08x masked=%d\n", e.kind, e.native ? 1 : 0,
+                            e.gsFromRegs ? 1 : 0, e.texture, e.envTexture, memory.isPath3Masked() ? 1 : 0);
+            }
+        }
         MeshJob job{};
         job.kind = e.kind;
         job.verts = e.verts;
@@ -2548,6 +3069,8 @@ namespace nrw
                 job.envTex1 = e.envTex1;
                 job.envFlags = e.envFlags;
             }
+            if (e.kind == kIm2DMesh && (e.code & kPGenEntry) && !pgenMarker(e, job))
+                return; // no live particles
         }
         else if (const uint8_t *vu = memory.getVU1Data())
             std::memcpy(job.vu, vu + kVuFirstQw * 16u, sizeof(job.vu));

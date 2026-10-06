@@ -437,6 +437,7 @@ struct GSD3D11Backend::Impl
     std::unordered_map<uint32_t, NativeMesh> nativeMeshes;
     const nrw::MeshJob *nativeJob = nullptr;
     bool nativeEnvPass = false; // drawing the env map pass of nativeJob (texture = job.envTexture)
+    uint32_t pendingRasterTex = 0; // screen-space native job (game particles): the pending batch samples this raster
     NativeSector *nativeSector = nullptr;
     NativeMesh *nativeMesh = nullptr;
     // Draw-state cache for flushPending. Anything else that changes context state (blit, present,
@@ -2175,6 +2176,21 @@ struct GSD3D11Backend::Impl
         GSPrimitiveBatch b{};
         b.state = st;
         b.vertexCount = 3;
+        const bool rasterState = (job.stateFlags & nrw::kStateNative) != 0u && job.texture != 0u;
+        if (rasterState)
+        {
+            // Game particles: no RenderWare bridge ran, so its GS state is applied here and the texture is decoded
+            // from the raster in EE memory (never VRAM). Blending and the frame come from the registers.
+            flushPending();
+            GSDrawState &s = b.state;
+            s.context.test = job.gsTest;
+            s.context.tex1 = job.gsTex1;
+            s.context.clamp = job.gsClamp;
+            const uint32_t mmag = static_cast<uint32_t>((job.gsTex1 >> 5) & 1u), mmin = static_cast<uint32_t>((job.gsTex1 >> 6) & 7u);
+            s.linearFilter = mmag != 0u || mmin == 1u || (mmin & 4u) != 0u;
+            rasterTex0(s, job.texture);
+            pendingRasterTex = job.texture;
+        }
         for (uint32_t i = 0; i + 2u < job.numIndices; i += 3u)
         {
             for (uint32_t k = 0; k < 3u; ++k)
@@ -2195,6 +2211,11 @@ struct GSD3D11Backend::Impl
                 o.fog = 255;
             }
             submit(b);
+        }
+        if (rasterState)
+        {
+            flushPending();
+            pendingRasterTex = 0;
         }
     }
 
@@ -2356,7 +2377,7 @@ struct GSD3D11Backend::Impl
             // (except an env pass whose env raster is a camera texture: that one is a render target).
             const bool envRt = nativeJob && (nativeEnvPass ? (nativeJob->envFlags & nrw::kEnvRenderTarget) != 0u
                                                            : (nativeJob->envFlags & nrw::kBaseRenderTarget) != 0u);
-            const bool nativeState = nativeJob && (nativeJob->stateFlags & nrw::kStateNative) != 0u && !envRt;
+            const bool nativeState = (nativeJob && (nativeJob->stateFlags & nrw::kStateNative) != 0u && !envRt) || pendingRasterTex != 0u;
             RenderTarget *srcRt = (!isIndexed(t.psm) && !nativeState) ? findRt(t.tbp0) : nullptr;
             if (!srcRt && !isIndexed(t.psm) && !disableRtSubTex && !nativeState)
             {
@@ -2461,7 +2482,7 @@ struct GSD3D11Backend::Impl
             {
                 uint32_t w = 1, h = 1;
                 texSrv = nullptr;
-                const uint32_t nativeTex = (nativeJob && !envRt) ? (nativeEnvPass ? nativeJob->envTexture : nativeJob->texture) : 0u;
+                const uint32_t nativeTex = (nativeJob && !envRt) ? (nativeEnvPass ? nativeJob->envTexture : nativeJob->texture) : pendingRasterTex;
                 if (nativeTex && rasterTexMode() != 0)
                 {
                     uint32_t rw = 1, rh = 1;
