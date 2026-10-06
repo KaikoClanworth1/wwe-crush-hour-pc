@@ -1816,7 +1816,13 @@ namespace nrw
             if (s_diag && s_n < 12)
             {
                 ++s_n;
-                std::printf("[nrw-node-prim] setup=%08x obj=%08x meshHeaderFlags=%08x meshes=%u\n", setupCB, object, hdrFlags, numMeshes);
+                const uint32_t m0 = header + 16u + rd32(ee, header + 12u), mat0 = rd32(ee, m0 + 8u);
+                const uint32_t gp = rd32(ee, objPvt + 24u), mpipe = gp ? gp : (mat0 ? rd32(ee, mat0 + 8u) : 0u);
+                const uint32_t nodes = mpipe ? rd32(ee, mpipe + 8u) : 0u, mp = nodes ? rd32(ee, nodes + 20u) : 0u;
+                std::printf("[nrw-node-prim] setup=%08x obj=%08x meshHeaderFlags=%08x meshes=%u pipe=%08x bridge=%08x code=%08x codes=%08x,%08x numIdx=%u tex=%08x\n",
+                            setupCB, object, hdrFlags, numMeshes, mpipe, mp ? rd32(ee, mp + 12u) : 0u, mp ? rd32(ee, mp + 24u) : 0u,
+                            mp ? rd32(ee, rd32(ee, mp + 24u)) : 0u, mp ? rd32(ee, rd32(ee, mp + 24u) + 4u) : 0u, rd32(ee, m0 + 4u),
+                            mat0 ? rd32(ee, mat0) : 0u);
             }
             return false;
         }
