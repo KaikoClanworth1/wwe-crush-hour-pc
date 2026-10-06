@@ -496,8 +496,18 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
     m_eeCycle += elapsed;
-    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
-    m_runtime.advanceIopEeCycles(elapsed);
+    // A checkpoint runs at every guest call and loop back-edge. EE timers and the IOP clock both batch
+    // internally (>= 1024 / 8192 EE cycles), so feed them in batches here as well: most checkpoints are
+    // then two adds and a compare instead of four nested calls (~8% of the EE thread in a match).
+    static uint64_t s_unaccounted = 0u;
+    s_unaccounted += elapsed;
+    if (s_unaccounted >= 1024u)
+    {
+        const uint64_t batch = s_unaccounted;
+        s_unaccounted = 0u;
+        m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(batch);
+        m_runtime.advanceIopEeCycles(batch);
+    }
     if (m_pendingEeTimerInterrupts != 0u)
     {
         m_checkpointPending.store(true, std::memory_order_release);

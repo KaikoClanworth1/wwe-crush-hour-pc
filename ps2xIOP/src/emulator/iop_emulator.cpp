@@ -752,6 +752,15 @@ namespace ps2x::iop::detail
         }
         const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
+        // Every IRX this game loads is served natively, so the IOP normally has nothing to execute: no
+        // threads, no running timers, no DMA completions or guest callbacks in flight. Then just keep its
+        // clock -- stepping the scheduler loop for nothing cost ~5% of the EE thread.
+        if (m_impl->kernel.threadCount() == 0u && m_impl->pendingDmaInterrupts.empty() &&
+            m_impl->pendingGuestCallbacks.empty() && !m_impl->timrman.anyRunning())
+        {
+            m_impl->totalCycles += iopCycles;
+            return;
+        }
         if (iopCycles)
             m_impl->runCycles(iopCycles);
     }

@@ -17,6 +17,13 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+        [[nodiscard]] bool anyRunning() const noexcept
+        {
+            for (const Timer &timer : m_timers)
+                if (timer.running)
+                    return true;
+            return false;
+        }
 
     private:
         struct Callback
