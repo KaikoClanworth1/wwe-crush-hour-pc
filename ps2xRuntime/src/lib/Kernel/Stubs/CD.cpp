@@ -1,4 +1,6 @@
 ﻿#include "Common.h"
+#include <chrono>
+#include <optional>
 #include "CD.h"
 #include <cstdlib>
 #include <limits>
@@ -742,7 +744,24 @@ namespace ps2_stubs
             uint32_t buffer = 0u;
             uint32_t errorAddress = 0u;
             uint32_t sectorsRead = 0u;
+            bool blocking = false;
         };
+
+        // Blocking reads answered with 0 at the end of a stream (or on a stopped one) in a row. A VidTex callback
+        // that outlives its movie polls sceCdStRead in a tight guest loop -- millions of calls per second. Past a
+        // few attempts each further 0 is returned after the next vsync, so the poller costs nothing while the
+        // game resets the stream (the result it sees is unchanged).
+        uint32_t g_cdEofZeroReads = 0;
+        constexpr uint32_t kCdEofSpinReads = 64;
+
+        void throttleCdStSpin(PS2Runtime *runtime, uint8_t *rdram, const CdStReadContinuation &state)
+        {
+            if (!runtime || ++g_cdEofZeroReads <= kCdEofSpinReads)
+                return;
+            if (int32_t *errorOut = reinterpret_cast<int32_t *>(getMemPtr(rdram, state.errorAddress)); errorOut)
+                *errorOut = 0;
+            runtime->eeScheduler().waitVSync(runtime->eeScheduler().currentVSyncTick(), 0, [](R5900Context &) {});
+        }
 
         void finishCdStRead(uint8_t *rdram, R5900Context *ctx, const CdStReadContinuation &state, int32_t error)
         {
@@ -791,6 +810,8 @@ namespace ps2_stubs
                     if (atEnd || (g_cdStreamingEndLbn != 0xFFFFFFFFu && g_cdStreamingLbn >= g_cdStreamingEndLbn))
                     {
                         notifyMpegCdStreamEof(runtime);
+                        if (state.blocking && state.sectorsRead == 0u)
+                            throttleCdStSpin(runtime, rdram, state);
                     }
                     finishCdStRead(rdram, ctx, state, 0);
                     return;
@@ -861,6 +882,7 @@ namespace ps2_stubs
                 }
 
                 g_cdStreamingLbn += sectors;
+                g_cdEofZeroReads = 0;
                 if (runtime == nullptr)
                 {
                     g_cdStreamTiming.producedSectors += sectors;
@@ -896,8 +918,45 @@ namespace ps2_stubs
         }
     }
 
+    // PS2X_CD_STATS=1: per-second sceCdStRead outcomes (why polling readers spin).
+    static double g_cdStReadUs = 0.0; // PS2X_CD_STATS: host time inside sceCdStRead
+    struct CdStTimer
+    {
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~CdStTimer() { g_cdStReadUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(); }
+    };
+
+    static void cdStStat(int k)
+    {
+        static const bool s_on = std::getenv("PS2X_CD_STATS") != nullptr;
+        if (!s_on)
+            return;
+        static uint64_t s_n[5] = {};
+        static auto s_t0 = std::chrono::steady_clock::now();
+        ++s_n[k];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s_t0 >= std::chrono::seconds(2))
+        {
+            s_t0 = now;
+            std::printf("[cd-st] calls/2s: data=%llu inactive=%llu eof=%llu empty=%llu blocking=%llu lbn=%u end=%u buffered=%llu cap=%u bank=%u\n",
+                        (unsigned long long)s_n[0], (unsigned long long)s_n[1], (unsigned long long)s_n[2], (unsigned long long)s_n[3],
+                        (unsigned long long)s_n[4], g_cdStreamingLbn, g_cdStreamingEndLbn,
+                        (unsigned long long)(g_cdStreamTiming.producedSectors - g_cdStreamTiming.consumedSectors),
+                        g_cdStreamTiming.capacitySectors, g_cdStreamTiming.sectorsPerBank);
+            std::printf("[cd-st] host time in sceCdStRead: %.1f ms / 2 s\n", g_cdStReadUs / 1000.0);
+            g_cdStReadUs = 0.0;
+            std::fflush(stdout);
+            for (auto &v : s_n)
+                v = 0;
+        }
+    }
+
     void sceCdStRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        static const bool s_time = std::getenv("PS2X_CD_STATS") != nullptr;
+        std::optional<CdStTimer> timer;
+        if (s_time)
+            timer.emplace();
         const uint32_t requestedSectors = getRegU32(ctx, 4);
         const uint32_t buffer = getRegU32(ctx, 5);
         const uint32_t mode = getRegU32(ctx, 6);
@@ -915,12 +974,17 @@ namespace ps2_stubs
 
         if (!g_cdStreamTiming.active || requestedSectors == 0u)
         {
+            cdStStat(1);
+            if (mode == kCdStreamBlocking && requestedSectors != 0u)
+                throttleCdStSpin(runtime, rdram, state); // a reader still polling a stopped stream
             setReturnS32(ctx, 0);
             return;
         }
 
         if (mode == kCdStreamBlocking)
         {
+            cdStStat(4);
+            state.blocking = true;
             continueCdStRead(rdram, ctx, runtime, state);
             return;
         }
@@ -941,12 +1005,16 @@ namespace ps2_stubs
         {
             if (g_cdStreamingEndLbn != 0xFFFFFFFFu && g_cdStreamingLbn >= g_cdStreamingEndLbn)
             {
+                cdStStat(2);
                 notifyMpegCdStreamEof(runtime);
             }
+            else
+                cdStStat(3);
             setReturnS32(ctx, 0);
             return;
         }
 
+        cdStStat(0);
         state.requestedSectors = sectors;
         continueCdStRead(rdram, ctx, runtime, state);
     }
@@ -966,12 +1034,14 @@ namespace ps2_stubs
     void sceCdStSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         restartCdStreamAt(getRegU32(ctx, 4), runtime);
+        g_cdEofZeroReads = 0;
         setReturnS32(ctx, 1);
     }
 
     void sceCdStSeekF(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         restartCdStreamAt(getRegU32(ctx, 4), runtime);
+        g_cdEofZeroReads = 0;
         setReturnS32(ctx, 1);
     }
 
@@ -986,6 +1056,7 @@ namespace ps2_stubs
         }
 
         restartCdStreamAt(lbn, runtime);
+        g_cdEofZeroReads = 0;
         g_cdStreamTiming.active = true;
         g_cdStreamTiming.paused = false;
         g_cdStreamTiming.sectorsPerSecond = dvdStreamSectorsPerSecond(spindleControl);

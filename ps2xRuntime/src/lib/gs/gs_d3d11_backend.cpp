@@ -142,6 +142,13 @@ namespace
         return c | (a << 24);
     }
 
+    uint32_t rd32ee(const uint8_t *ee, uint32_t a)
+    {
+        uint32_t v;
+        std::memcpy(&v, ee + (a & 0x1FFFFFCu), 4);
+        return v;
+    }
+
     uint64_t fnv1a(const void *data, size_t n, uint64_t h = 1469598103934665603ull)
     {
         const uint8_t *p = static_cast<const uint8_t *>(data);
@@ -184,6 +191,8 @@ cbuffer Native : register(b1)
     float4 nLightCol[6];       // xyz: colour * surface coefficient, w: 1 ambient / 2 directional / 3 point
     float4 nLightDir[6];       // object-space direction (directional) or position + 1/radius (point)
     float4 nClip;              // clip variants: x, y = VU1 1021.z, 1022.z (clip z = x + y*w, kept within +-w); z: on
+    float4 nEnvR;              // env map pass (PDS G3x Gem): object-space env right, w: coefficient
+    float4 nEnvU;              // object-space env up, w: 1 = env pass
 };
 // GS-equivalent outputs plus the clip variants' near/far planes (VU1 CLIP of z against w).
 struct NativeOut { float4 pos : SV_Position; noperspective float4 col : COLOR0; noperspective float4 tc : TEXCOORD0;
@@ -221,10 +230,17 @@ NativeOut vs_native(NativeIn v)
         }
     }
     o.col = trunc(min(col, 255.0) * nMat);                     // FTOI0
+    float2 uv = v.uv;
+    if (nEnvU.w != 0.0)
+    {
+        // Env pass: UV from the normal against the env frame, colour scaled by the coefficient.
+        uv = float2(dot(n, nEnvR.xyz), dot(n, nEnvU.xyz)) * 0.5 - 0.5;
+        o.col = round(o.col * nEnvR.w);
+    }
     // Fog routines: F = clamp(fz * clip.w, fz*fw, fz*fw + 255) - fz*fw  (XYZF2 F byte).
     const float lo = nFog.x * nFog.y;
     const float fog = nMisc.w != 0.0 ? trunc(clamp(clip.w * nFog.x, min(lo, lo + 255.0), max(lo, lo + 255.0)) - lo) : 255.0;
-    o.tc = float4(v.uv * q, q, fog);                           // STQ + fog
+    o.tc = float4(uv * q, q, fog);                             // STQ + fog
     return o;
 }
 
@@ -415,6 +431,7 @@ struct GSD3D11Backend::Impl
     std::unordered_map<uint32_t, NativeSector> nativeSectors;
     std::unordered_map<uint32_t, NativeMesh> nativeMeshes;
     const nrw::MeshJob *nativeJob = nullptr;
+    bool nativeEnvPass = false; // drawing the env map pass of nativeJob (texture = job.envTexture)
     NativeSector *nativeSector = nullptr;
     NativeMesh *nativeMesh = nullptr;
     // Draw-state cache for flushPending. Anything else that changes context state (blit, present,
@@ -598,7 +615,7 @@ struct GSD3D11Backend::Impl
         dev->CreateBuffer(&cbd, nullptr, &cb);
         cbd.ByteWidth = 16;
         dev->CreateBuffer(&cbd, nullptr, &blitCb);
-        cbd.ByteWidth = 21 * 16;
+        cbd.ByteWidth = 23 * 16;
         dev->CreateBuffer(&cbd, nullptr, &cbNative);
 
         for (int lin = 0; lin < 2; ++lin)
@@ -1921,6 +1938,7 @@ struct GSD3D11Backend::Impl
         key = (key ^ uvs) * 0x100000001B3ull;
         key = (key ^ prelit) * 0x100000001B3ull;
         key = (key ^ normals) * 0x100000001B3ull;
+        key = (key ^ job.reserved) * 0x100000001B3ull; // geometry edit generation (native node path)
         key = sample(key, verts, std::min<uint32_t>(numVerts * 12u, 192u));
         key = sample(key, verts + (numVerts - 1u) * 12u, 12u);
         NativeSector &ns = nativeSectors[sec];
@@ -2010,7 +2028,7 @@ struct GSD3D11Backend::Impl
             cols[i][1] = (cols[i][1] - 0.5f * cols[i][3]) * scale[1];
         }
         cols[3][2] *= scale[2];
-        float cbv[21][4] = {};
+        float cbv[23][4] = {};
         std::memcpy(cbv, cols, sizeof(cols));
         const float *off = vu(1016), *off2 = vu(1017);
         cbv[4][0] = off[0] + off2[0];
@@ -2035,6 +2053,13 @@ struct GSD3D11Backend::Impl
         cbv[20][0] = vu(1021)[2];
         cbv[20][1] = vu(1022)[2];
         cbv[20][2] = (objFlags & 2u) ? 1.0f : 0.0f;
+        if (nativeEnvPass)
+        {
+            std::memcpy(cbv[21], job.envR, 12);
+            cbv[21][3] = job.envCoef;
+            std::memcpy(cbv[22], job.envU, 12);
+            cbv[22][3] = 1.0f;
+        }
         D3D11_MAPPED_SUBRESOURCE m{};
         if (SUCCEEDED(ctx->Map(cbNative.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
         {
@@ -2061,13 +2086,77 @@ struct GSD3D11Backend::Impl
             return;
         pending.clear();
         pendingState = st;
+        if (job.stateFlags & nrw::kStateNative)
+        {
+            // RenderWare's mesh bridge did not run (native node path): apply the GS state it would have set to
+            // this draw only. The texture comes from the raster (rasterTexture), so TEX0 carries its format.
+            GSDrawState &s = pendingState;
+            s.context.test = job.gsTest;
+            s.context.tex1 = job.gsTex1;
+            s.context.clamp = job.gsClamp;
+            const uint32_t mmag = static_cast<uint32_t>((job.gsTex1 >> 5) & 1u), mmin = static_cast<uint32_t>((job.gsTex1 >> 6) & 7u);
+            s.linearFilter = mmag != 0u || mmin == 1u || (mmin & 4u) != 0u;
+            rasterTex0(s, job.texture);
+        }
         hasPending = true;
         nativeJob = &job;
         flushPending();
+        if ((job.stateFlags & nrw::kStateNative) && job.envTexture)
+        {
+            // Env map pass (PDS G3x Gem): same geometry, env raster, additive blend, fog to black.
+            GSDrawState es = pendingState;
+            auto &c = es.context;
+            c.alpha = job.envAlpha;
+            c.test = 0x50002u;
+            c.clamp = 0u;
+            c.tex1 = job.envTex1;
+            const uint32_t mmag = static_cast<uint32_t>((job.envTex1 >> 5) & 1u), mmin = static_cast<uint32_t>((job.envTex1 >> 6) & 7u);
+            es.linearFilter = mmag != 0u || mmin == 1u || (mmin & 4u) != 0u;
+            es.prim.abe = true;
+            es.prim.tme = true;
+            es.prim.iip = true;
+            es.prim.fst = false;
+            es.prim.fge = (job.transType & 1u) != 0u;
+            es.fogR = es.fogG = es.fogB = 0;
+            rasterTex0(es, job.envTexture);
+            if (prepareNative(job))
+            {
+                pendingState = es;
+                hasPending = true;
+                nativeEnvPass = true;
+                flushPending();
+                nativeEnvPass = false;
+            }
+        }
         nativeJob = nullptr;
         nativeSector = nullptr;
         nativeMesh = nullptr;
         ++statNativeDraws;
+    }
+
+    // TEX0 of a native draw from its RenderWare raster (sky raster extension lsb/msb; TBP/CBP are not used, the
+    // texture comes from the raster itself via rasterTexture).
+    void rasterTex0(GSDrawState &s, uint32_t texture)
+    {
+        const uint8_t *ee = nrw::rdram();
+        const uint32_t raster = (ee && texture) ? rd32ee(ee, texture) : 0u;
+        if (!raster)
+            return;
+        const uint32_t lsb = rd32ee(ee, raster + 52u + 8u), msb = rd32ee(ee, raster + 52u + 12u);
+        GSTex0Reg &t = s.context.tex0;
+        t.tbp0 = 0;
+        t.tbw = static_cast<uint8_t>((lsb >> 14) & 0x3Fu);
+        t.psm = static_cast<uint8_t>((lsb >> 20) & 0x3Fu);
+        t.tw = static_cast<uint8_t>((lsb >> 26) & 0xFu);
+        t.th = static_cast<uint8_t>(((lsb >> 30) & 3u) | ((msb & 3u) << 2));
+        t.tcc = static_cast<uint8_t>((msb >> 2) & 1u);
+        t.tfx = static_cast<uint8_t>((msb >> 3) & 3u);
+        t.cbp = rd32ee(ee, raster + 52u + 16u);
+        t.cpsm = static_cast<uint8_t>((msb >> 19) & 0xFu);
+        t.csm = static_cast<uint8_t>((msb >> 23) & 1u);
+        t.csa = static_cast<uint8_t>((msb >> 24) & 0x1Fu);
+        s.textureWidth = static_cast<uint16_t>(1u << std::min<uint32_t>(t.tw, 10u));
+        s.textureHeight = static_cast<uint16_t>(1u << std::min<uint32_t>(t.th, 10u));
     }
 
     void flushPending()
@@ -2110,8 +2199,10 @@ struct GSD3D11Backend::Impl
             const auto &t = c.tex0;
             texDims[0] = static_cast<float>(st.textureWidth);
             texDims[1] = static_cast<float>(st.textureHeight);
-            RenderTarget *srcRt = (!isIndexed(t.psm)) ? findRt(t.tbp0) : nullptr;
-            if (!srcRt && !isIndexed(t.psm) && !disableRtSubTex)
+            // Native-state draws (native node path) always sample their raster texture, never a render target.
+            const bool nativeState = nativeJob && (nativeJob->stateFlags & nrw::kStateNative) != 0u;
+            RenderTarget *srcRt = (!isIndexed(t.psm) && !nativeState) ? findRt(t.tbp0) : nullptr;
+            if (!srcRt && !isIndexed(t.psm) && !disableRtSubTex && !nativeState)
             {
                 // Texture at a page-aligned offset inside a render target (e.g. a screen effect sampling
                 // part of the frame buffer): sample the GPU target with an origin instead of reading back.
@@ -2214,10 +2305,11 @@ struct GSD3D11Backend::Impl
             {
                 uint32_t w = 1, h = 1;
                 texSrv = nullptr;
-                if (nativeJob && nativeJob->texture && rasterTexMode() != 0)
+                const uint32_t nativeTex = nativeJob ? (nativeEnvPass ? nativeJob->envTexture : nativeJob->texture) : 0u;
+                if (nativeTex && rasterTexMode() != 0)
                 {
                     uint32_t rw = 1, rh = 1;
-                    ID3D11ShaderResourceView *rs = rasterTexture(nativeJob->texture, st, rw, rh);
+                    ID3D11ShaderResourceView *rs = rasterTexture(nativeTex, st, rw, rh);
                     if (rs && rasterTexMode() == 1)
                     {
                         texSrv = rs;
@@ -2225,7 +2317,7 @@ struct GSD3D11Backend::Impl
                         h = rh;
                     }
                 }
-                if (!texSrv)
+                if (!texSrv && !nativeState)
                     texSrv = decodedTexture(st, w, h);
                 static const long s_staleTbp = std::getenv("PS2X_STALE_TBP") ? std::atol(std::getenv("PS2X_STALE_TBP")) : -1;
                 if (staleLog && (t.psm == 10u || t.psm == 2u || static_cast<long>(t.tbp0) == s_staleTbp))

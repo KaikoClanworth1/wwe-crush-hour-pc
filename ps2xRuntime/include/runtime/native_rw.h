@@ -33,7 +33,7 @@ namespace nrw
     struct MeshJob
     {
         uint64_t magic = kJobMagic;
-        uint64_t reserved = 0;
+        uint64_t reserved = 0;        // native node path: geometry edit generation (vertex buffer cache key)
         uint32_t kind = kWorldSectorMesh;
         uint32_t object = 0;          // RpWorldSector (EE address)
         uint32_t mesh = 0;            // RpMesh (EE address)
@@ -48,8 +48,23 @@ namespace nrw
         // Vertex source (EE addresses; 0 = absent), taken from the sector or the atomic's geometry.
         uint32_t verts = 0, normals = 0, uvs = 0, prelit = 0, numVerts = 0, geomFlags = 0, pad2[2]{};
         float vu[kVuQwCount][4]{};    // VU1 data memory kVuFirstQw..
+        // Native node path (RenderWare's PS2All pipeline skipped): the GS state its mesh bridge would have
+        // set, applied by the backend to this draw only (the emulated GS registers stay untouched).
+        uint64_t gsTest = 0, gsTex1 = 0, gsClamp = 0;
+        uint32_t stateFlags = 0; // kStateNative
+        uint32_t pad3 = 0;
+        // PDS G3x Gem (RpMatFX environment map, native node path): a second, additive pass with the env raster.
+        // UVs from the vertex normals, 0.5 * (N.envR, N.envU) - 0.5 with envR/envU the env frame's right/up in
+        // object space; colour = coefficient * the lit colour. GS state of that pass: ALPHA_2 / TEX1_2 below,
+        // TEST 0x50002, CLAMP 0 (repeat), FOGCOL 0, PRIM ABE|TME|IIP (+FGE).
+        uint32_t envTexture = 0; // RwTexture, 0 = no env pass
+        float envCoef = 0.0f;
+        uint32_t pad4[2]{};
+        float envR[4]{}, envU[4]{};
+        uint64_t envAlpha = 0, envTex1 = 0;
     };
     static_assert(sizeof(MeshJob) % 16u == 0u, "job must be qword sized");
+    constexpr uint32_t kStateNative = 1u;
 
     // Vertex normal i as the packed form the VU1 program gets (x, y, z * 128 as signed bytes, w 0).
     // Sectors store that already; atomic morph targets store RwV3d floats.
@@ -79,6 +94,12 @@ namespace nrw
 
     bool enabled();
     // EE side (called from patched generated code).
+    // RenderWare's PS2All node body (RxPipelineNodeInstance self, RxPipelineNodeParam params): draws the object
+    // natively -- markers appended to RW's open VIF packet, constants computed from the RW structures -- and
+    // returns true, or false to let RenderWare run its own PS2 pipeline (unsupported object / no packet room).
+    bool nodeBody(uint8_t *rdram, PS2Memory &memory, uint32_t self, uint32_t params);
+    // RpPDS_G3x_ADL_LightingUpload(ambient, directional): the lights PDS G3x objects are lit with from now on.
+    void g3xLights(uint32_t ambient, uint32_t directional);
     void sectorBegin(uint32_t sector);
     void sectorEnd();
     // Bridge callback, about to store the geometry CALL tag (callLo/callHi): returns true and the marker

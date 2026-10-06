@@ -78,10 +78,11 @@ static LONG WINAPI ps2xCrashFilter(EXCEPTION_POINTERS *ep)
 
 namespace ps2host
 {
+    constexpr int kAutoAnchorHits = 32;
     // Anchored auto-input: the dispatcher stamps g_autoAnchorAt when the guest first calls g_autoAnchorPc.
     uint32_t g_autoAnchorPc = 0;
-    int g_autoAnchorCount = 1;          // PS2X_AUTOINPUT_ANCHOR=<hex pc>[:<n>] = the n-th call
-    std::atomic<double> g_autoAnchorAt{-1.0};
+    int g_autoAnchorCount = 1;          // PS2X_AUTOINPUT_ANCHOR=<hex pc>[:<n>] = default call index for "@t"
+    std::atomic<double> g_autoAnchorAt[kAutoAnchorHits]; // time of the 1st..32nd call of the anchor pc
     uint32_t g_autoWatchPc[8] = {};     // PS2X_AUTOINPUT_WATCH=<hex pc>,... : log call times (finding anchors)
     int g_autoWatchN = 0;
     namespace
@@ -92,8 +93,8 @@ namespace ps2host
         double g_shotInterval = 5.0;    // PS2X_SCREENSHOT_SEC
         double g_nextShot = 0.0;
         int g_shotIndex = 0;
-        struct AutoPress { double t, until; uint16_t button; bool anchored; };
-        std::vector<AutoPress> g_autoPress; // PS2X_AUTOINPUT="12:START,15:CROSS,@0.5:RIGHT" ('@' = after the anchor call)
+        struct AutoPress { double t, until; uint16_t button; int anchorHit; }; // anchorHit 0 = absolute time
+        std::vector<AutoPress> g_autoPress; // PS2X_AUTOINPUT="12:START,@0.5:RIGHT,@3+1.0:CROSS" ('@[n+]t' = t s after anchor call n)
         HWND g_hwnd = nullptr;
         std::atomic<bool> g_quit{false};
         bool g_ready = false;
@@ -623,6 +624,8 @@ float4 ps_main(VsOut i) : SV_Target
                 g_shotInterval = std::max(0.5, std::atof(iv));
             g_nextShot = g_shotInterval;
         }
+        for (auto &a : g_autoAnchorAt)
+            a.store(-1.0);
         if (const char *an = std::getenv("PS2X_AUTOINPUT_ANCHOR"))
         {
             char *endp = nullptr;
@@ -658,9 +661,19 @@ float4 ps_main(VsOut i) : SV_Target
                     std::string when = item.substr(0, colon);
                     // "@seconds" entries count from the first guest call of PS2X_AUTOINPUT_ANCHOR=<hex pc>
                     // (menu timing drifts with load; e.g. anchor OnInitLevelSelect_Tag for the arena chooser).
-                    const bool anchored = !when.empty() && when[0] == '@';
-                    if (anchored)
+                    int anchorHit = 0;
+                    if (!when.empty() && when[0] == '@')
+                    {
                         when.erase(0, 1);
+                        anchorHit = g_autoAnchorCount;
+                        const size_t plus = when.find('+');
+                        if (plus != std::string::npos)
+                        {
+                            anchorHit = std::max(1, std::atoi(when.c_str()));
+                            when.erase(0, plus + 1);
+                        }
+                        anchorHit = std::min(anchorHit, kAutoAnchorHits);
+                    }
                     const size_t dash = when.find('-', 1);
                     const double t = std::atof(when.c_str());
                     const double until = dash != std::string::npos ? std::atof(when.c_str() + dash + 1) : t + 0.25;
@@ -671,7 +684,7 @@ float4 ps_main(VsOut i) : SV_Target
                         {"LEFT", kBtnLeft}, {"RIGHT", kBtnRight}, {"L1", kBtnL1}, {"R1", kBtnR1}, {"L2", kBtnL2}, {"R2", kBtnR2}};
                     for (const auto &n : names)
                         if (b == n.first)
-                            g_autoPress.push_back({t, until, n.second, anchored});
+                            g_autoPress.push_back({t, until, n.second, anchorHit});
                 }
                 if (end == std::string::npos)
                     break;
@@ -918,12 +931,12 @@ float4 ps_main(VsOut i) : SV_Target
         if (!g_autoPress.empty())
         {
             const double t = nowSeconds();
-            const double anchorAt = g_autoAnchorAt.load();
             for (const auto &ap : g_autoPress)
             {
-                if (ap.anchored && anchorAt < 0.0)
+                const double anchorAt = ap.anchorHit ? g_autoAnchorAt[ap.anchorHit - 1].load() : 0.0;
+                if (ap.anchorHit && anchorAt < 0.0)
                     continue;
-                const double rt = ap.anchored ? t - anchorAt : t;
+                const double rt = ap.anchorHit ? t - anchorAt : t;
                 if (rt >= ap.t && rt < ap.until)
                     pads[0].buttons |= ap.button;
             }
