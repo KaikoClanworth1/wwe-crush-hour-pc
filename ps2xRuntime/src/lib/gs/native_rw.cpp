@@ -1287,6 +1287,90 @@ namespace nrw
             return at;
         }
 
+        // RpSkin on the CPU (RenderWare's PS2 skin VU1 program blends up to four bones per vertex). Matrices as
+        // _rpSkinMatrixUpdating: skinToBone[i] x bone[i] x inverse(atomic LTM), bone = the HAnim matrix array, or
+        // the node frames' LTMs (rpHANIMHIERARCHYNOMATRICES); local-space matrices skip the atomic inverse. Then
+        // p = sum w_k (v x M[i_k]), n = sum w_k (n x M[i_k]) into the ring as RxObjSpace3DVertex (pos, RGBA,
+        // normal, u, v). Returns the ring offset, or ~0u when the object has to stay on RenderWare.
+        constexpr uint32_t kSkinAtomicOffset = 0x466164u, kSkinGeomOffset = 0x466168u; // _rpSkinGlobals
+        uint32_t skinVertices(const uint8_t *ee, uint32_t atomic, uint32_t geom, uint32_t numVerts, uint32_t verts,
+                              uint32_t normals, uint32_t uvs, uint32_t prelit)
+        {
+            const uint32_t hier = rd32(ee, atomic + rd32(ee, kSkinAtomicOffset));
+            const uint32_t skin = rd32(ee, geom + rd32(ee, kSkinGeomOffset));
+            if (!hier || !skin)
+                return ~0u;
+            const uint32_t hflags = rd32(ee, hier), numNodes = rd32(ee, hier + 4u);
+            const uint32_t toBone = rd32(ee, skin + 12u), vIdx = rd32(ee, skin + 20u), vW = rd32(ee, skin + 24u);
+            if (numNodes == 0u || numNodes > 256u || !toBone || !vIdx || !vW)
+                return ~0u;
+            const bool noMatrices = (hflags & 2u) != 0u, localSpace = (hflags & 0x4000u) != 0u;
+            const uint32_t matrixArray = rd32(ee, hier + 8u), nodeInfo = rd32(ee, hier + 16u);
+            if ((noMatrices && !nodeInfo) || (!noMatrices && !matrixArray))
+                return ~0u;
+            static Mat mats[256];
+            Mat invAtomic{};
+            if (noMatrices || !localSpace)
+                matInvert(invAtomic, readMat(ee, rd32(ee, atomic + 4u) + 80u));
+            for (uint32_t i = 0; i < numNodes; ++i)
+            {
+                Mat bone;
+                if (noMatrices)
+                {
+                    const uint32_t frame = rd32(ee, nodeInfo + i * 16u + 12u);
+                    if (!frame)
+                        return ~0u;
+                    bone = readMat(ee, frame + 80u);
+                }
+                else
+                    bone = readMat(ee, matrixArray + i * 64u);
+                Mat t;
+                matMul(t, readMat(ee, toBone + i * 64u), bone);
+                if (noMatrices || !localSpace)
+                    matMul(mats[i], t, invAtomic);
+                else
+                    mats[i] = t;
+            }
+            const uint32_t at = ringAlloc(numVerts * kIm3DVertexStride);
+            uint8_t *out = g_ring.data() + at;
+            for (uint32_t v = 0; v < numVerts; ++v, out += kIm3DVertexStride)
+            {
+                float p[3], n[3] = {0.0f, 0.0f, 0.0f}, w[4];
+                uint8_t ix[4];
+                std::memcpy(p, ee + ((verts + v * 12u) & 0x1FFFFFFu), 12);
+                if (normals)
+                    std::memcpy(n, ee + ((normals + v * 12u) & 0x1FFFFFFu), 12);
+                std::memcpy(w, ee + ((vW + v * 16u) & 0x1FFFFFFu), 16);
+                std::memcpy(ix, ee + ((vIdx + v * 4u) & 0x1FFFFFFu), 4);
+                float po[3] = {0.0f, 0.0f, 0.0f}, no[3] = {0.0f, 0.0f, 0.0f};
+                for (int k = 0; k < 4; ++k)
+                {
+                    if (!(w[k] > 0.0f) || ix[k] >= numNodes)
+                        continue;
+                    const Mat &m = mats[ix[k]];
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        po[c] += w[k] * (p[0] * m.r[0][c] + p[1] * m.r[1][c] + p[2] * m.r[2][c] + m.r[3][c]);
+                        no[c] += w[k] * (n[0] * m.r[0][c] + n[1] * m.r[1][c] + n[2] * m.r[2][c]);
+                    }
+                }
+                std::memcpy(out, po, 12);
+                if (prelit)
+                    std::memcpy(out + 12, ee + ((prelit + v * 4u) & 0x1FFFFFFu), 4);
+                else
+                {
+                    const uint8_t black[4] = {0, 0, 0, 255}; // atomics without pre-lit colours start black
+                    std::memcpy(out + 12, black, 4);
+                }
+                std::memcpy(out + 16, no, 12);
+                if (uvs)
+                    std::memcpy(out + 28, ee + ((uvs + v * 8u) & 0x1FFFFFFu), 8);
+                else
+                    std::memset(out + 28, 0, 8);
+            }
+            return at;
+        }
+
     }
 
     namespace
@@ -1526,6 +1610,17 @@ namespace nrw
     // registers), so the job takes those from the GS. Vertices and indices are snapshotted into the ring.
     // Parallel-projection cameras (transType bit 8: the HUD, 2D cameras) are drawn natively with RenderWare's ISO
     // VU1 math (no divide, see bindNative); fogged ISO objects stay on RenderWare. PS2X_NRW_ISO=0: all ISO on RW.
+    // RpPDS_G3_Skin objects drawn natively (PS2X_NRW_SKIN=0: on RenderWare's skin VU1 program).
+    bool skinNative()
+    {
+        static const bool s_on = []()
+        {
+            const char *v = std::getenv("PS2X_NRW_SKIN");
+            return !(v && *v == '0');
+        }();
+        return s_on;
+    }
+
     bool isoNative(uint32_t transBase)
     {
         static const bool s_on = []()
@@ -1699,7 +1794,7 @@ namespace nrw
         const uint32_t setupCB = rd32(ee, objPvt + 16u);
         if (setupCB == 0x300250u)
             return im3dNode(ee, memory, objPvt, object, mode);
-        bool sector, gameCB = false, g3x = false, pgen = false;
+        bool sector, gameCB = false, g3x = false, pgen = false, skin = false;
         if (setupCB == 0x2976F0u)
         {
             // The game's PGenObjectSetupCallback (particle geometry): LTM x view, no lighting setup (the node's null
@@ -1718,6 +1813,13 @@ namespace nrw
             sector = false; // RpAtomicPS2AllObjectSetupCallBack
         else if (setupCB == 0x302720u)
             sector = true; // RpWorldSectorPS2AllObjectSetupCallBack
+        else if (setupCB == 0x2E0540u && skinNative() && mode == 1)
+        {
+            // RpPDS_G3_Skin_PS2AllObjectSetupCallBack (drivers, wrestlers): RenderWare's atomic setup with RpSkin bone
+            // matrices; drawn from vertices skinned on the CPU (skinVertices), always the clipping variant.
+            sector = false;
+            skin = true;
+        }
         else if (setupCB == 0x2B17A0u)
         {
             // The game's object_setup_callback: RenderWare's atomic setup (same LTM x view transform and
@@ -1875,11 +1977,11 @@ namespace nrw
         // triangle mesh's code index is below 4), so it is drawn exactly like the default pipeline.
         // The game's bridge_callback (0x2b0e00) is a recompiled copy of the generic bridge (generic code array; its
         // post-mesh callback only gathers metrics, an empty function in this build).
-        enum { kPipeNo, kPipeGeneric, kPipeMatFX, kPipeG3x, kPipeGame, kPipeG3xGem };
+        enum { kPipeNo, kPipeGeneric, kPipeMatFX, kPipeG3x, kPipeGame, kPipeG3xGem, kPipeSkin };
         auto pipeKind = [&](uint32_t pipe) -> int
         {
-            static uint32_t s_pipe[6] = {};
-            for (int k = 1; k < 6; ++k)
+            static uint32_t s_pipe[7] = {};
+            for (int k = 1; k < 7; ++k)
                 if (pipe && s_pipe[k] == pipe)
                     return k;
             const uint32_t nodes = pipe ? rd32(ee, pipe + 8u) : 0u;
@@ -1898,6 +2000,8 @@ namespace nrw
                 k = kPipeMatFX;
             else if (bcb == 0x2DC320u && code == 0x48FA30u)
                 k = kPipeG3x;
+            else if (bcb == 0x2FDF80u && code == 0x407850u)
+                k = kPipeSkin; // the generic bridge with RpPDS_G3_Skin's VU1 code array
             else if (bcb == 0x2E35E0u && code == 0x48FA40u)
                 k = kPipeG3xGem;
             if (k != kPipeNo)
@@ -1954,6 +2058,8 @@ namespace nrw
                     ++g_pipeWhy[3];
                 return k == kPipeG3xGem && s_gem && gemEnvOk(material);
             }
+            if (skin)
+                return k == kPipeSkin;
             if (k == kPipeGeneric || k == kPipeGame)
                 return true;
             if (k != kPipeMatFX || (ee[(kGp - 0x793Cu) & 0x1FFFFFFu] & 0x10u)) // trans 0x10: code index 4+ (MatFX effect codes)
@@ -2066,11 +2172,21 @@ namespace nrw
         }
         const uint32_t primType = (hdrFlags & 1u) ? 4u : 3u;
         uint32_t transType = (hdrFlags & 1u) ? transBase : ((transBase | 4u) & 0xFFu);
-        if (gameCB || pgen || frustumTest(ee, object, sector, cam) != 2u)
+        if (gameCB || pgen || skin || frustumTest(ee, object, sector, cam) != 2u)
             transType |= 2u;
         const bool modulate = !pgen && (gameCB || (sector ? (rd32(ee, world + 8u) & 0x40u) != 0u : (geomFlags & 0x40u) != 0u));
         const uint64_t primGlobal = rd64(ee, kGp - 0x7CC0u);
         const uint64_t testGlobal = rd64(ee, kGp - 0x79F8u), tex1Global = rd64(ee, kGp - 0x79D8u), clampGlobal = rd64(ee, kGp - 0x79E0u);
+        uint32_t skinRing = 0;
+        if (skin)
+        {
+            skinRing = skinVertices(ee, object, rd32(ee, object + 24u), numVerts, verts, normals, uvs, prelit);
+            if (skinRing == ~0u)
+            {
+                nstat(kNsObject);
+                return false;
+            }
+        }
         uint32_t idxs[64];
         for (uint32_t i = 0; i < numMeshes; ++i)
         {
@@ -2138,6 +2254,19 @@ namespace nrw
             e.envTexture = 0;
             e.envFlags = (raster && (ee[(raster + 32u) & 0x1FFFFFFu] & 7u) == 5u) ? kBaseRenderTarget : 0u;
             e.gsFromRegs = false;
+            if (skin)
+            {
+                // This frame's skinned vertices (ring) with the mesh's indices: drawn like an Im3D job, with this
+                // mesh's native GS state and the atomic's lit constants.
+                const uint32_t mi = rd32(ee, m), mn = std::min<uint32_t>(rd32(ee, m + 4u), 1u << 20);
+                e.kind = kIm3DMesh;
+                e.verts = skinRing;
+                e.normals = e.uvs = e.prelit = 0;
+                e.numIndices = mn;
+                e.ringIndices = ringAlloc(mn * 2u);
+                std::memcpy(g_ring.data() + e.ringIndices, ee + (mi & 0x1FFFFFFu),
+                            std::min<uint32_t>(mn * 2u, 0x2000000u - (mi & 0x1FFFFFFu)));
+            }
             const uint32_t meshMatPipe = rd32(ee, material + 8u);
             const int meshPipe = pipeKind(groupPipe ? groupPipe : (meshMatPipe ? meshMatPipe : defPipe));
             const uint32_t meshFx = rd32(ee, material + matfxOffset);

@@ -1951,7 +1951,16 @@ struct GSD3D11Backend::Impl
             std::memcpy(o.pos, src, 12);
             std::memcpy(o.col, src + 12, 4);
             std::memcpy(o.uv, src + 28, 8);
-            o.nrm[0] = o.nrm[1] = o.nrm[2] = o.nrm[3] = 0;
+            // RxObjSpace3DVertex normal (floats): packed like an atomic's normal for the lit native programs
+            // (skinned objects; plain Im3D has no lights).
+            float nf[3];
+            std::memcpy(nf, src + 16, 12);
+            for (int k = 0; k < 3; ++k)
+            {
+                const float v = nf[k] * 128.0f;
+                o.nrm[k] = static_cast<int8_t>(v >= 127.0f ? 127 : (v <= -128.0f ? -128 : static_cast<int>(v)));
+            }
+            o.nrm[3] = 0;
         }
         if (!uploadDynamic(im3dSector.vb, im3dVbCap, D3D11_BIND_VERTEX_BUFFER, im3dVtx.data(),
                            job.numVerts * static_cast<uint32_t>(sizeof(NativeVtx))) ||
