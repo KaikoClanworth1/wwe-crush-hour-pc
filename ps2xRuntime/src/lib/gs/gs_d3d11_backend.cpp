@@ -1118,6 +1118,337 @@ struct GSD3D11Backend::Impl
         return tex0.cpsm == GS_PSM_CT24 ? expand24(raw, texa) : raw;
     }
 
+    // ---- Textures straight from RenderWare rasters (native draws) -----------------------------------
+    // A RenderWare PS2 texture raster keeps a prebuilt DMA chain at originalPixels + 16 (VIF DIRECT ->
+    // GIF BITBLTBUF/TRXPOS/TRXREG/TRXDIR + IMAGE) that uploads its pixels, mip levels and palette relative
+    // to the raster's GS base; RenderWare's texture cache relocates it and re-uploads it whenever the
+    // texture is used while not resident. Native draws replay the chain once into a private GS memory at
+    // base 0 and decode level 0 there (palette at the raster's palOffset): no residency in the emulated
+    // VRAM, no per-frame uploads. TEX0 in the raster extension holds the last cache placement, so only its
+    // format fields are used. PS2X_NRW_RASTERTEX=0 decodes from VRAM again, =verify compares both.
+    struct RasterTex
+    {
+        ComPtr<ID3D11Texture2D> tex;
+        ComPtr<ID3D11ShaderResourceView> srv;
+        uint64_t key = 0;
+        uint32_t w = 0, h = 0;
+        uint64_t lastUse = 0;
+        bool verified = false;
+    };
+    std::unordered_map<uint32_t, RasterTex> rasterTex;
+    GSCpuBackend rasterMem;
+    std::vector<uint8_t> rasterVram;
+    struct RasterXfer
+    {
+        GSTransferCommand cmd;
+        uint32_t data = 0, bytes = 0;
+    };
+    std::vector<RasterXfer> rasterXfers;
+    std::vector<uint32_t> rasterPx, rasterRaw;
+    uint64_t statRasterDecodes = 0, statRasterFallbacks = 0;
+
+    static int rasterTexMode()
+    {
+        static const int s_mode = []()
+        {
+            const char *v = std::getenv("PS2X_NRW_RASTERTEX");
+            if (v && *v == '0')
+                return 0;
+            if (v && std::strcmp(v, "verify") == 0)
+                return 2;
+            return 1;
+        }();
+        return s_mode;
+    }
+
+    // Walk a raster's upload chain into rasterXfers; false when it has none or an unexpected layout.
+    bool rasterChain(const uint8_t *ee, uint32_t raster)
+    {
+        constexpr uint32_t kRam = 0x2000000u;
+        auto inRam = [&](uint32_t p, uint64_t bytes) { p &= 0x1FFFFFFFu; return p != 0u && p < kRam && p + bytes <= kRam; };
+        auto rd64 = [&](uint32_t a) { uint64_t v; std::memcpy(&v, ee + (a & 0x1FFFFF8u), 8); return v; };
+        rasterXfers.clear();
+        uint32_t orig;
+        std::memcpy(&orig, ee + ((raster + 36u) & 0x1FFFFFCu), 4);
+        if (!inRam(orig, 32u) || (orig & 15u))
+            return false;
+        uint32_t a = orig + 16u, firstRef = 0;
+        GSTransferCommand cur{};
+        cur.direction = 0;
+        for (int n = 0; n < 64; ++n)
+        {
+            if (!inRam(a, 16u) || (firstRef && a == firstRef))
+                break;
+            const uint64_t lo = rd64(a), hi = rd64(a + 8u);
+            const uint32_t qwc = static_cast<uint32_t>(lo & 0xFFFFu), id = static_cast<uint32_t>((lo >> 28) & 7u);
+            const uint32_t addr = static_cast<uint32_t>((lo >> 32) & 0x7FFFFFF0u);
+            const uint32_t vif1 = static_cast<uint32_t>(hi >> 32);
+            if ((id != 1u && id != 3u) || ((vif1 >> 24) & 0x7Fu) != 0x50u)
+                break; // NEXT / END / anything else ends the raster's chain
+            const uint32_t data = id == 1u ? a + 16u : addr;
+            if (id == 3u && !firstRef)
+                firstRef = addr;
+            if (!inRam(data, qwc * 16ull))
+                return false;
+            uint32_t o = data;
+            const uint32_t end = data + qwc * 16u;
+            while (o + 16u <= end)
+            {
+                const uint64_t gt = rd64(o), regs = rd64(o + 8u);
+                const uint32_t nloop = static_cast<uint32_t>(gt & 0x7FFFu), flg = static_cast<uint32_t>((gt >> 58) & 3u);
+                const uint32_t nreg = static_cast<uint32_t>((gt >> 60) & 0xFu);
+                o += 16u;
+                if (flg == 0u)
+                {
+                    if (nreg != 1u || (regs & 0xFu) != 0xEu || o + nloop * 16u > end)
+                        return false; // RenderWare writes these registers as A+D only
+                    for (uint32_t i = 0; i < nloop; ++i, o += 16u)
+                    {
+                        const uint64_t v = rd64(o);
+                        switch (rd64(o + 8u) & 0xFFu)
+                        {
+                        case 0x50:
+                            cur.bitbltbuf.sbp = static_cast<uint32_t>(v & 0x3FFFu);
+                            cur.bitbltbuf.sbw = static_cast<uint8_t>((v >> 16) & 0x3Fu);
+                            cur.bitbltbuf.spsm = static_cast<uint8_t>((v >> 24) & 0x3Fu);
+                            cur.bitbltbuf.dbp = static_cast<uint32_t>((v >> 32) & 0x3FFFu);
+                            cur.bitbltbuf.dbw = static_cast<uint8_t>((v >> 48) & 0x3Fu);
+                            cur.bitbltbuf.dpsm = static_cast<uint8_t>((v >> 56) & 0x3Fu);
+                            break;
+                        case 0x51:
+                            cur.trxpos.ssax = static_cast<uint16_t>(v & 0x7FFu);
+                            cur.trxpos.ssay = static_cast<uint16_t>((v >> 16) & 0x7FFu);
+                            cur.trxpos.dsax = static_cast<uint16_t>((v >> 32) & 0x7FFu);
+                            cur.trxpos.dsay = static_cast<uint16_t>((v >> 48) & 0x7FFu);
+                            cur.trxpos.dir = static_cast<uint8_t>((v >> 59) & 3u);
+                            break;
+                        case 0x52:
+                            cur.trxreg.rrw = static_cast<uint16_t>(v & 0xFFFu);
+                            cur.trxreg.rrh = static_cast<uint16_t>((v >> 32) & 0xFFFu);
+                            break;
+                        default: break; // TRXDIR (always host -> local here), TEXFLUSH
+                        }
+                    }
+                }
+                else if (flg == 2u)
+                {
+                    if (o + nloop * 16u > end)
+                        return false;
+                    rasterXfers.push_back({cur, o, nloop * 16u});
+                    o += nloop * 16u;
+                }
+                else
+                    return false;
+            }
+            a = id == 1u ? a + 16u + qwc * 16u : a + 16u;
+        }
+        return !rasterXfers.empty();
+    }
+
+    // Native texture for an RwTexture: decoded level 0 of its raster, or nullptr (caller decodes from VRAM).
+    ID3D11ShaderResourceView *rasterTexture(uint32_t rwTexture, const GSDrawState &st, uint32_t &outW, uint32_t &outH)
+    {
+        const uint8_t *ee = nrw::rdram();
+        if (!ee || !rwTexture)
+            return nullptr;
+        auto rd32 = [&](uint32_t a) { uint32_t v; std::memcpy(&v, ee + (a & 0x1FFFFFCu), 4); return v; };
+        const uint32_t raster = rd32(rwTexture);
+        if (raster < 0x100000u || raster >= 0x2000000u || (raster & 3u))
+            return nullptr;
+        const uint8_t cType = ee[(raster + 32u) & 0x1FFFFFFu];
+        const uint32_t ext = raster + 52u;
+        const uint32_t lsb = rd32(ext + 8u), msb = rd32(ext + 12u), palOffset = rd32(ext + 16u);
+        if ((cType & 7u) != 4u) // rwRASTERTYPETEXTURE; camera textures live in render targets
+        {
+            ++statRasterFallbacks;
+            return nullptr;
+        }
+        if (!rasterChain(ee, raster))
+        {
+            ++statRasterFallbacks;
+            return nullptr;
+        }
+        GSTex0Reg t{};
+        t.tbp0 = 0;
+        t.tbw = static_cast<uint8_t>((lsb >> 14) & 0x3Fu);
+        t.psm = static_cast<uint8_t>((lsb >> 20) & 0x3Fu);
+        t.tw = static_cast<uint8_t>((lsb >> 26) & 0xFu);
+        t.th = static_cast<uint8_t>(((lsb >> 30) & 3u) | ((msb & 3u) << 2));
+        t.tcc = static_cast<uint8_t>((msb >> 2) & 1u);
+        t.tfx = static_cast<uint8_t>((msb >> 3) & 3u);
+        t.cbp = palOffset;
+        t.cpsm = static_cast<uint8_t>((msb >> 19) & 0xFu);
+        t.csm = static_cast<uint8_t>((msb >> 23) & 1u);
+        t.csa = static_cast<uint8_t>((msb >> 24) & 0x1Fu);
+        if (t.tw > 10u || t.th > 10u || (isIndexed(t.psm) && t.csm != 0u))
+        {
+            ++statRasterFallbacks;
+            return nullptr; // CSM2 palettes need TEXCLUT state RenderWare never sets
+        }
+        const uint32_t tw = 1u << t.tw, th = 1u << t.th;
+        // Cache key: raster header + chain layout + a sampled hash of the image data (video textures
+        // rewrite their pixels in place) + TEXA (16-bit palette alpha expansion). TEX0's TBP0/CBP fields
+        // change whenever RenderWare's cache relocates the raster, so they are masked out.
+        const uint32_t lsbFmt = lsb & ~0x3FFFu, msbFmt = msb & ~(0x3FFFu << 5);
+        uint64_t key = fnv1a(&lsbFmt, 4);
+        {
+            const uint32_t k[] = {msbFmt, palOffset, tw, th, st.texa.ta0, st.texa.ta1, st.texa.aem ? 1u : 0u};
+            key = fnv1a(k, sizeof(k), key);
+        }
+        for (const RasterXfer &x : rasterXfers)
+        {
+            const uint32_t k[] = {x.data, x.bytes, x.cmd.bitbltbuf.dbp, x.cmd.bitbltbuf.dbw, x.cmd.bitbltbuf.dpsm,
+                                  x.cmd.trxpos.dsax, x.cmd.trxpos.dsay, x.cmd.trxreg.rrw, x.cmd.trxreg.rrh};
+            key = fnv1a(k, sizeof(k), key);
+            uint64_t c = key;
+            const uint32_t step = std::max<uint32_t>(64u, (x.bytes / 8u) & ~63u);
+            for (uint32_t off = 0; off + 64u <= x.bytes; off += step)
+            {
+                const uint64_t *w = reinterpret_cast<const uint64_t *>(ee + ((x.data + off) & 0x1FFFFFFu));
+                for (int i = 0; i < 8; ++i)
+                    c = _mm_crc32_u64(c, w[i]);
+            }
+            key ^= c * 0x9E3779B97F4A7C15ull;
+        }
+        RasterTex &rt = rasterTex[raster];
+        const bool verify = rasterTexMode() == 2;
+        if (rt.srv && rt.key == key && !(verify && !rt.verified))
+        {
+            rt.lastUse = frameCounter;
+            outW = rt.w;
+            outH = rt.h;
+            return rt.srv.Get();
+        }
+        // Replay the chain into the private GS memory and decode level 0 like decodedTexture does.
+        if (rasterVram.empty())
+        {
+            rasterVram.assign(4u * 1024u * 1024u, 0u);
+            rasterMem.Initialize(rasterVram.data(), static_cast<uint32_t>(rasterVram.size()));
+        }
+        for (const RasterXfer &x : rasterXfers)
+        {
+            rasterMem.BeginTransfer(x.cmd);
+            rasterMem.UploadImage(ee + (x.data & 0x1FFFFFFu), x.bytes);
+        }
+        rasterRaw.resize(static_cast<size_t>(tw) * th);
+        rasterMem.ReadVramRect(t.psm, 0u, std::max<uint32_t>(t.tbw, 1u), 0u, 0u, tw, th, rasterRaw.data());
+        uint16_t pal[512] = {};
+        if (isIndexed(t.psm))
+        {
+            const bool c16 = t.cpsm == GS_PSM_CT16 || t.cpsm == GS_PSM_CT16S;
+            const uint32_t count = isIndexed4(t.psm) ? 16u : 256u;
+            const uint32_t dstBase = (static_cast<uint32_t>(t.csa) & (c16 ? 0x1Fu : 0x0Fu)) << 4u;
+            const bool csm1Suffix = !c16 && !isIndexed4(t.psm);
+            for (uint32_t e = 0; e < count; ++e)
+            {
+                const uint32_t si = swizzleClutIndexCSM1(e);
+                const uint32_t raw = rasterMem.ReadVram(t.cpsm, t.cbp, 1u, si & 0x0Fu, si >> 4u);
+                const uint32_t d = (csm1Suffix ? e : dstBase + e) & (c16 ? 0x1FFu : 0xFFu);
+                if (c16)
+                    pal[d] = static_cast<uint16_t>(raw);
+                else
+                {
+                    pal[d] = static_cast<uint16_t>(raw & 0xFFFFu);
+                    pal[d + 256u] = static_cast<uint16_t>(raw >> 16u);
+                }
+            }
+        }
+        rasterPx.resize(static_cast<size_t>(tw) * th);
+        for (size_t i = 0; i < rasterPx.size(); ++i)
+        {
+            const uint32_t v = rasterRaw[i];
+            uint32_t c;
+            if (isIndexed(t.psm))
+            {
+                const bool c16 = t.cpsm == GS_PSM_CT16 || t.cpsm == GS_PSM_CT16S;
+                const uint32_t base = (static_cast<uint32_t>(t.csa) & (c16 ? 0x1Fu : 0x0Fu)) << 4u;
+                const uint32_t si = isIndexed4(t.psm) ? (v & 0x0Fu) : v;
+                uint32_t ci = (base + si) & (c16 ? 0x1FFu : 0xFFu);
+                if (!c16 && isIndexed8(t.psm))
+                    ci = std::min<uint32_t>((si & 0xF0u) + base, 240u) + (si & 0x0Fu);
+                if (c16)
+                    c = expand16(pal[ci], st.texa, true);
+                else
+                {
+                    const uint32_t raw = static_cast<uint32_t>(pal[ci]) | (static_cast<uint32_t>(pal[ci + 256u]) << 16u);
+                    c = t.cpsm == GS_PSM_CT24 ? expand24(raw, st.texa) : raw;
+                }
+            }
+            else if (is16(t.psm))
+                c = expand16(v, st.texa, true);
+            else if (is24(t.psm))
+                c = expand24(v, st.texa);
+            else
+                c = v;
+            rasterPx[i] = c;
+        }
+        ++statRasterDecodes;
+        if (verify && !rt.verified)
+        {
+            // Compare with the VRAM copy RenderWare's texture cache uploaded for this draw (bridge state).
+            rt.verified = true;
+            const GSTex0Reg &vt = st.context.tex0;
+            static int s_reports = 0;
+            if (vt.psm == t.psm && st.textureWidth == tw && st.textureHeight == th)
+            {
+                std::vector<uint32_t> vraw(static_cast<size_t>(tw) * th);
+                mem.ReadVramRect(vt.psm, vt.tbp0, std::max<uint32_t>(vt.tbw, 1u), 0u, 0u, tw, th, vraw.data());
+                uint32_t bad = 0, firstBad = 0xFFFFFFFFu;
+                for (size_t i = 0; i < vraw.size(); ++i)
+                {
+                    uint32_t c = vraw[i];
+                    if (isIndexed(vt.psm))
+                        c = clutColor(vt, st.texa, c);
+                    else if (is16(vt.psm))
+                        c = expand16(c, st.texa, true);
+                    else if (is24(vt.psm))
+                        c = expand24(c, st.texa);
+                    if (c != rasterPx[i])
+                    {
+                        if (!bad)
+                            firstBad = static_cast<uint32_t>(i);
+                        ++bad;
+                    }
+                }
+                char name[33] = {};
+                std::memcpy(name, ee + ((rwTexture + 16u) & 0x1FFFFFFu), 32);
+                if (s_reports < 300 && (bad || s_reports < 40))
+                {
+                    ++s_reports;
+                    std::printf("[nrw-tex] %-20s raster=%08x %ux%u psm=%u cpsm=%u xfers=%zu mismatch=%u/%u",
+                                name, raster, tw, th, t.psm, t.cpsm, rasterXfers.size(), bad, tw * th);
+                    if (bad)
+                        std::printf(" first@%u,%u vram=%08x raster=%08x", firstBad % tw, firstBad / tw,
+                                    isIndexed(vt.psm) ? clutColor(vt, st.texa, vraw[firstBad]) : vraw[firstBad], rasterPx[firstBad]);
+                    std::printf("\n");
+                    std::fflush(stdout);
+                }
+            }
+            else if (s_reports < 300)
+            {
+                ++s_reports;
+                std::printf("[nrw-tex] raster=%08x format differs from bridge state: raster psm=%u %ux%u, draw psm=%u %ux%u\n", raster,
+                            t.psm, tw, th, vt.psm, st.textureWidth, st.textureHeight);
+            }
+        }
+        if (!rt.tex || rt.w != tw || rt.h != th)
+        {
+            rt.tex.Reset();
+            rt.srv.Reset();
+            if (!createTexture(tw, th, D3D11_BIND_SHADER_RESOURCE, rt.tex))
+                return nullptr;
+            dev->CreateShaderResourceView(rt.tex.Get(), nullptr, &rt.srv);
+        }
+        ctx->UpdateSubresource(rt.tex.Get(), 0, nullptr, rasterPx.data(), tw * 4u, 0);
+        rt.key = key;
+        rt.w = tw;
+        rt.h = th;
+        rt.lastUse = frameCounter;
+        outW = tw;
+        outH = th;
+        return rt.srv.Get();
+    }
+
     uint64_t texturePageStamp(uint32_t first, uint32_t last) const
     {
         uint64_t s = 0;
@@ -1882,7 +2213,20 @@ struct GSD3D11Backend::Impl
             else
             {
                 uint32_t w = 1, h = 1;
-                texSrv = decodedTexture(st, w, h);
+                texSrv = nullptr;
+                if (nativeJob && nativeJob->texture && rasterTexMode() != 0)
+                {
+                    uint32_t rw = 1, rh = 1;
+                    ID3D11ShaderResourceView *rs = rasterTexture(nativeJob->texture, st, rw, rh);
+                    if (rs && rasterTexMode() == 1)
+                    {
+                        texSrv = rs;
+                        w = rw;
+                        h = rh;
+                    }
+                }
+                if (!texSrv)
+                    texSrv = decodedTexture(st, w, h);
                 static const long s_staleTbp = std::getenv("PS2X_STALE_TBP") ? std::atol(std::getenv("PS2X_STALE_TBP")) : -1;
                 if (staleLog && (t.psm == 10u || t.psm == 2u || static_cast<long>(t.tbp0) == s_staleTbp))
                 {
@@ -2616,10 +2960,13 @@ PresentationFrame GSD3D11Backend::Present(const GSPresentationRequest &request)
                 ++it;
         }
         if (std::getenv("PS2X_GS_STATS"))
-            std::printf("[gs-d3d11] draws=%llu syncs=%llu skippedSyncs=%llu uploads=%llu texDecodes=%llu rts=%zu tex=%zu\n",
+            std::printf("[gs-d3d11] draws=%llu syncs=%llu skippedSyncs=%llu uploads=%llu texDecodes=%llu rts=%zu tex=%zu "
+                        "rasterDecodes=%llu rasterFallbacks=%llu rasterTex=%zu\n",
                         static_cast<unsigned long long>(d.statDraws), static_cast<unsigned long long>(d.statSyncs),
                         static_cast<unsigned long long>(d.statSkippedSyncs), static_cast<unsigned long long>(d.statUploads),
-                        static_cast<unsigned long long>(d.statTexDecodes), d.rts.size(), d.texCache.size());
+                        static_cast<unsigned long long>(d.statTexDecodes), d.rts.size(), d.texCache.size(),
+                        static_cast<unsigned long long>(d.statRasterDecodes), static_cast<unsigned long long>(d.statRasterFallbacks),
+                        d.rasterTex.size());
         if (std::getenv("PS2X_GS_STATS"))
         {
             std::printf("[gs-d3d11]   present: %s\n", d.lastPresent);

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 
 bool ps2GsThreadEnabled();                                         // ps2_runtime.cpp
 void ps2GsThreadSubmit(GS &gs, const uint8_t *data, uint32_t size); // ps2_runtime.cpp
@@ -158,6 +159,475 @@ namespace nrw
                 if (qwc)
                     dumpVifWords(rdram, data, qwc * 4u, cl, wl);
                 addr = next;
+            }
+        }
+    }
+
+    // ---- Native object constants -------------------------------------------------------------------
+    // What RenderWare's PS2All object setup uploads to VU1 per object, computed from the RW structures
+    // (verified against the real uploads with PS2X_NRW_OBJVERIFY=1):
+    //   lightOffset..: light block (RxPipelineNodePS2AllApplyLight) or the node's 2-qword null block
+    //   1008..1011   : rows of LTM x camera->viewMatrix (sectors: viewMatrix) as {x, y, z, z}
+    //   1012..1013   : zero
+    //   1014..1018   : the per-camera block RenderWare keeps at 0x4BE1B0
+    namespace
+    {
+        constexpr uint32_t kRwGlobals = 0x4B8C50u;   // +0 curCamera, +4 curWorld, +0xA lightFrame
+        constexpr uint32_t kSkyCamBlock = 0x4BE1B0u; // 5 qwords -> VU1 1014..1018
+
+        struct Mat
+        {
+            float r[4][4]; // right, up, at, pos (w lane of right = flags)
+            uint32_t flags() const
+            {
+                uint32_t f;
+                std::memcpy(&f, &r[0][3], 4);
+                return f;
+            }
+        };
+
+        Mat readMat(const uint8_t *ee, uint32_t a)
+        {
+            Mat m;
+            std::memcpy(&m, ee + (a & 0x1FFFFF0u), 64);
+            return m;
+        }
+
+        // RwMatrixMultiply (VU0): row_i = b.right * a_i.x + b.up * a_i.y + b.at * a_i.z (+ b.pos for pos).
+        void matMul(Mat &d, const Mat &a, const Mat &b)
+        {
+            for (int i = 0; i < 4; ++i)
+                for (int k = 0; k < 3; ++k)
+                {
+                    float v = b.r[0][k] * a.r[i][0];
+                    v = v + b.r[1][k] * a.r[i][1];
+                    v = v + b.r[2][k] * a.r[i][2];
+                    if (i == 3)
+                        v = v + b.r[3][k];
+                    d.r[i][k] = v;
+                }
+            const uint32_t f = a.flags() & b.flags();
+            std::memcpy(&d.r[0][3], &f, 4);
+        }
+
+        // MatrixInvertOrthoNormalized: transpose, pos' = -(p.x*c.x + p.y*c.y + p.z*c.z) per column.
+        void invertOrtho(Mat &d, const Mat &m)
+        {
+            for (int i = 0; i < 3; ++i)
+                for (int k = 0; k < 3; ++k)
+                    d.r[i][k] = m.r[k][i];
+            for (int k = 0; k < 3; ++k)
+            {
+                float v = m.r[3][0] * m.r[k][0];
+                v = v + m.r[3][1] * m.r[k][1];
+                v = m.r[3][2] * m.r[k][2] + v;
+                d.r[3][k] = -v;
+            }
+            const uint32_t f = 3u;
+            std::memcpy(&d.r[0][3], &f, 4);
+        }
+
+        // General inverse (adjugate / determinant), RenderWare row-vector layout.
+        void invertGeneric(Mat &d, const Mat &m)
+        {
+            const float(*a)[4] = m.r;
+            const float c00 = a[1][1] * a[2][2] - a[1][2] * a[2][1];
+            const float c01 = a[1][2] * a[2][0] - a[1][0] * a[2][2];
+            const float c02 = a[1][0] * a[2][1] - a[1][1] * a[2][0];
+            const float det = a[0][0] * c00 + a[0][1] * c01 + a[0][2] * c02;
+            const float id = det != 0.0f ? 1.0f / det : 0.0f;
+            d.r[0][0] = c00 * id;
+            d.r[1][0] = c01 * id;
+            d.r[2][0] = c02 * id;
+            d.r[0][1] = (a[2][1] * a[0][2] - a[2][2] * a[0][1]) * id;
+            d.r[1][1] = (a[2][2] * a[0][0] - a[2][0] * a[0][2]) * id;
+            d.r[2][1] = (a[2][0] * a[0][1] - a[2][1] * a[0][0]) * id;
+            d.r[0][2] = (a[0][1] * a[1][2] - a[0][2] * a[1][1]) * id;
+            d.r[1][2] = (a[0][2] * a[1][0] - a[0][0] * a[1][2]) * id;
+            d.r[2][2] = (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * id;
+            for (int k = 0; k < 3; ++k)
+                d.r[3][k] = -(a[3][0] * d.r[0][k] + a[3][1] * d.r[1][k] + a[3][2] * d.r[2][k]);
+            const uint32_t f = 0u;
+            std::memcpy(&d.r[0][3], &f, 4);
+        }
+
+        void matInvert(Mat &d, const Mat &m)
+        {
+            if ((m.flags() & 3u) == 3u)
+                invertOrtho(d, m);
+            else
+                invertGeneric(d, m);
+        }
+
+        struct LightBlock
+        {
+            float q[124][4];
+            int count = 0;
+            bool unsupported = false;
+        };
+
+        void putq(float *q, float x, float y, float z, float w)
+        {
+            q[0] = x;
+            q[1] = y;
+            q[2] = z;
+            q[3] = w;
+        }
+
+        // RxPipelineNodePS2AllApplyLight: header (inverse matrix rows) on the first light, then per light
+        // {rgb, type} + direction (directional) / position + radius (point). Spot lights are not handled.
+        void applyLight(const uint8_t *ee, uint32_t light, const Mat *inv, float invScale, float recip, LightBlock &lb)
+        {
+            if (lb.count >= 0x7C)
+                return;
+            if (lb.count == 0)
+            {
+                if (inv)
+                {
+                    putq(lb.q[0], inv->r[0][0], inv->r[0][1], inv->r[0][2], invScale);
+                    putq(lb.q[1], inv->r[1][0], inv->r[1][1], inv->r[1][2], invScale);
+                    putq(lb.q[2], inv->r[2][0], inv->r[2][1], inv->r[2][2], invScale);
+                    putq(lb.q[3], inv->r[3][0], inv->r[3][1], inv->r[3][2], recip);
+                }
+                else
+                {
+                    putq(lb.q[0], 1.0f, 0.0f, 0.0f, invScale);
+                    putq(lb.q[1], 0.0f, 1.0f, 0.0f, invScale);
+                    putq(lb.q[2], 0.0f, 0.0f, 1.0f, invScale);
+                    putq(lb.q[3], 0.0f, 0.0f, 0.0f, recip);
+                }
+                lb.count = 4;
+            }
+            const uint32_t type = ee[(light + 1u) & 0x1FFFFFFu];
+            float col[3];
+            std::memcpy(col, ee + ((light + 24u) & 0x1FFFFFFu), 12);
+            float *q = lb.q[lb.count];
+            q[0] = col[0];
+            q[1] = col[1];
+            q[2] = col[2];
+            std::memcpy(&q[3], &type, 4);
+            const uint32_t frame = rd32(ee, light + 4u);
+            Mat ltm{};
+            if (frame)
+                ltm = readMat(ee, frame + 80u);
+            switch (type)
+            {
+            case 1: // directional: light frame "at"
+                putq(lb.q[lb.count + 1], ltm.r[2][0], ltm.r[2][1], ltm.r[2][2], 0.0f);
+                lb.count += 2;
+                break;
+            case 2: // ambient
+                lb.count += 1;
+                break;
+            case 0x80: // point: position, radius
+            {
+                float radius;
+                std::memcpy(&radius, ee + ((light + 20u) & 0x1FFFFFFu), 4);
+                putq(lb.q[lb.count + 1], ltm.r[3][0], ltm.r[3][1], ltm.r[3][2], radius);
+                lb.count += 2;
+                break;
+            }
+            default:
+                lb.unsupported = true;
+                break;
+            }
+        }
+
+        // RenderWare's light gathering for an atomic (RpAtomicPS2AllLightingSetupFunc) or a world sector
+        // (RpWorldSectorPS2AllLightingSetupFunc). false: lighting is off for the object (null block).
+        bool gatherLights(const uint8_t *ee, uint32_t object, bool sector, LightBlock &lb)
+        {
+            const uint32_t world = rd32(ee, kRwGlobals + 4u);
+            if (!world)
+                return false;
+            Mat inv{};
+            float invScale = 1.0f, recip = 1.0f;
+            const uint32_t flagBit = sector ? 2u : 1u; // rpLIGHTLIGHTWORLD / rpLIGHTLIGHTATOMICS
+            if (sector)
+            {
+                if ((rd32(ee, world + 8u) & 0x20u) == 0u) // rpWORLDLIGHT
+                    return false;
+            }
+            else
+            {
+                const uint32_t geom = rd32(ee, object + 24u);
+                if (!geom || (rd32(ee, geom + 8u) & 0x20u) == 0u) // rpGEOMETRYLIGHT
+                    return false;
+                const uint32_t frame = rd32(ee, object + 4u);
+                if (!frame)
+                    return false;
+                matInvert(inv, readMat(ee, frame + 80u));
+                if ((inv.flags() & 3u) != 3u)
+                {
+                    const float s2 = inv.r[2][0] * inv.r[2][0] + inv.r[2][1] * inv.r[2][1] + inv.r[2][2] * inv.r[2][2];
+                    invScale = std::sqrt(s2);
+                    if (invScale > 0.0f)
+                        recip = 1.0f / invScale;
+                }
+            }
+            const Mat *invp = sector ? nullptr : &inv;
+            // Global lights: curWorld->directionalLightList (RpLight.inWorld at +52).
+            const uint32_t head = world + 60u;
+            uint32_t node = rd32(ee, head);
+            for (int n = 0; node != head && node && n < 64; ++n, node = rd32(ee, node))
+            {
+                const uint32_t light = node - 52u;
+                if (ee[(light + 2u) & 0x1FFFFFFu] & flagBit)
+                    applyLight(ee, light, invp, invScale, recip, lb);
+            }
+            // Local lights of the sector(s): sector+0x48 list of RpLightTie {link, light}. An atomic walks its
+            // RpTie list (atomic+100, sector at node+8); each light once per object.
+            uint32_t seen[32];
+            int nseen = 0;
+            auto sectorLights = [&](uint32_t sec)
+            {
+                const uint32_t lh = sec + 0x48u;
+                uint32_t ln = rd32(ee, lh);
+                for (int n = 0; ln != lh && ln && n < 64; ++n, ln = rd32(ee, ln))
+                {
+                    const uint32_t light = rd32(ee, ln + 8u);
+                    if (!light || !(ee[(light + 2u) & 0x1FFFFFFu] & flagBit))
+                        continue;
+                    bool dup = false;
+                    for (int i = 0; i < nseen; ++i)
+                        dup |= seen[i] == light;
+                    if (dup)
+                        continue;
+                    if (nseen < 32)
+                        seen[nseen++] = light;
+                    applyLight(ee, light, invp, invScale, recip, lb);
+                }
+            };
+            if (sector)
+                sectorLights(object);
+            else
+            {
+                const uint32_t th = object + 100u;
+                uint32_t tn = rd32(ee, th);
+                for (int n = 0; tn != th && tn && n < 64; ++n, tn = rd32(ee, tn))
+                    if (const uint32_t sec = rd32(ee, tn + 8u))
+                        sectorLights(sec);
+            }
+            return true;
+        }
+
+        struct ObjExpect
+        {
+            float vu[kVuQwCount][4];
+            uint64_t mask = 0; // bit i: VU1 kVuFirstQw + i was computed
+            uint32_t setupCB = 0;
+            bool unsupported = false;
+        };
+        constexpr uint32_t kExpectRing = 4096u;
+        ObjExpect g_objExpect[kExpectRing];
+
+        // Fill ex with the object constants RenderWare would upload for this object.
+        void computeObjectConstants(const uint8_t *ee, uint32_t object, bool sector, uint32_t objPvt, ObjExpect &ex)
+        {
+            ex.mask = 0;
+            ex.unsupported = false;
+            const uint32_t cam = rd32(ee, kRwGlobals);
+            if (!cam)
+            {
+                ex.unsupported = true;
+                return;
+            }
+            const Mat view = readMat(ee, cam + 32u);
+            Mat t;
+            if (sector)
+                t = view;
+            else
+            {
+                const uint32_t frame = rd32(ee, object + 4u);
+                if (!frame)
+                {
+                    ex.unsupported = true;
+                    return;
+                }
+                matMul(t, readMat(ee, frame + 80u), view);
+            }
+            for (int i = 0; i < 4; ++i)
+            {
+                putq(ex.vu[vuIndex(1008u + i)], t.r[i][0], t.r[i][1], t.r[i][2], t.r[i][2]);
+                ex.mask |= 1ull << vuIndex(1008u + i);
+            }
+            putq(ex.vu[vuIndex(1012)], 0, 0, 0, 0);
+            putq(ex.vu[vuIndex(1013)], 0, 0, 0, 0);
+            ex.mask |= (1ull << vuIndex(1012)) | (1ull << vuIndex(1013));
+            for (uint32_t i = 0; i < 5; ++i)
+            {
+                std::memcpy(ex.vu[vuIndex(1014u + i)], ee + ((kSkyCamBlock + i * 16u) & 0x1FFFFFFu), 16);
+                ex.mask |= 1ull << vuIndex(1014u + i);
+            }
+            const uint32_t lightOffset = rd32(ee, objPvt + 28u);
+            static LightBlock lb;
+            lb.count = 0;
+            lb.unsupported = false;
+            const bool lit = gatherLights(ee, object, sector, lb);
+            if (lb.unsupported)
+                ex.unsupported = true;
+            // The node's null block is a VIF UNPACK header + data: for an unlit object only the light list
+            // terminator (VU1 980) is written. A lit object gets header + lights + that terminator.
+            const uint32_t nullBlock = rd32(ee, objPvt + 36u);
+            if (lightOffset >= kVuFirstQw && lightOffset < 1008u)
+            {
+                if (lit && lb.count > 0)
+                {
+                    for (int i = 0; i < lb.count && lightOffset + i < 1008u; ++i)
+                    {
+                        std::memcpy(ex.vu[vuIndex(lightOffset + i)], lb.q[i], 16);
+                        ex.mask |= 1ull << vuIndex(lightOffset + i);
+                    }
+                    const uint32_t term = lightOffset + static_cast<uint32_t>(lb.count);
+                    if (nullBlock && term < 1008u)
+                    {
+                        std::memcpy(ex.vu[vuIndex(term)], ee + ((nullBlock + 16u) & 0x1FFFFFFu), 16);
+                        ex.mask |= 1ull << vuIndex(term);
+                    }
+                }
+                else if (nullBlock)
+                {
+                    const uint32_t hdr = rd32(ee, nullBlock + 12u); // UNPACK: num << 16 | addr
+                    const uint32_t addr = hdr & 0x3FFu, num = (hdr >> 16) & 0xFFu;
+                    for (uint32_t i = 0; i < num && addr + i >= kVuFirstQw && addr + i < 1008u; ++i)
+                    {
+                        std::memcpy(ex.vu[vuIndex(addr + i)], ee + ((nullBlock + 16u + i * 16u) & 0x1FFFFFFu), 16);
+                        ex.mask |= 1ull << vuIndex(addr + i);
+                    }
+                }
+            }
+        }
+
+        // What RpMeshPS2AllBridgeCallBack uploads per mesh (VU1 1018..1023). Globals are gp-relative.
+        constexpr uint32_t kGp = 0x497870u;
+        constexpr uint32_t kSkyGifTag = 0x4BE100u; // GIF tag template (PRIM patched per mesh)
+        void computeMeshConstants(const uint8_t *ee, uint32_t pipeData, ObjExpect &ex)
+        {
+            auto g32 = [&](uint32_t off) { return rd32(ee, kGp - off); };
+            auto gf = [&](uint32_t off) { float f; uint32_t u = g32(off); std::memcpy(&f, &u, 4); return f; };
+            const uint32_t transType = ee[(pipeData + 40u) & 0x1FFFFFFu];
+            const uint32_t primType = ee[(pipeData + 41u) & 0x1FFFFFFu];
+            uint8_t col[4];
+            std::memcpy(col, ee + ((pipeData + 68u) & 0x1FFFFFFu), 4);
+            // 1018: GIF tag with PRIM = skyPrim_State (ABE when the material is translucent or g-0x797C) | primType.
+            uint64_t lo, hi;
+            std::memcpy(&lo, ee + (kSkyGifTag & 0x1FFFFFFu), 8);
+            std::memcpy(&hi, ee + ((kSkyGifTag + 8u) & 0x1FFFFFFu), 8);
+            uint64_t primState;
+            std::memcpy(&primState, ee + ((kGp - 0x7CC0u) & 0x1FFFFFFu), 8);
+            const bool abe = col[3] != 0xFFu || g32(0x797C) != 0u;
+            primState = abe ? (primState | 0x40u) : (primState & ~0x40ull);
+            const uint64_t prim = (static_cast<uint32_t>(primState) | primType) & 0x7FFu;
+            lo = (lo & ~(0x7FFull << 47)) | (prim << 47);
+            std::memcpy(&ex.vu[vuIndex(1018)][0], &lo, 8);
+            std::memcpy(&ex.vu[vuIndex(1018)][2], &hi, 8);
+            ex.mask |= 1ull << vuIndex(1018);
+            // 1019: material colour; rgb scale depends on texturing (PRIM TME), alpha always gp-0x7F7C.
+            const float s = (primState & 0x10u) ? gf(0x7F7C) : gf(0x7F78);
+            putq(ex.vu[vuIndex(1019)], static_cast<float>(col[0]) * s, static_cast<float>(col[1]) * s, static_cast<float>(col[2]) * s,
+                 static_cast<float>(col[3]) * gf(0x7F7C));
+            ex.mask |= 1ull << vuIndex(1019);
+            // 1020: surface properties * 255, w = spExtra.
+            const uint32_t sp = rd32(ee, pipeData + 60u);
+            float amb = 0, spec = 0, diff = 0, spExtra;
+            if (sp)
+            {
+                std::memcpy(&amb, ee + (sp & 0x1FFFFFFu), 4);
+                std::memcpy(&spec, ee + ((sp + 4u) & 0x1FFFFFFu), 4);
+                std::memcpy(&diff, ee + ((sp + 8u) & 0x1FFFFFFu), 4);
+            }
+            std::memcpy(&spExtra, ee + ((pipeData + 28u) & 0x1FFFFFFu), 4);
+            const float k2 = gf(0x7F70);
+            putq(ex.vu[vuIndex(1020)], amb * k2, spec * k2, diff * k2, spExtra);
+            ex.mask |= 1ull << vuIndex(1020);
+            // 1021..1023: clip planes (small / large guard band) and flags.
+            uint32_t flags = transType & 7u;
+            bool large;
+            if (g32(0x792C) != 0u && (flags & 4u) == 0u)
+                large = true;
+            else if (g32(0x7C98) == 0u)
+                large = false;
+            else
+                large = (flags & 4u) != 0u;
+            if (large)
+                flags |= 8u;
+            const uint32_t clipSrc = large ? 0x4BE170u : 0x4BE150u;
+            std::memcpy(ex.vu[vuIndex(1021)], ee + (clipSrc & 0x1FFFFFFu), 16);
+            std::memcpy(ex.vu[vuIndex(1022)], ee + ((clipSrc + 16u) & 0x1FFFFFFu), 16);
+            const uint32_t w2 = g32(0x7988) == 3u ? 0x20u : 0u;
+            const uint32_t w[4] = {flags, 0u, w2, g32(0x7930)};
+            std::memcpy(ex.vu[vuIndex(1023)], w, 16);
+            ex.mask |= (1ull << vuIndex(1021)) | (1ull << vuIndex(1022)) | (1ull << vuIndex(1023));
+        }
+
+        bool objVerifyMode()
+        {
+            static const bool s_on = std::getenv("PS2X_NRW_OBJVERIFY") != nullptr;
+            return s_on;
+        }
+
+        // Compare the native constants for marker idx with the VU1 data memory RenderWare produced.
+        void verifyObjectConstants(uint32_t idx, const MeshJob &job)
+        {
+            const ObjExpect &ex = g_objExpect[idx & (kExpectRing - 1u)];
+            static uint64_t s_checked = 0, s_exact = 0, s_unsup = 0, s_badQw[kVuQwCount] = {};
+            static int s_reports = 0;
+            ++s_checked;
+            if (ex.unsupported)
+            {
+                ++s_unsup;
+                return;
+            }
+            bool exact = true;
+            for (uint32_t i = 0; i < kVuQwCount; ++i)
+            {
+                if (!(ex.mask & (1ull << i)))
+                    continue;
+                if (std::memcmp(ex.vu[i], job.vu[i], 16) != 0)
+                {
+                    // Tolerate float rounding differences (a few ulps) in the computed lanes.
+                    bool close = true;
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        const float a = ex.vu[i][k], b = job.vu[i][k];
+                        uint32_t ua, ub;
+                        std::memcpy(&ua, &a, 4);
+                        std::memcpy(&ub, &b, 4);
+                        if (ua == ub)
+                            continue;
+                        const float diff = std::fabs(a - b), mag = std::max(std::fabs(a), std::fabs(b));
+                        if (!(diff <= mag * 1e-5f || diff < 1e-6f))
+                            close = false;
+                    }
+                    if (!close)
+                    {
+                        exact = false;
+                        ++s_badQw[i];
+                        if (s_reports < 60)
+                        {
+                            ++s_reports;
+                            uint32_t ua[4], ub[4];
+                            std::memcpy(ua, ex.vu[i], 16);
+                            std::memcpy(ub, job.vu[i], 16);
+                            std::printf("[nrw-obj] kind=%u obj=%08x setupCB=%08x vu%u NAT=(%g %g %g %g | %08x %08x %08x %08x) "
+                                        "RW=(%g %g %g %g | %08x %08x %08x %08x)\n",
+                                        job.kind, job.object, ex.setupCB, kVuFirstQw + i, ex.vu[i][0], ex.vu[i][1], ex.vu[i][2], ex.vu[i][3], ua[0],
+                                        ua[1], ua[2], ua[3], job.vu[i][0], job.vu[i][1], job.vu[i][2], job.vu[i][3], ub[0], ub[1], ub[2], ub[3]);
+                        }
+                    }
+                }
+            }
+            if (exact)
+                ++s_exact;
+            if ((s_checked % 20000u) == 0u)
+            {
+                std::printf("[nrw-obj-stats] checked=%llu match=%llu unsupported=%llu badQw:", (unsigned long long)s_checked,
+                            (unsigned long long)s_exact, (unsigned long long)s_unsup);
+                for (uint32_t i = 0; i < kVuQwCount; ++i)
+                    if (s_badQw[i])
+                        std::printf(" %u:%llu", kVuFirstQw + i, (unsigned long long)s_badQw[i]);
+                std::printf("\n");
+                std::fflush(stdout);
             }
         }
     }
@@ -652,6 +1122,16 @@ namespace nrw
         e.texture = rd32(rdram, pipeData + 0x40);
         e.matCol = rd32(rdram, pipeData + 0x44);
         e.code = code;
+        if (objVerifyMode())
+        {
+            // Native object constants from the RW structures, compared at the marker with what RW uploaded.
+            ObjExpect &ex = g_objExpect[idx & (kExpectRing - 1u)];
+            const uint32_t objPvt = rd32(rdram, pipeData + 0x00);
+            ex.setupCB = rd32(rdram, objPvt + 16u);
+            computeObjectConstants(rdram, object, kind == kWorldSectorMesh, objPvt, ex);
+            if (!ex.unsupported)
+                computeMeshConstants(rdram, pipeData, ex);
+        }
         // DMA CNT, qwc 0; with TTE its upper half goes to VIF1: MARK 0xC0DE, then NOP carrying the index.
         lo = 0x10000000ull;
         hi = (0x07000000ull | kMarkerMark) | (static_cast<uint64_t>(idx & 0xFFFFu) << 32);
@@ -682,6 +1162,8 @@ namespace nrw
         job.surfProps = e.surfProps;
         if (const uint8_t *vu = memory.getVU1Data())
             std::memcpy(job.vu, vu + kVuFirstQw * 16u, sizeof(job.vu));
+        if (objVerifyMode())
+            verifyObjectConstants(index, job);
         if (verifyMode())
         {
             computeExpected(job);
