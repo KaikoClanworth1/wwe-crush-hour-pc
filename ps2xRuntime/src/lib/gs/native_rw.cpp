@@ -1638,7 +1638,7 @@ namespace nrw
     {
         static const char *s_mode = []()
         {
-            const char *v = std::getenv("PS2X_NRW_IM2D"); // =1: native (off by default for now, see skinNative)
+            const char *v = std::getenv("PS2X_NRW_IM2D"); // =1: native (off by default: same PATH3 pairing risk as G3 Gem)
             return v ? v : "0";
         }();
         if (!ee || !verts)
@@ -1765,14 +1765,13 @@ namespace nrw
         return true;
     }
 
-    // RpPDS_G3_Skin objects drawn natively (PS2X_NRW_SKIN=1; off by default while the menu-panel corruption seen
-    // with today's native paths is narrowed down).
+    // RpPDS_G3_Skin objects drawn natively (PS2X_NRW_SKIN=0: RenderWare's skin VU1 program).
     bool skinNative()
     {
         static const bool s_on = []()
         {
             const char *v = std::getenv("PS2X_NRW_SKIN");
-            return v && *v == '1';
+            return !(v && *v == '0');
         }();
         return s_on;
     }
@@ -1781,8 +1780,8 @@ namespace nrw
     {
         static const bool s_on = []()
         {
-            const char *v = std::getenv("PS2X_NRW_ISO"); // =1: on (off by default for now, see skinNative)
-            return v && *v == '1';
+            const char *v = std::getenv("PS2X_NRW_ISO");
+            return !(v && *v == '0');
         }();
         return !(transBase & 8u) || (s_on && !(transBase & 1u));
     }
@@ -2236,9 +2235,13 @@ namespace nrw
                                 (unsigned long long)s_fx[2], (unsigned long long)s_fx[3], (unsigned long long)s_fx[4],
                                 (unsigned long long)s_fx[5], sector ? 1 : 0);
             }
+            // PS2X_NRW_G3GEM=1: MatFX env maps on generic objects natively. Off by default: together with native
+            // ISO draws it corrupted the Match Type panel (a render-to-texture camera) -- skipping these objects'
+            // packets shifts which masked PATH3 texture upload each MSKPATH3 unmask releases, so the panel's
+            // sprites sampled VRAM before their textures arrived.
             static const bool s_g3Gem = []()
             {
-                const char *v = std::getenv("PS2X_NRW_G3GEM"); // =1: MatFX env maps on generic objects natively
+                const char *v = std::getenv("PS2X_NRW_G3GEM");
                 return v && *v == '1';
             }();
             if (effect == 2u && s_gem && s_g3Gem) // Gem: the generic programs plus an additive env pass
