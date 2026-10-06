@@ -2020,9 +2020,34 @@ void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
                        exception == EXCEPTION_TLB_REFILL);
 }
 
+std::atomic<uint64_t> g_vu0MicroRuns{0}; // PS2X_VU_STATS
+std::atomic<uint32_t> g_vu0LastPc{0};
+
 void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
 {
     (void)rdram;
+    g_vu0MicroRuns.fetch_add(1, std::memory_order_relaxed);
+    g_vu0LastPc.store(address, std::memory_order_relaxed);
+    {
+        // PS2X_VU_STATS: VU0 micro programs run on the VU interpreter -- report how often and where from.
+        static const bool s_stats = std::getenv("PS2X_VU_STATS") != nullptr;
+        static std::unordered_map<uint64_t, uint64_t> s_pcs;
+        static auto s_last = std::chrono::steady_clock::now();
+        if (s_stats)
+        {
+            ++s_pcs[(static_cast<uint64_t>(address) << 32) | GPR_U32(ctx, 31)];
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_last >= std::chrono::seconds(2))
+            {
+                s_last = now;
+                std::printf("[vu0-micro] calls/2s by (pc, ra):");
+                for (const auto &[k, n] : s_pcs)
+                    std::printf(" %x/%x:%llu", static_cast<uint32_t>(k >> 32), static_cast<uint32_t>(k), (unsigned long long)n);
+                std::printf("%c", 10);
+                s_pcs.clear();
+            }
+        }
+    }
 
     uint8_t *const vu0Code = m_memory.getVU0Code();
     uint8_t *const vu0Data = m_memory.getVU0Data();

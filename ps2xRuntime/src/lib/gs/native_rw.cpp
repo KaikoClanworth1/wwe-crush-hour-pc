@@ -1086,6 +1086,10 @@ namespace nrw
             kNsLocked, kNsCount
         };
         uint64_t g_nstat[kNsCount] = {};
+        // Why meshes stay on RenderWare's pipeline (PS2X_NRW_STATS): 0 unknown pipeline, 1 MatFX line/effect code index,
+        // 2 MatFX effect, 3 G3x non-Gem pipeline, 4 Gem env rejected, 5 texture not a plain texture raster.
+        uint64_t g_pipeWhy[6] = {};
+
         void nstat(int k)
         {
             static const bool s_on = std::getenv("PS2X_NRW_STATS") != nullptr;
@@ -1101,6 +1105,9 @@ namespace nrw
                             (unsigned long long)g_nstat[3], (unsigned long long)g_nstat[4], (unsigned long long)g_nstat[5],
                             (unsigned long long)g_nstat[6], (unsigned long long)g_nstat[7], (unsigned long long)g_nstat[8],
                             (unsigned long long)g_nstat[9], (unsigned long long)g_nstat[10]);
+                std::printf("[nrw-node-pipe-why] unknown=%llu matfxTrans=%llu matfxEffect=%llu g3xOther=%llu gemEnv=%llu texture=%llu\n",
+                            (unsigned long long)g_pipeWhy[0], (unsigned long long)g_pipeWhy[1], (unsigned long long)g_pipeWhy[2],
+                            (unsigned long long)g_pipeWhy[3], (unsigned long long)g_pipeWhy[4], (unsigned long long)g_pipeWhy[5]);
                 std::fflush(stdout);
             }
         }
@@ -1461,6 +1468,7 @@ namespace nrw
         Entry &e = g_table[idx];
         e.native = false;
         e.envTexture = 0;
+        e.envFlags = 0;
         e.gsFromRegs = false;
         e.kind = kind;
         e.verts = verts;
@@ -1516,6 +1524,18 @@ namespace nrw
     // RenderWare's static Im3D mesh (material 0x466390: white, alpha 254, surface properties 1). The generic VU1
     // program draws it unlit with the vertices' RGBA; texture and blending come from the render states (GS
     // registers), so the job takes those from the GS. Vertices and indices are snapshotted into the ring.
+    // Parallel-projection cameras (transType bit 8: the HUD, 2D cameras) are drawn natively with RenderWare's ISO
+    // VU1 math (no divide, see bindNative); fogged ISO objects stay on RenderWare. PS2X_NRW_ISO=0: all ISO on RW.
+    bool isoNative(uint32_t transBase)
+    {
+        static const bool s_on = []()
+        {
+            const char *v = std::getenv("PS2X_NRW_ISO");
+            return !(v && *v == '0');
+        }();
+        return !(transBase & 8u) || (s_on && !(transBase & 1u));
+    }
+
     bool im3dNode(uint8_t *ee, PS2Memory &memory, uint32_t objPvt, uint32_t stash, int mode)
     {
         static const bool s_on = []()
@@ -1590,7 +1610,7 @@ namespace nrw
         for (uint32_t a = kVuFirstQw; a < 1008u; ++a)
             putq(ex.vu[vuIndex(a)], 0, 0, 0, 0); // no lights (terminator at 980)
         const uint32_t transBase = ee[(kGp - 0x793Cu) & 0x1FFFFFFu];
-        if (transBase & 8u) // parallel-projection camera (HUD): RenderWare's parallel VU1 variant, not drawn natively
+        if (!isoNative(transBase))
         {
             nstat(kNsPrim);
             return false;
@@ -1655,6 +1675,7 @@ namespace nrw
         e.gsTest = e.gsTex1 = e.gsClamp = 0;
         e.geomGen = 0;
         e.envTexture = 0;
+        e.envFlags = 0;
         e.ringIndices = iAt;
         e.numIndices = numIndices;
         std::memcpy(g_nativeVu[idx & (kNativeVuRing - 1u)], ex.vu, sizeof(ex.vu));
@@ -1708,6 +1729,24 @@ namespace nrw
         {
             nstat(kNsOtherSetup);
             static const bool s_hist = std::getenv("PS2X_NRW_STATS") != nullptr;
+            if (s_hist && setupCB == 0x2E0540u)
+            {
+                // RpPDS_G3_Skin: does the geometry keep its source arrays (verts, skin weights/indices)?
+                static int s_skinShown = 0;
+                const uint32_t geom = rd32(ee, object + 24u);
+                if (s_skinShown < 12 && geom)
+                {
+                    ++s_skinShown;
+                    const uint32_t mt = rd32(ee, geom + 92u), skin = rd32(ee, geom + rd32(ee, 0x466168u));
+                    std::printf("[nrw-skin] atomic=%08x geom=%08x flags=%08x numVerts=%u numMT=%u verts=%08x normals=%08x uvs=%08x "
+                                "skin=%08x bones=%u ids=%u inv=%08x maxW=%u vIdx=%08x vW=%08x frame=%08x\n",
+                                object, geom, rd32(ee, geom + 8u), rd32(ee, geom + 20u), rd32(ee, geom + 24u),
+                                mt ? rd32(ee, mt + 20u) : 0u, mt ? rd32(ee, mt + 24u) : 0u, rd32(ee, geom + 52u), skin,
+                                skin ? rd32(ee, skin) : 0u, skin ? rd32(ee, skin + 4u) : 0u, skin ? rd32(ee, skin + 12u) : 0u,
+                                skin ? rd32(ee, skin + 16u) : 0u, skin ? rd32(ee, skin + 20u) : 0u, skin ? rd32(ee, skin + 24u) : 0u,
+                                rd32(ee, object + 4u));
+                }
+            }
             if (s_hist)
             {
                 // Which object setup callbacks keep objects on RenderWare's pipeline (finalize CB alongside).
@@ -1866,6 +1905,44 @@ namespace nrw
             return k;
         };
         const uint32_t matfxOffset = rd32(ee, kGp - 0x7C48u);
+        static const bool s_gem = []()
+        {
+            const char *v = std::getenv("PS2X_NRW_GEM"); // =0: env-mapped objects stay on RenderWare
+            return !(v && *v == '0');
+        }();
+        // Env map (RpPDS_G3x_Gem_MeshPS2AllBridgeCallBack / RpPDS_G3_Gem_PS2AllMatBridgeCallBack): matfx data
+        // {frame, texture, coef, fbAlpha}; the env raster must be a plain texture raster or a camera texture, and
+        // the env frame's LTM in sync.
+        auto gemEnvOk = [&](uint32_t material)
+        {
+            const uint32_t fx = rd32(ee, material + matfxOffset);
+            const uint32_t envTex = fx ? rd32(ee, fx + 4u) : 0u, envRaster = envTex ? rd32(ee, envTex) : 0u;
+            static const bool s_diag = std::getenv("PS2X_NRW_STATS") != nullptr;
+            static uint64_t s_rej[4] = {};
+            auto reject = [&](int why)
+            {
+                ++g_pipeWhy[4];
+                if (s_diag && (++s_rej[why] % 20000u) == 1u)
+                    std::printf("[nrw-gem-reject] raster=%llu rasterType=%llu frame=%llu (type %u pixels %08x)\n",
+                                (unsigned long long)s_rej[0], (unsigned long long)s_rej[1], (unsigned long long)s_rej[2],
+                                envRaster ? ee[(envRaster + 32u) & 0x1FFFFFFu] : 0u, envRaster ? rd32(ee, envRaster + 36u) : 0u);
+                return false;
+            };
+            if (!envRaster)
+                return reject(0);
+            // A texture raster with its upload chain, or a camera texture (rendered by the GS, sampled from
+            // its render target at the raster's VRAM address).
+            const uint32_t envType = ee[(envRaster + 32u) & 0x1FFFFFFu] & 7u;
+            if (envType != 5u && (envType != 4u || !rd32(ee, envRaster + 36u)))
+                return reject(1);
+            uint32_t envFrame = rd32(ee, fx);
+            if (!envFrame)
+                envFrame = rd32(ee, cam + 4u);
+            const uint32_t envRoot = envFrame ? rd32(ee, envFrame + 160u) : 0u;
+            if (!envRoot || (ee[(envRoot + 3u) & 0x1FFFFFFu] & 1u))
+                return reject(2);
+            return true;
+        };
         auto pipeOk = [&](uint32_t pipe, uint32_t material)
         {
             const int k = pipeKind(pipe);
@@ -1873,48 +1950,43 @@ namespace nrw
             {
                 if (k == kPipeG3x)
                     return true;
-                static const bool s_gem = []()
-                {
-                    const char *v = std::getenv("PS2X_NRW_GEM"); // =0: env-mapped G3x objects stay on RenderWare
-                    return !(v && *v == '0');
-                }();
-                if (k != kPipeG3xGem || !s_gem)
-                    return false;
-                // Env map (RpPDS_G3x_Gem_MeshPS2AllBridgeCallBack): matfx data {frame, texture, coef, fbAlpha};
-                // the env raster must be a plain texture raster and the env frame's LTM in sync.
-                const uint32_t fx = rd32(ee, material + matfxOffset);
-                const uint32_t envTex = fx ? rd32(ee, fx + 4u) : 0u, envRaster = envTex ? rd32(ee, envTex) : 0u;
-                static const bool s_diag = std::getenv("PS2X_NRW_STATS") != nullptr;
-                static uint64_t s_rej[4] = {};
-                auto reject = [&](int why)
-                {
-                    if (s_diag && (++s_rej[why] % 20000u) == 1u)
-                        std::printf("[nrw-gem-reject] raster=%llu rasterType=%llu frame=%llu (type %u pixels %08x)\n",
-                                    (unsigned long long)s_rej[0], (unsigned long long)s_rej[1], (unsigned long long)s_rej[2],
-                                    envRaster ? ee[(envRaster + 32u) & 0x1FFFFFFu] : 0u, envRaster ? rd32(ee, envRaster + 36u) : 0u);
-                    return false;
-                };
-                if (!envRaster)
-                    return reject(0);
-                // A texture raster with its upload chain, or a camera texture (rendered by the GS, sampled from
-                // its render target at the raster's VRAM address).
-                const uint32_t envType = ee[(envRaster + 32u) & 0x1FFFFFFu] & 7u;
-                if (envType != 5u && (envType != 4u || !rd32(ee, envRaster + 36u)))
-                    return reject(1);
-                uint32_t envFrame = rd32(ee, fx);
-                if (!envFrame)
-                    envFrame = rd32(ee, cam + 4u);
-                const uint32_t envRoot = envFrame ? rd32(ee, envFrame + 160u) : 0u;
-                if (!envRoot || (ee[(envRoot + 3u) & 0x1FFFFFFu] & 1u))
-                    return reject(2);
-                return true;
+                if (k != kPipeG3xGem)
+                    ++g_pipeWhy[3];
+                return k == kPipeG3xGem && s_gem && gemEnvOk(material);
             }
             if (k == kPipeGeneric || k == kPipeGame)
                 return true;
             if (k != kPipeMatFX || (ee[(kGp - 0x793Cu) & 0x1FFFFFFu] & 0x10u)) // trans 0x10: code index 4+ (MatFX effect codes)
+            {
+                ++g_pipeWhy[k != kPipeMatFX ? 0 : 1];
                 return false;
+            }
             const uint32_t fx = rd32(ee, material + matfxOffset);
-            return !fx || rd32(ee, fx + 0x80u) == 0u;
+            const uint32_t effect = fx ? rd32(ee, fx + 0x80u) : 0u;
+            static const bool s_fxDiag = std::getenv("PS2X_NRW_STATS") != nullptr;
+            if (s_fxDiag && effect != 0u)
+            {
+                // MatFX effects kept on RenderWare (1 Emb bump, 2 Gem env, 3 Bem bump+env, 4 Dup dual pass).
+                static uint64_t s_fx[8] = {}, s_n = 0;
+                ++s_fx[effect & 7u];
+                if ((++s_n % 5000u) == 1u)
+                    std::printf("[nrw-matfx] effects 1..5: %llu %llu %llu %llu %llu (sector %d)\n", (unsigned long long)s_fx[1],
+                                (unsigned long long)s_fx[2], (unsigned long long)s_fx[3], (unsigned long long)s_fx[4],
+                                (unsigned long long)s_fx[5], sector ? 1 : 0);
+            }
+            if (effect == 2u && s_gem) // Gem: the generic programs plus an additive env pass
+            {
+                // Plain env textures only: camera-texture env maps on these objects were not live render targets
+                // (each draw read VRAM back, the GPU stalled for seconds).
+                const uint32_t envTex = fx ? rd32(ee, fx + 4u) : 0u, envRaster = envTex ? rd32(ee, envTex) : 0u;
+                if (envRaster && (ee[(envRaster + 32u) & 0x1FFFFFFu] & 7u) == 4u)
+                    return gemEnvOk(material);
+                ++g_pipeWhy[4];
+                return false;
+            }
+            if (effect != 0u)
+                ++g_pipeWhy[2];
+            return effect == 0u;
         };
         for (uint32_t i = 0; i < numMeshes; ++i)
         {
@@ -1949,11 +2021,25 @@ namespace nrw
                 }
                 return false;
             }
-            // Textures must be plain texture rasters with an upload chain (camera textures live in render
-            // targets and stay on RenderWare's path).
+            // Textures must be plain texture rasters with an upload chain. Camera textures (render targets) stay on
+            // RenderWare: its texture cache places them in VRAM (RpSkyTexCacheAccessRaster), which the node path
+            // skips -- drawing them natively blacked out the menus and the arena intro, which composite through them.
             const uint32_t texture = rd32(ee, material), raster = texture ? rd32(ee, texture) : 0u;
-            if (texture && (!raster || (ee[(raster + 32u) & 0x1FFFFFFu] & 7u) != 4u || !rd32(ee, raster + 36u)))
+            const uint32_t rasterType = raster ? (ee[(raster + 32u) & 0x1FFFFFFu] & 7u) : 0u;
+            if (texture && (!raster || rasterType != 4u || !rd32(ee, raster + 36u)))
             {
+                ++g_pipeWhy[5];
+                static const bool s_texDiag = std::getenv("PS2X_NRW_STATS") != nullptr;
+                static int s_texShown = 0;
+                if (s_texDiag && raster && s_texShown < 16)
+                {
+                    ++s_texShown;
+                    uint32_t w = rd32(ee, raster + 12u), h = rd32(ee, raster + 16u);
+                    std::printf("[nrw-tex-reject] setup=%08x obj=%08x tex=%08x raster=%08x type=%u flags=%02x priv=%02x fmt=%02x %ux%u chain=%08x pixels=%08x parent=%08x\n",
+                                setupCB, object, texture, raster, ee[(raster + 32u) & 0x1FFFFFFu] & 7u, ee[(raster + 33u) & 0x1FFFFFFu],
+                                ee[(raster + 34u) & 0x1FFFFFFu], ee[(raster + 35u) & 0x1FFFFFFu], w, h, rd32(ee, raster + 36u),
+                                rd32(ee, raster + 4u), rd32(ee, raster));
+                }
                 nstat(kNsPipe);
                 return false;
             }
@@ -1973,7 +2059,7 @@ namespace nrw
         }
         // RpAtomic/RpWorldSector PS2All prim/trans setup: strip -> PRIM 4, list -> PRIM 3 + LIST; clip unless inside.
         const uint32_t transBase = ee[(kGp - 0x793Cu) & 0x1FFFFFFu];
-        if (transBase & 8u) // parallel-projection camera (HUD): RenderWare's parallel VU1 variant, not drawn natively
+        if (!isoNative(transBase))
         {
             nstat(kNsPrim);
             return false;
@@ -2050,11 +2136,18 @@ namespace nrw
             e.gsClamp = clamp;
             e.geomGen = geomGen;
             e.envTexture = 0;
+            e.envFlags = (raster && (ee[(raster + 32u) & 0x1FFFFFFu] & 7u) == 5u) ? kBaseRenderTarget : 0u;
             e.gsFromRegs = false;
-            if (g3x)
+            const uint32_t meshMatPipe = rd32(ee, material + 8u);
+            const int meshPipe = pipeKind(groupPipe ? groupPipe : (meshMatPipe ? meshMatPipe : defPipe));
+            const uint32_t meshFx = rd32(ee, material + matfxOffset);
+            // RpPDS_G3_Gem_PS2AllMatBridgeCallBack (MatFX effect 2 on RenderWare's generic atomics / sectors): its VU1
+            // env pass computes UV = 0.5 - 0.5 * (N x M).xy with M = _rpMatFXSyncEffectMatrix (object LTM x inverse
+            // env frame LTM, orthonormalised; the inverse env LTM alone for world sectors) -- the G3x formula with
+            // the env vectors negated (the UVs wrap). Same GS state as the G3x env pass.
+            const bool g3Gem = !g3x && meshPipe == kPipeMatFX && meshFx && rd32(ee, meshFx + 0x80u) == 2u;
+            if ((g3x && meshPipe == kPipeG3xGem) || g3Gem)
             {
-                const uint32_t matPipe = rd32(ee, material + 8u);
-                if (pipeKind(groupPipe ? groupPipe : (matPipe ? matPipe : defPipe)) == kPipeG3xGem)
                 {
                     // RpPDS_G3x_Gem_MeshPS2AllBridgeCallBack + its VU1 program: env frame right/up (the camera's frame
                     // without one) into object space -- dot with the LTM rows, normalised by 1 / |LTM right| -- and
@@ -2064,18 +2157,37 @@ namespace nrw
                     uint32_t envFrame = rd32(ee, fx);
                     if (!envFrame)
                         envFrame = rd32(ee, cam + 4u);
-                    const Mat env = readMat(ee, envFrame + 80u), ltm = readMat(ee, rd32(ee, object + 4u) + 80u);
-                    const float l2 = ltm.r[0][0] * ltm.r[0][0] + ltm.r[0][1] * ltm.r[0][1] + ltm.r[0][2] * ltm.r[0][2];
-                    const float q = l2 > 0.0f ? 1.0f / std::sqrt(l2) : 1.0f;
-                    for (int i = 0; i < 3; ++i)
+                    const Mat env = readMat(ee, envFrame + 80u);
+                    if (sector)
                     {
-                        e.envR[i] = (ltm.r[i][0] * env.r[0][0] + ltm.r[i][1] * env.r[0][1] + ltm.r[i][2] * env.r[0][2]) * q;
-                        e.envU[i] = (ltm.r[i][0] * env.r[1][0] + ltm.r[i][1] * env.r[1][1] + ltm.r[i][2] * env.r[1][2]) * q;
+                        for (int i = 0; i < 3; ++i)
+                        {
+                            e.envR[i] = env.r[0][i];
+                            e.envU[i] = env.r[1][i];
+                        }
                     }
+                    else
+                    {
+                        const Mat ltm = readMat(ee, rd32(ee, object + 4u) + 80u);
+                        const float l2 = ltm.r[0][0] * ltm.r[0][0] + ltm.r[0][1] * ltm.r[0][1] + ltm.r[0][2] * ltm.r[0][2];
+                        const float q = l2 > 0.0f ? 1.0f / std::sqrt(l2) : 1.0f;
+                        for (int i = 0; i < 3; ++i)
+                        {
+                            e.envR[i] = (ltm.r[i][0] * env.r[0][0] + ltm.r[i][1] * env.r[0][1] + ltm.r[i][2] * env.r[0][2]) * q;
+                            e.envU[i] = (ltm.r[i][0] * env.r[1][0] + ltm.r[i][1] * env.r[1][1] + ltm.r[i][2] * env.r[1][2]) * q;
+                        }
+                    }
+                    if (g3Gem)
+                        for (int i = 0; i < 3; ++i)
+                        {
+                            e.envR[i] = -e.envR[i];
+                            e.envU[i] = -e.envU[i];
+                        }
                     float coef;
                     std::memcpy(&coef, ee + ((fx + 8u) & 0x1FFFFFFu), 4);
                     e.envTexture = coef > 0.0f ? rd32(ee, fx + 4u) : 0u; // coefficient 0: the pass adds nothing
-                    e.envFlags = (e.envTexture && (ee[(rd32(ee, e.envTexture) + 32u) & 0x1FFFFFFu] & 7u) == 5u) ? kEnvRenderTarget : 0u;
+                    if (e.envTexture && (ee[(rd32(ee, e.envTexture) + 32u) & 0x1FFFFFFu] & 7u) == 5u)
+                        e.envFlags |= kEnvRenderTarget;
                     std::memcpy(&e.envCoef, ee + ((fx + 8u) & 0x1FFFFFFu), 4);
                     const uint32_t fbAlpha = rd32(ee, fx + 12u);
                     e.envAlpha = 0x8000000048ull | (0x20u >> (fbAlpha & 31u));
@@ -2130,6 +2242,7 @@ namespace nrw
             job.ringIndices = e.ringIndices;
             job.numIndices = e.numIndices;
             job.envTexture = e.envTexture;
+            job.envFlags = e.native ? e.envFlags : 0u;
             if (e.envTexture)
             {
                 job.envCoef = e.envCoef;

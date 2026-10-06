@@ -1,3 +1,4 @@
+#include <atomic>
 #include "runtime/ps2_vu1.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
@@ -2279,6 +2280,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (s_stats && now - s_last >= std::chrono::seconds(2))
         {
             s_last = now;
+            extern std::atomic<uint64_t> g_vu0MicroRuns;
+            extern std::atomic<uint32_t> g_vu0LastPc;
+            std::printf("[vu-stats] vu0micro=%llu (last pc 0x%x)\n", (unsigned long long)g_vu0MicroRuns.exchange(0), g_vu0LastPc.load());
             std::printf("[vu-stats] runs=%llu pairs=%llu cycles=%llu budgetHits=%llu maxCycles=%u codeChanges=%llu native=%llu fallback=%llu miss=%llu ncyc=%llu hash=%016llx\n",
                         (unsigned long long)g_vuStatRuns, (unsigned long long)g_vuStatPairs,
                         (unsigned long long)g_vuStatCycles, (unsigned long long)g_vuStatBudgetHits, maxCycles,

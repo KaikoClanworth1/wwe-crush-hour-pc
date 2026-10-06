@@ -2074,17 +2074,35 @@ struct GSD3D11Backend::Impl
         float cols[4][4];
         for (int i = 0; i < 4; ++i)
             std::memcpy(cols[i], vu(1008u + static_cast<uint32_t>(i)), 16);
-        // VU1 setup: z lane from C3 only (= 1), shift x/y by half w, then scale by VU1 1015.
-        for (int i = 0; i < 3; ++i)
-            cols[i][2] = 0.0f;
-        cols[3][2] = 1.0f;
         const float *scale = vu(1015);
-        for (int i = 0; i < 4; ++i)
+        const bool iso = (job.transType & 8u) != 0u;
+        if (iso)
         {
-            cols[i][0] = (cols[i][0] - 0.5f * cols[i][3]) * scale[0];
-            cols[i][1] = (cols[i][1] - 0.5f * cols[i][3]) * scale[1];
+            // Parallel projection (RenderWare's ISO VU1 programs): screen = C.v + offset without a divide; the
+            // translation column alone is shifted by half a pixel, every column's xyz is scaled. w = 1 keeps the
+            // shader's divide a no-op.
+            cols[3][0] -= 0.5f;
+            cols[3][1] -= 0.5f;
+            for (int i = 0; i < 4; ++i)
+            {
+                for (int k = 0; k < 3; ++k)
+                    cols[i][k] *= scale[k];
+                cols[i][3] = i == 3 ? 1.0f : 0.0f;
+            }
         }
-        cols[3][2] *= scale[2];
+        else
+        {
+            // VU1 setup: z lane from C3 only (= 1), shift x/y by half w, then scale by VU1 1015.
+            for (int i = 0; i < 3; ++i)
+                cols[i][2] = 0.0f;
+            cols[3][2] = 1.0f;
+            for (int i = 0; i < 4; ++i)
+            {
+                cols[i][0] = (cols[i][0] - 0.5f * cols[i][3]) * scale[0];
+                cols[i][1] = (cols[i][1] - 0.5f * cols[i][3]) * scale[1];
+            }
+            cols[3][2] *= scale[2];
+        }
         float cbv[23][4] = {};
         std::memcpy(cbv, cols, sizeof(cols));
         const float *off = vu(1016), *off2 = vu(1017);
@@ -2102,14 +2120,14 @@ struct GSD3D11Backend::Impl
         cbv[6][2] = static_cast<float>(maxz);
         uint32_t objFlags;
         std::memcpy(&objFlags, vu(1023), 4);
-        cbv[6][3] = (objFlags & 1u) ? 1.0f : 0.0f;
+        cbv[6][3] = (objFlags & 1u) && !iso ? 1.0f : 0.0f; // native_rw keeps fogged ISO objects on RenderWare
         cbv[7][0] = vu(1014)[2];
         cbv[7][1] = vu(1014)[3];
         cbv[7][3] = 0.0f;
         cbv[7][2] = static_cast<float>(nrw::parseLights(job, &cbv[8][0], &cbv[14][0], 6));
         cbv[20][0] = vu(1021)[2];
         cbv[20][1] = vu(1022)[2];
-        cbv[20][2] = (objFlags & 2u) ? 1.0f : 0.0f;
+        cbv[20][2] = (objFlags & 2u) && !iso ? 1.0f : 0.0f;
         if (nativeEnvPass)
         {
             std::memcpy(cbv[21], job.envR, 12);
@@ -2169,7 +2187,7 @@ struct GSD3D11Backend::Impl
             s.context.clamp = job.gsClamp;
             const uint32_t mmag = static_cast<uint32_t>((job.gsTex1 >> 5) & 1u), mmin = static_cast<uint32_t>((job.gsTex1 >> 6) & 7u);
             s.linearFilter = mmag != 0u || mmin == 1u || (mmin & 4u) != 0u;
-            rasterTex0(s, job.texture);
+            rasterTex0(s, job.texture, (job.envFlags & nrw::kBaseRenderTarget) != 0u);
         }
         hasPending = true;
         nativeJob = &job;
@@ -2287,7 +2305,8 @@ struct GSD3D11Backend::Impl
             texDims[1] = static_cast<float>(st.textureHeight);
             // Native-state draws (native node path) always sample their raster texture, never a render target.
             // (except an env pass whose env raster is a camera texture: that one is a render target).
-            const bool envRt = nativeEnvPass && (nativeJob->envFlags & nrw::kEnvRenderTarget) != 0u;
+            const bool envRt = nativeJob && (nativeEnvPass ? (nativeJob->envFlags & nrw::kEnvRenderTarget) != 0u
+                                                           : (nativeJob->envFlags & nrw::kBaseRenderTarget) != 0u);
             const bool nativeState = nativeJob && (nativeJob->stateFlags & nrw::kStateNative) != 0u && !envRt;
             RenderTarget *srcRt = (!isIndexed(t.psm) && !nativeState) ? findRt(t.tbp0) : nullptr;
             if (!srcRt && !isIndexed(t.psm) && !disableRtSubTex && !nativeState)

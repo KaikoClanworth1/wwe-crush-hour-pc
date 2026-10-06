@@ -68,7 +68,8 @@ namespace nrw
     };
     static_assert(sizeof(MeshJob) % 16u == 0u, "job must be qword sized");
     constexpr uint32_t kStateNative = 1u;
-    constexpr uint32_t kEnvRenderTarget = 1u;
+    constexpr uint32_t kEnvRenderTarget = 1u;  // envFlags: the env raster is a camera texture
+    constexpr uint32_t kBaseRenderTarget = 2u; // envFlags: the base raster is a camera texture (e.g. a live screen)
 
     // Vertex normal i as the packed form the VU1 program gets (x, y, z * 128 as signed bytes, w 0).
     // Sectors store that already; atomic morph targets store RwV3d floats.
