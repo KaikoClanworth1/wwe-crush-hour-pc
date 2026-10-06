@@ -419,6 +419,9 @@ target_sources(ps2_runtime PRIVATE src/lib/vu/vu1_native_glue.cpp)
 set(PS2X_VU1_NATIVE_SRC "${PS2X_GAME_DIR}/../vu1/vu1_native.cpp")
 if(PS2X_GAME_DIR AND EXISTS "${PS2X_VU1_NATIVE_SRC}")
     target_sources(ps2_runtime PRIVATE "${PS2X_VU1_NATIVE_SRC}")
+    if(MSVC)
+        set_source_files_properties("${PS2X_VU1_NATIVE_SRC}" PROPERTIES COMPILE_OPTIONS "/d2OptimizeHugeFunctions")
+    endif()
     target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_VU1_NATIVE=1)
 endif()
 
@@ -540,6 +543,9 @@ endif()
 
 if(MSVC)
     target_compile_options(ps2EntryRunner PRIVATE /FS)
+    # Recompiled game functions are often huge; MSVC silently compiles functions above its size threshold without
+    # optimization (C4883). Force it: the generated code shrinks ~2.5x and runs correspondingly faster.
+    target_compile_options(ps2EntryRunner PRIVATE /d2OptimizeHugeFunctions)
 endif()
 
 target_include_directories(ps2_runtime PUBLIC

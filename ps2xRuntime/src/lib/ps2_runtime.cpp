@@ -2663,6 +2663,13 @@ namespace
 }
 void ps2RecordBranch(uint32_t source, uint32_t target, uint32_t ra, uint32_t sp)
 {
+    // Called for every guest call/jump: without the debug options below only the ring is written.
+    static const bool s_extra = std::getenv("PS2X_RING_SKIP") || std::getenv("PS2X_STACKSCAN") || std::getenv("PS2X_GLOBALWATCH");
+    if (!s_extra)
+    {
+        g_branchRing[g_branchRingPos++ & 63u] = {source, target, ra, sp};
+        return;
+    }
     // PS2X_RING_SKIP=lo-hi (hex): don't record transfers from/to that code range (e.g. a polling loop
     // that would otherwise flush everything interesting out of the ring).
     static uint32_t s_skipLo = 0, s_skipHi = 0;
