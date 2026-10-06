@@ -846,8 +846,29 @@ namespace nrw
         }
     }
 
+    namespace
+    {
+        // PS2X_NRW_IM2D=log: the next VU1 kick after an Im2D call is printed next to the call's first vertex.
+        int g_im2dLogArmed = 0;
+    }
+
     void observeKick(const uint8_t *data, uint32_t size)
     {
+        if (g_im2dLogArmed > 0 && data && size >= 64u)
+        {
+            --g_im2dLogArmed;
+            uint64_t tag, regs;
+            std::memcpy(&tag, data, 8);
+            std::memcpy(&regs, data + 8, 8);
+            uint32_t q[12];
+            std::memcpy(q, data + 16, 48);
+            float stq[3];
+            std::memcpy(stq, q, 12);
+            std::printf("[nrw-im2d-kick] tag=%016llx regs=%016llx nloop=%u prim=%03x | STQ=(%g %g %g) RGBA=(%u %u %u %u) XYZF=(%u %u %u %u)\n",
+                        (unsigned long long)tag, (unsigned long long)regs, static_cast<uint32_t>(tag & 0x7FFF),
+                        static_cast<uint32_t>((tag >> 47) & 0x7FF), stq[0], stq[1], stq[2], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11]);
+            std::fflush(stdout);
+        }
         if (!g_expectArmed || !data)
             return;
         // Walk GIF tags (PACKED) until a vertex-carrying one; collect STQ / RGBAQ / XYZ(F)2 per vertex.
@@ -1610,13 +1631,148 @@ namespace nrw
     // registers), so the job takes those from the GS. Vertices and indices are snapshotted into the ring.
     // Parallel-projection cameras (transType bit 8: the HUD, 2D cameras) are drawn natively with RenderWare's ISO
     // VU1 math (no divide, see bindNative); fogged ISO objects stay on RenderWare. PS2X_NRW_ISO=0: all ISO on RW.
-    // RpPDS_G3_Skin objects drawn natively (PS2X_NRW_SKIN=0: on RenderWare's skin VU1 program).
+    // RwIm2D (SkyIm2DRenderPrimitive / SkyIm2DRenderIndexedPrimitive, tools/patch_im2d.py). PS2X_NRW_IM2D=log
+    // prints each call's first vertex and the vertex RenderWare's Im2D VU1 program kicked for it.
+    bool im2d(uint8_t *ee, PS2Memory &memory, uint32_t primType, uint32_t verts, uint32_t numVerts, uint32_t indices,
+              uint32_t numIndices)
+    {
+        static const char *s_mode = []()
+        {
+            const char *v = std::getenv("PS2X_NRW_IM2D"); // =1: native (off by default for now, see skinNative)
+            return v ? v : "0";
+        }();
+        if (!ee || !verts)
+            return false;
+        if (std::strcmp(s_mode, "log") == 0)
+        {
+            static int s_left = 40;
+            if (s_left > 0)
+            {
+                --s_left;
+                float f[16];
+                std::memcpy(f, ee + (verts & 0x1FFFFF0u), 64);
+                const uint64_t prim = rd64(ee, kGp - 0x7CC0u);
+                float c1017[4], c1019a[4], c1019b[4];
+                std::memcpy(c1017, ee + ((kSkyCamBlock + 48u) & 0x1FFFFF0u), 16);
+                std::memcpy(c1019a, ee + 0x4BE230u, 16);
+                std::memcpy(c1019b, ee + 0x4BE240u, 16);
+                std::printf("[nrw-im2d] prim=%u n=%u skyPrim=%llx v0: xyz=(%g %g %g %g) uv rz=(%g %g %g %g) rgba=(%g %g %g %g) | "
+                            "cam1017=(%g %g %g %g) 4be230=(%g %g %g %g) 4be240=(%g %g %g %g)\n",
+                            primType, numVerts, (unsigned long long)prim, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8],
+                            f[9], f[10], f[11], c1017[0], c1017[1], c1017[2], c1017[3], c1019a[0], c1019a[1], c1019a[2],
+                            c1019a[3], c1019b[0], c1019b[1], c1019b[2], c1019b[3]);
+                g_im2dLogArmed = 1;
+            }
+            return false;
+        }
+        if (s_mode[0] == '0')
+            return false;
+        // Native: RenderWare's Im2D VU1 program (open2DVU1Pkt constants, 0x3d0dc0 / 0x3d0f20) on the CPU.
+        // GS XY = (x, y) + the 2D offset (0x4BE260), Z = z, STQ = (u, v) * 1/z, RGBA = colour * scale (0x4BE230
+        // textured / 0x4BE220), F = 255; each triangle was a 3-vertex fan with PRIM = sky prim state.
+        if (primType < 3u || primType > 5u || numVerts == 0u || numVerts > 65535u || (indices && numIndices > (1u << 20)))
+            return false;
+        static std::vector<uint16_t> tri;
+        tri.clear();
+        const uint32_t count = indices ? numIndices : numVerts;
+        auto at = [&](uint32_t i) -> uint16_t
+        {
+            if (!indices)
+                return static_cast<uint16_t>(i);
+            uint16_t v;
+            std::memcpy(&v, ee + ((indices + i * 2u) & 0x1FFFFFFu), 2);
+            return v;
+        };
+        if (primType == 3u)
+            for (uint32_t i = 0; i + 2u < count; i += 3u)
+                tri.insert(tri.end(), {at(i), at(i + 1u), at(i + 2u)});
+        else if (primType == 4u)
+            for (uint32_t i = 0; i + 2u < count; ++i)
+                tri.insert(tri.end(), {at(i), at(i + 1u), at(i + 2u)});
+        else
+            for (uint32_t i = 1; i + 1u < count; ++i)
+                tri.insert(tri.end(), {at(0), at(i), at(i + 1u)});
+        if (tri.empty())
+            return false;
+        for (uint16_t v : tri)
+            if (v >= numVerts)
+                return false;
+        MarkerSlot slot;
+        if (!reserveMarkers(ee, 1u, slot))
+        {
+            static uint64_t s_noRoom = 0;
+            if (std::getenv("PS2X_NRW_STATS") && (++s_noRoom % 2000u) == 1u)
+                std::printf("[nrw-im2d] no open VIF packet: %llu calls on RenderWare\n", (unsigned long long)s_noRoom);
+            return false;
+        }
+        const uint64_t skyPrim = rd64(ee, kGp - 0x7CC0u);
+        float off[2], scale[4];
+        std::memcpy(off, ee + 0x4BE260u, 8);
+        std::memcpy(scale, ee + ((skyPrim & 0x10u) ? 0x4BE230u : 0x4BE220u), 16);
+        const uint32_t vAt = ringAlloc(numVerts * static_cast<uint32_t>(sizeof(Im2DVertex)));
+        Im2DVertex *out = reinterpret_cast<Im2DVertex *>(g_ring.data() + vAt);
+        for (uint32_t v = 0; v < numVerts; ++v)
+        {
+            float f[12];
+            std::memcpy(f, ee + ((verts + v * 64u) & 0x1FFFFFFu), 48);
+            Im2DVertex &o = out[v];
+            o.x = std::trunc((f[0] + off[0]) * 16.0f) / 16.0f; // FTOI4
+            o.y = std::trunc((f[1] + off[1]) * 16.0f) / 16.0f;
+            const int32_t z16 = static_cast<int32_t>(std::max(0.0f, std::min(f[2] * 16.0f, 2147483520.0f)));
+            o.z = static_cast<float>((z16 >> 4) & 0xFFFFFF);
+            o.s = f[4] * f[6];
+            o.t = f[5] * f[6];
+            o.q = f[6];
+            for (int k = 0; k < 4; ++k)
+            {
+                const float c = f[8 + k] * scale[k];
+                o.rgba[k] = static_cast<uint8_t>(c <= 0.0f ? 0 : (c >= 255.0f ? 255 : static_cast<int>(c))); // FTOI0
+            }
+            o.pad = 0;
+        }
+        const uint32_t iAt = ringAlloc(static_cast<uint32_t>(tri.size()) * 2u);
+        std::memcpy(g_ring.data() + iAt, tri.data(), tri.size() * 2u);
+        const uint32_t idx = g_next.fetch_add(1, std::memory_order_relaxed) & (kTableSize - 1u);
+        Entry &e = g_table[idx];
+        e.native = true;
+        e.gsFromRegs = true;
+        e.kind = kIm2DMesh;
+        e.object = verts;
+        e.mesh = 0;
+        e.meshFlags = 0;
+        e.primType = 3u;
+        e.transType = 0;
+        e.matCol = 0xFFFFFFFFu;
+        e.texture = 0;
+        e.vu1CodeIndex = 0;
+        e.surfProps = 0;
+        e.code = 0;
+        e.verts = vAt;
+        e.normals = e.uvs = e.prelit = 0;
+        e.numVerts = numVerts;
+        e.geomFlags = 0;
+        e.gsTest = e.gsTex1 = e.gsClamp = 0;
+        e.geomGen = 0;
+        e.envTexture = 0;
+        e.envFlags = 0;
+        e.ringIndices = iAt;
+        e.numIndices = static_cast<uint32_t>(tri.size());
+        float(*vu)[4] = g_nativeVu[idx & (kNativeVuRing - 1u)];
+        std::memset(vu, 0, sizeof(float) * 4u * kVuQwCount);
+        const uint64_t tag = 0x8000ull | (1ull << 46) | ((3ull | (skyPrim & 0x6F8ull)) << 47); // EOP, PRE, TRIANGLE (FST 0)
+        std::memcpy(vu[vuIndex(1018)], &tag, 8);
+        writeMarkers(ee, memory, slot, &idx, 1u);
+        return true;
+    }
+
+    // RpPDS_G3_Skin objects drawn natively (PS2X_NRW_SKIN=1; off by default while the menu-panel corruption seen
+    // with today's native paths is narrowed down).
     bool skinNative()
     {
         static const bool s_on = []()
         {
             const char *v = std::getenv("PS2X_NRW_SKIN");
-            return !(v && *v == '0');
+            return v && *v == '1';
         }();
         return s_on;
     }
@@ -1625,8 +1781,8 @@ namespace nrw
     {
         static const bool s_on = []()
         {
-            const char *v = std::getenv("PS2X_NRW_ISO");
-            return !(v && *v == '0');
+            const char *v = std::getenv("PS2X_NRW_ISO"); // =1: on (off by default for now, see skinNative)
+            return v && *v == '1';
         }();
         return !(transBase & 8u) || (s_on && !(transBase & 1u));
     }
@@ -2080,7 +2236,12 @@ namespace nrw
                                 (unsigned long long)s_fx[2], (unsigned long long)s_fx[3], (unsigned long long)s_fx[4],
                                 (unsigned long long)s_fx[5], sector ? 1 : 0);
             }
-            if (effect == 2u && s_gem) // Gem: the generic programs plus an additive env pass
+            static const bool s_g3Gem = []()
+            {
+                const char *v = std::getenv("PS2X_NRW_G3GEM"); // =1: MatFX env maps on generic objects natively
+                return v && *v == '1';
+            }();
+            if (effect == 2u && s_gem && s_g3Gem) // Gem: the generic programs plus an additive env pass
             {
                 // Plain env textures only: camera-texture env maps on these objects were not live render targets
                 // (each draw read VRAM back, the GPU stalled for seconds).

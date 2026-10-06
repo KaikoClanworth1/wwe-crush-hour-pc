@@ -25,6 +25,7 @@ namespace nrw
         kWorldSectorMesh = 1,
         kAtomicMesh = 2, // rigid RpAtomic (one morph target) on RenderWare's generic PS2All VU1 program
         kIm3DMesh = 3,   // RwIm3D primitive: vertices/indices snapshotted into the job ring (ring()), GS state from registers
+        kIm2DMesh = 4,   // RwIm2D primitive: screen-space Im2DVertex triangles in the ring, GS state from registers
     };
 
     // VU1 data memory snapshot range: lights (976..) through per-object constants (..1023).
@@ -103,6 +104,9 @@ namespace nrw
     // natively -- markers appended to RW's open VIF packet, constants computed from the RW structures -- and
     // returns true, or false to let RenderWare run its own PS2 pipeline (unsupported object / no packet room).
     bool nodeBody(uint8_t *rdram, PS2Memory &memory, uint32_t self, uint32_t params);
+    // RwIm2D primitive (SkyIm2DRenderPrimitive / -IndexedPrimitive entry): true when drawn natively.
+    bool im2d(uint8_t *rdram, PS2Memory &memory, uint32_t primType, uint32_t verts, uint32_t numVerts, uint32_t indices,
+              uint32_t numIndices);
     // RpPDS_G3x_ADL_LightingUpload(ambient, directional): the lights PDS G3x objects are lit with from now on.
     void g3xLights(uint32_t ambient, uint32_t directional);
     void sectorBegin(uint32_t sector);
@@ -124,6 +128,14 @@ namespace nrw
     // Snapshot ring of transient vertex data (kIm3DMesh jobs; written on the EE side, read in stream order).
     const uint8_t *ring();
     constexpr uint32_t kIm3DVertexStride = 36u; // RxObjSpace3DVertex: pos, RGBA, normal, u, v
+    // kIm2DMesh vertex: GS window position (pixels, XYOFFSET included), Z, STQ, RGBA -- what RenderWare's Im2D VU1
+    // program would have kicked.
+    struct Im2DVertex
+    {
+        float x, y, z, s, t, q;
+        uint8_t rgba[4];
+        uint32_t pad;
+    };
     // Runtime wiring.
     void setGs(GS *gs);
     void setRdram(const uint8_t *rdram);

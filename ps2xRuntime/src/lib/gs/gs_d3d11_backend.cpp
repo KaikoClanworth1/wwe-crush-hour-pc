@@ -2163,8 +2163,48 @@ struct GSD3D11Backend::Impl
         ++pipeGen; // the next ordinary draw rebinds the standard pipeline
     }
 
+    // RwIm2D drawn natively (nrw::im2d): the screen-space triangles RenderWare's Im2D VU1 program would have kicked,
+    // through the standard GS-vertex path with the register state and the job's PRIM (TRIANGLE).
+    void submitIm2D(const GSDrawState &st, const nrw::MeshJob &job)
+    {
+        const uint8_t *ring = nrw::ring();
+        if (!ring || job.numIndices < 3u || job.numVerts == 0u)
+            return;
+        const auto *vs = reinterpret_cast<const nrw::Im2DVertex *>(ring + job.verts);
+        const auto *ix = reinterpret_cast<const uint16_t *>(ring + job.ringIndices);
+        GSPrimitiveBatch b{};
+        b.state = st;
+        b.vertexCount = 3;
+        for (uint32_t i = 0; i + 2u < job.numIndices; i += 3u)
+        {
+            for (uint32_t k = 0; k < 3u; ++k)
+            {
+                const nrw::Im2DVertex &v = vs[ix[i + k] % job.numVerts];
+                GSVertex &o = b.vertices[k];
+                o.x = v.x;
+                o.y = v.y;
+                o.z = v.z;
+                o.r = v.rgba[0];
+                o.g = v.rgba[1];
+                o.b = v.rgba[2];
+                o.a = v.rgba[3];
+                o.s = v.s;
+                o.t = v.t;
+                o.q = v.q;
+                o.u = o.v = 0;
+                o.fog = 255;
+            }
+            submit(b);
+        }
+    }
+
     void submitNative(const GSDrawState &st, const nrw::MeshJob &job)
     {
+        if (job.kind == nrw::kIm2DMesh)
+        {
+            submitIm2D(st, job);
+            return;
+        }
         {
             static const bool s_log = std::getenv("PS2X_NRW_ENVLOG") != nullptr;
             static uint64_t s_n = 0, s_nat = 0, s_env = 0;
