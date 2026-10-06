@@ -19,6 +19,8 @@ void ps2GsThreadSubmit(GS &gs, const uint8_t *data, uint32_t size); // ps2_runti
 extern int g_p3Trace;                                               // ps2_memory.cpp
 bool ps2vu1nRunPrivate(const uint8_t *image, uint64_t key, uint8_t *data, uint32_t pc, // vu1_native_glue.cpp
                        void (*onKick)(void *user, const uint8_t *packet, uint32_t bytes), void *user);
+bool ps2vu1nRunPrivateTop(const uint8_t *image, uint64_t key, uint8_t *data, uint32_t pc, uint32_t top, uint32_t itop,
+                          void (*onKick)(void *user, const uint8_t *packet, uint32_t bytes), void *user);
 
 namespace nrw
 {
@@ -1998,9 +2000,9 @@ namespace nrw
         constexpr uint32_t kPGenBridge = 0x296FB0u;       // PGenBridgeCallback (the material pipeline's bridge)
         constexpr uint32_t kPGenEntry = 0x80000000u;      // Entry.code flag: a PGen job (index in the low bits)
 
-        // A variant as its code-array DMA chain uploads it (one RET tag, VIF codes inline): the micro image (MPG) and
-        // the initial data memory (STCYCL 4/4 + UNPACK V4-32: constants, the output GIF tag at 270, UV frame tables).
-        struct PGenProgram
+        // A VU1 program as its code-array DMA chain uploads it (one RET tag, VIF codes inline): the micro image (MPG)
+        // and the initial data memory (STCYCL 4/4 + UNPACK V4-32: constants, GIF tags, tables).
+        struct VuChainProgram
         {
             bool tried = false, ok = false;
             uint64_t key = 0;
@@ -2008,19 +2010,14 @@ namespace nrw
             std::vector<uint16_t> uploaded; // data qwords the chain writes
         };
 
-        const PGenProgram *pgenProgram(const uint8_t *ee, uint32_t variant)
+        bool decodeVuChain(const uint8_t *ee, uint32_t chain, VuChainProgram &p)
         {
-            static PGenProgram s_prog[6];
-            PGenProgram &p = s_prog[variant % 6u];
-            if (p.tried)
-                return p.ok ? &p : nullptr;
-            p.tried = true;
-            const uint32_t chain = rd32(ee, kPGenCodeArray + (variant % 6u) * 4u);
             if (!chain)
-                return nullptr;
+                return false;
             const uint32_t qwc = static_cast<uint32_t>(rd64(ee, chain) & 0xFFFFu);
             p.image.assign(0x4000, 0);
             p.data.assign(0x4000, 0);
+            p.uploaded.clear();
             uint32_t pos = chain + 8u;
             const uint32_t end = chain + 16u + qwc * 16u;
             bool mpg = false;
@@ -2033,7 +2030,7 @@ namespace nrw
                     num = num ? num : 256u;
                     const uint32_t at = (code & 0xFFFFu) * 8u;
                     if (at + num * 8u > 0x4000u)
-                        return nullptr;
+                        return false;
                     std::memcpy(p.image.data() + at, ee + ((pos + 4u) & 0x1FFFFFFu), num * 8u);
                     pos += 4u + num * 8u;
                     mpg = true;
@@ -2043,7 +2040,7 @@ namespace nrw
                     num = num ? num : 256u;
                     const uint32_t at = code & 0x3FFu;
                     if (at + num > 1024u)
-                        return nullptr;
+                        return false;
                     std::memcpy(p.data.data() + at * 16u, ee + ((pos + 4u) & 0x1FFFFFFu), num * 16u);
                     for (uint32_t k = 0; k < num; ++k)
                         p.uploaded.push_back(static_cast<uint16_t>(at + k));
@@ -2052,16 +2049,63 @@ namespace nrw
                 else if (cmd == 0x00u || (cmd == 0x01u && (code & 0xFFFFu) == 0x0404u)) // NOP, STCYCL 4/4
                     pos += 4u;
                 else
-                    return nullptr;
+                    return false;
             }
-            uint32_t w0;
-            std::memcpy(&w0, p.image.data(), 4);
-            if (!mpg || w0 != 0x100E03D4u) // the PGen start stub: iaddiu vi14, vi00, 0x3d4
-                return nullptr;
+            if (!mpg)
+                return false;
             uint64_t h = 1469598103934665603ull;
             for (uint8_t b : p.image)
                 h = (h ^ b) * 1099511628211ull;
-            p.key = h ^ 0x5047454E00000000ull;
+            p.key = h;
+            return true;
+        }
+
+        // RwResourcesUseResEntry (inlined in PS2AllNodeBody): move a resource entry to the head of the "used this
+        // frame" list, so the arena does not reclaim it while space is short. Native paths whose data lives in
+        // RenderWare's instance memory (PGen history buffers, the crowd's tiles) do it every frame, as RenderWare's
+        // render of the object did.
+        void useResEntry(uint8_t *ee, uint32_t entry)
+        {
+            if (!entry)
+                return;
+            const uint32_t next = rd32(ee, entry), prev = rd32(ee, entry + 4u);
+            const uint32_t list = rd32(ee, kRwGlobals + rd32(ee, kGp - 0x7B40u) + 0x24u);
+            if (!next || !prev || !list || list == entry)
+                return;
+            wr32(ee, prev, next);
+            wr32(ee, next + 4u, prev);
+            const uint32_t first = rd32(ee, list);
+            wr32(ee, entry, first);
+            wr32(ee, entry + 4u, list);
+            wr32(ee, first + 4u, entry);
+            wr32(ee, list, entry);
+        }
+
+        // The resource entry of an object's first mesh: the geometry's mesh cache with one morph target, else the
+        // atomic's (as the PS2All object setups look it up).
+        uint32_t meshResEntry(const uint8_t *ee, uint32_t atomic, uint32_t geom)
+        {
+            const uint32_t cache = rd32(ee, geom + 24u) == 1u ? rd32(ee, geom + rd32(ee, kGp - 0x7B78u))
+                                                              : rd32(ee, atomic + rd32(ee, kGp - 0x7B7Cu));
+            return (cache && rd32(ee, cache) >= 1u) ? rd32(ee, cache + 4u) : 0u;
+        }
+
+        using PGenProgram = VuChainProgram;
+
+        const PGenProgram *pgenProgram(const uint8_t *ee, uint32_t variant)
+        {
+            static PGenProgram s_prog[6];
+            PGenProgram &p = s_prog[variant % 6u];
+            if (p.tried)
+                return p.ok ? &p : nullptr;
+            p.tried = true;
+            if (!decodeVuChain(ee, rd32(ee, kPGenCodeArray + (variant % 6u) * 4u), p))
+                return nullptr;
+            uint32_t w0;
+            std::memcpy(&w0, p.image.data(), 4);
+            if (w0 != 0x100E03D4u) // the PGen start stub: iaddiu vi14, vi00, 0x3d4
+                return nullptr;
+            p.key ^= 0x5047454E00000000ull;
             p.ok = true;
             return &p;
         }
@@ -2406,6 +2450,7 @@ namespace nrw
             return false; // RenderWare draws; its run is repeated natively and compared
         }
         const uint32_t jobIndex = g_pgenJobNext++ & (kPGenJobs - 1u);
+        useResEntry(ee, meshResEntry(ee, atomic, geom)); // the history buffers live in the instance data
         // PGenBridgeCallback's GS state: alpha test for alpha rasters, TEX1 / CLAMP from the texture (as the generic
         // bridge: mip K/L/MXL from the raster extension, the filter mode, wrap/clamp per axis).
         const uint32_t fmt = ee[(raster + 35u) & 0x1FFFFFFu] & 0xFu;
@@ -2448,6 +2493,651 @@ namespace nrw
         return true;
     }
 
+    // ---- The crowd (RpCrowd) ----------------------------------------------------------------------------------------
+    // RenderWare's crowd toolkit: the stands are a static geometry of tiles (four corners each); its hand-written VU1
+    // program scatters billboard spectators over every tile (count from the tile's area and the density, positions
+    // and animation frames from the VU random generator seeded per tile), projects them and kicks triangle strips.
+    // Natively: _rpCrowdPS2AllObjectSetupCallBack's constants (VU1 957.., the frame UV table) and the bridge's (1019
+    // material colour, 1021..1023 small clip planes) are computed from the RpCrowd structures, the object constants
+    // as for atomics, and when the VIF reaches the marker the program runs as compiled code on a private memory, batch
+    // by batch as RenderWare's instance data lays them out (the tiles exist only there: the game frees the geometry's
+    // arrays once RenderWare has instanced them). GS state of the setup's A+D (context 2): ALPHA_2 Cs/Cd/As,
+    // CLAMP_2 repeat, TEST_2 alpha > 0x3F + depth GEQUAL; the texture is decoded from the raster.
+    // PS2X_NRW_CROWD=0: the crowd stays on RenderWare; =verify: RenderWare draws and every batch is repeated natively
+    // and compared ([nrw-crowd] lines).
+    int crowdMode()
+    {
+        static const int s_mode = []()
+        {
+            const char *v = std::getenv("PS2X_NRW_CROWD");
+            if (v && std::strcmp(v, "verify") == 0)
+                return 2;
+            return (v && *v == '0') ? 0 : 1;
+        }();
+        return s_mode;
+    }
+
+    namespace
+    {
+        constexpr uint32_t kCrowdSetup = 0x2B9130u;  // _rpCrowdPS2AllObjectSetupCallBack
+        constexpr uint32_t kCrowdBridge = 0x2B9AB0u; // _rpCrowdPS2AllBridgeCallBack
+        constexpr uint32_t kCrowdEntry = 0x40000000u; // Entry.code flag: a crowd job (index in the low bits)
+        constexpr uint32_t kCrowdMaxFrames = 60u;    // frame UV table entries (957 + 3 + frames < 1008)
+
+        const VuChainProgram *crowdProgram(const uint8_t *ee)
+        {
+            static VuChainProgram s_prog;
+            if (!s_prog.tried)
+            {
+                s_prog.tried = true;
+                // RxPipelineNodePS2AllMatSetVU1CodeArray(node, gp - 0x7ECC, 1): one program.
+                s_prog.ok = decodeVuChain(ee, rd32(ee, kGp - 0x7ECCu), s_prog);
+                s_prog.key ^= 0x43524F5744000000ull;
+            }
+            return s_prog.ok ? &s_prog : nullptr;
+        }
+
+        struct CrowdJob
+        {
+            const VuChainProgram *prog = nullptr;
+            uint32_t atomic = 0, res = 0, chain = 0, numConst = 0; // resource entry, its instance DMA chain
+            uint8_t consts[(3u + kCrowdMaxFrames) * 16u]; // VU1 957..
+            uint8_t cam[16 * 16];                          // VU1 1008..1023
+            uint32_t camMask = 0;                          // bit i: 1008 + i set
+        };
+        constexpr uint32_t kCrowdJobs = 256u;
+        CrowdJob g_crowdJobs[kCrowdJobs];
+        uint32_t g_crowdJobNext = 0;
+
+        // Kicked packets -> triangles, as the GS assembles them: PRIM from each tag with PRE (list / strip / fan; a
+        // PRIM write restarts the vertex queue), XYZF2 / XYZ2 with ADC (word 3 bit 15) queue a vertex without a
+        // drawing kick.
+        struct GifTris
+        {
+            std::vector<Im2DVertex> verts;
+            std::vector<uint16_t> tris;
+            uint64_t tag = 0;
+        };
+        void gifTrisKick(void *user, const uint8_t *pkt, uint32_t bytes)
+        {
+            GifTris &o = *static_cast<GifTris *>(user);
+            float s = 0.0f, t = 0.0f, q = 1.0f;
+            uint8_t rgba[4] = {0, 0, 0, 0};
+            uint32_t prim = static_cast<uint32_t>((o.tag >> 47) & 7u);
+            uint32_t queue[3] = {}, queued = 0;
+            uint32_t p = 0;
+            while (p + 16u <= bytes)
+            {
+                uint64_t lo, hi;
+                std::memcpy(&lo, pkt + p, 8);
+                std::memcpy(&hi, pkt + p + 8, 8);
+                p += 16u;
+                const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu), flg = static_cast<uint32_t>((lo >> 58) & 3u);
+                uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
+                nreg = nreg ? nreg : 16u;
+                if ((lo >> 46) & 1u)
+                {
+                    o.tag = lo;
+                    prim = static_cast<uint32_t>((lo >> 47) & 7u);
+                    queued = 0;
+                }
+                if (flg != 0u)
+                {
+                    p += flg == 2u ? nloop * 16u : ((nloop * nreg + 1u) / 2u) * 16u;
+                    continue;
+                }
+                for (uint32_t l = 0; l < nloop; ++l)
+                    for (uint32_t r = 0; r < nreg; ++r)
+                    {
+                        if (p + 16u > bytes)
+                            return;
+                        uint32_t w[4];
+                        std::memcpy(w, pkt + p, 16);
+                        p += 16u;
+                        const uint32_t reg = static_cast<uint32_t>((hi >> (4u * r)) & 0xFu);
+                        if (reg == 2u)
+                        {
+                            std::memcpy(&s, &w[0], 4);
+                            std::memcpy(&t, &w[1], 4);
+                            std::memcpy(&q, &w[2], 4);
+                            if (q == 0.0f)
+                                q = 1.0f;
+                        }
+                        else if (reg == 1u)
+                        {
+                            for (int k = 0; k < 4; ++k)
+                                rgba[k] = static_cast<uint8_t>(w[k] & 0xFFu);
+                        }
+                        else if (reg == 4u || reg == 5u)
+                        {
+                            if (o.verts.size() >= 65535u)
+                                return;
+                            Im2DVertex v;
+                            v.x = static_cast<float>(w[0] & 0xFFFFu) / 16.0f;
+                            v.y = static_cast<float>(w[1] & 0xFFFFu) / 16.0f;
+                            v.z = static_cast<float>(reg == 4u ? (w[2] >> 4) & 0xFFFFFFu : w[2]);
+                            v.s = s;
+                            v.t = t;
+                            v.q = q;
+                            std::memcpy(v.rgba, rgba, 4);
+                            v.pad = 0;
+                            const uint32_t vi = static_cast<uint32_t>(o.verts.size());
+                            o.verts.push_back(v);
+                            const bool kick = !((w[3] >> 15) & 1u); // ADC clear
+                            if (prim == 3u) // triangle list
+                            {
+                                queue[queued++] = vi;
+                                if (queued == 3u)
+                                {
+                                    if (kick)
+                                        o.tris.insert(o.tris.end(), {static_cast<uint16_t>(queue[0]), static_cast<uint16_t>(queue[1]),
+                                                                     static_cast<uint16_t>(queue[2])});
+                                    queued = 0;
+                                }
+                            }
+                            else if (prim == 4u) // strip
+                            {
+                                if (queued >= 2u && kick)
+                                    o.tris.insert(o.tris.end(), {static_cast<uint16_t>(queue[0]), static_cast<uint16_t>(queue[1]),
+                                                                 static_cast<uint16_t>(vi)});
+                                if (queued < 2u)
+                                    queue[queued++] = vi;
+                                else
+                                {
+                                    queue[0] = queue[1];
+                                    queue[1] = vi;
+                                }
+                            }
+                            else if (prim == 5u) // fan
+                            {
+                                if (queued >= 2u && kick)
+                                    o.tris.insert(o.tris.end(), {static_cast<uint16_t>(queue[0]), static_cast<uint16_t>(queue[1]),
+                                                                 static_cast<uint16_t>(vi)});
+                                if (queued < 2u)
+                                    queue[queued++] = vi;
+                                else
+                                    queue[1] = vi;
+                            }
+                        }
+                    }
+            }
+        }
+
+        // A crowd job's batches from RenderWare's instance data (PS2All instancing, built once): DMA tags (CNT / NEXT /
+        // REF / RET / END) carrying per batch STCYCL 1/3 + UNPACK V3-32 positions (TOP+0), V2-32 UVs (TOP+1), V4-8
+        // unsigned colours (TOP+2), ITOP = vertices and the MSCAL. Every batch is unpacked at TOP 0 of the private
+        // memory and run there. onlyBatch >= 0: just that batch (verify); *batchVerts gets its ITOP.
+        alignas(16) uint8_t g_crowdMem[0x4000]; // VIF thread
+        bool crowdRunChain(const CrowdJob &j, GifTris &out, uint8_t *mem, int onlyBatch = -1, uint32_t *batchVerts = nullptr)
+        {
+            const uint8_t *ee = g_rdram;
+            if (!ee || !j.prog || !j.chain)
+                return false;
+            // The VIF stream: each tag's upper half, then its data (after the tag, or at ADDR for REF / REFS / REFE).
+            static thread_local std::vector<uint8_t> st;
+            st.clear();
+            uint32_t t = j.chain;
+            bool ended = false;
+            for (uint32_t guard = 0; guard < 512u && !ended; ++guard)
+            {
+                const uint64_t tag = rd64(ee, t);
+                const uint32_t id = static_cast<uint32_t>((tag >> 28) & 7u), qwc = static_cast<uint32_t>(tag & 0xFFFFu);
+                const uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFF0u);
+                const uint32_t data = (id == 0u || id == 3u || id == 4u) ? addr : t + 16u;
+                if (id == 5u || st.size() + 8u + qwc * 16u > (1u << 20))
+                    return false; // CALL: not in instance data
+                const uint8_t *hiHalf = ee + ((t + 8u) & 0x1FFFFFFu);
+                st.insert(st.end(), hiHalf, hiHalf + 8);
+                const uint8_t *d = ee + (data & 0x1FFFFFFu);
+                st.insert(st.end(), d, d + qwc * 16u);
+                if (id == 1u)
+                    t = t + 16u + qwc * 16u;
+                else if (id == 2u)
+                    t = addr;
+                else if (id == 3u || id == 4u)
+                    t = t + 16u;
+                else
+                    ended = true; // REFE, RET, END
+            }
+            if (!ended)
+                return false;
+            std::memcpy(mem, j.prog->data.data(), 0x4000u);
+            std::memcpy(mem + 957u * 16u, j.consts, j.numConst * 16u);
+            for (uint32_t i = 0; i < 16u; ++i)
+                if (j.camMask & (1u << i))
+                    std::memcpy(mem + (1008u + i) * 16u, j.cam + i * 16u, 16);
+            uint32_t wl = 1u, cl = 1u, itop = 0u, pos = 0u;
+            int batch = 0;
+            const uint32_t size = static_cast<uint32_t>(st.size());
+            auto word = [&](uint32_t at) { uint32_t w; std::memcpy(&w, st.data() + at, 4); return w; };
+            while (pos + 4u <= size)
+            {
+                const uint32_t code = word(pos), cmd = (code >> 24) & 0x7Fu, imm = code & 0xFFFFu;
+                uint32_t num = (code >> 16) & 0xFFu;
+                if (cmd >= 0x60u) // UNPACK
+                {
+                    num = num ? num : 256u;
+                    const uint32_t vn = (cmd >> 2) & 3u, vl = cmd & 3u;
+                    if (vl == 3u || (cmd & 0x10u) || cl < wl || !wl)
+                        return false; // V4-5, masked or fill-mode unpacks: not in this format
+                    const uint32_t compBytes = 4u >> vl, elemBytes = (vn + 1u) * compBytes;
+                    const uint32_t bytes = (num * elemBytes + 3u) & ~3u;
+                    if (pos + 4u + bytes > size)
+                        return false;
+                    const bool usn = (imm & 0x4000u) != 0u;
+                    const uint32_t base = imm & 0x3FFu; // TOP-relative (FLG) with TOP 0, or absolute
+                    for (uint32_t k = 0; k < num; ++k)
+                    {
+                        const uint32_t qw = (base + (k / wl) * cl + (k % wl)) & 0x3FFu;
+                        const uint8_t *e = st.data() + pos + 4u + k * elemBytes;
+                        for (uint32_t c = 0; c <= vn; ++c)
+                        {
+                            uint32_t v;
+                            if (compBytes == 4u)
+                                std::memcpy(&v, e + c * 4u, 4);
+                            else if (compBytes == 2u)
+                            {
+                                uint16_t h;
+                                std::memcpy(&h, e + c * 2u, 2);
+                                v = usn ? h : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(h)));
+                            }
+                            else
+                                v = usn ? e[c] : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(e[c])));
+                            std::memcpy(mem + qw * 16u + c * 4u, &v, 4);
+                        }
+                    }
+                    pos += 4u + bytes;
+                }
+                else if (cmd == 0x14u || cmd == 0x15u || cmd == 0x17u) // MSCAL / MSCALF / MSCNT: one batch
+                {
+                    pos += 4u;
+                    if (onlyBatch < 0 || batch == onlyBatch)
+                    {
+                        if (batchVerts)
+                            *batchVerts = itop;
+                        if (!::ps2vu1nRunPrivateTop(j.prog->image.data(), j.prog->key, mem, 0u, 0u, itop, gifTrisKick, &out))
+                            return false;
+                        if (batch == onlyBatch)
+                            return true;
+                    }
+                    ++batch;
+                }
+                else if (cmd == 0x01u) // STCYCL
+                {
+                    cl = imm & 0xFFu;
+                    wl = (imm >> 8) & 0xFFu;
+                    pos += 4u;
+                }
+                else if (cmd == 0x04u) // ITOP
+                {
+                    itop = imm & 0x3FFu;
+                    pos += 4u;
+                }
+                else if (cmd == 0x05u) // STMOD: only the plain mode
+                {
+                    if (imm & 3u)
+                        return false;
+                    pos += 4u;
+                }
+                else if (cmd == 0x00u || cmd == 0x02u || cmd == 0x03u || cmd == 0x06u || cmd == 0x07u || cmd == 0x10u ||
+                         cmd == 0x11u || cmd == 0x13u) // NOP, OFFSET, BASE, MSKPATH3, MARK, FLUSHE, FLUSH, FLUSHA
+                    pos += 4u;
+                else if (cmd == 0x20u) // STMASK + mask word
+                    pos += 8u;
+                else if (cmd == 0x30u || cmd == 0x31u) // STROW / STCOL
+                    pos += 20u;
+                else
+                    return false;
+            }
+            return onlyBatch < 0;
+        }
+
+        std::mutex g_crowdMx;
+        std::vector<CrowdJob> g_crowdExpect;
+    }
+
+    bool crowdVerifyWanted() { return crowdMode() == 2; }
+
+    // VU1 glue: RenderWare ran the crowd program (entry pc 0 = an object's first batch, 0x520 = the next batch).
+    bool crowdIsImage(const uint8_t *code)
+    {
+        const VuChainProgram *prog = g_rdram ? crowdProgram(g_rdram) : nullptr;
+        return prog && std::memcmp(code, prog->image.data(), 0x530u) == 0;
+    }
+
+    void crowdVerifyRun(uint32_t pc, uint32_t top, uint32_t itop, const uint8_t *vuBefore, const uint8_t *kicks, uint32_t kickBytes)
+    {
+        static uint64_t s_runs = 0, s_unpaired = 0, s_inBad = 0, s_outBad = 0, s_exact = 0, s_tris = 0;
+        static int s_shown = 0;
+        static CrowdJob s_cur;
+        static bool s_have = false;
+        static uint64_t s_calls = 0;
+        if ((++s_calls % 100u) == 1u)
+        {
+            std::printf("[nrw-crowd] verify calls %llu (paired batches %llu, unpaired %llu)\n", (unsigned long long)s_calls,
+                        (unsigned long long)s_runs, (unsigned long long)s_unpaired);
+            std::fflush(stdout);
+        }
+        static int s_batch = 0;
+        if (pc == 0u)
+        {
+            std::lock_guard<std::mutex> lock(g_crowdMx);
+            auto it = std::find_if(g_crowdExpect.begin(), g_crowdExpect.end(), [&](const CrowdJob &e)
+                                   { return std::memcmp(e.consts, vuBefore + 957u * 16u, e.numConst * 16u) == 0 &&
+                                            std::memcmp(e.cam, vuBefore + 1008u * 16u, 4u * 16u) == 0; });
+            s_have = it != g_crowdExpect.end();
+            if (s_have)
+            {
+                s_cur = *it;
+                g_crowdExpect.erase(it);
+            }
+            s_batch = 0;
+        }
+        else
+            ++s_batch;
+        if (!s_have)
+        {
+            ++s_unpaired;
+            return;
+        }
+        static GifTris nat, rw;
+        nat.verts.clear();
+        nat.tris.clear();
+        nat.tag = 0;
+        uint32_t count = 0;
+        if (!crowdRunChain(s_cur, nat, g_crowdMem, s_batch, &count) || count != (itop & 0x3FFu))
+        {
+            ++s_unpaired;
+            return;
+        }
+        ++s_runs;
+        // Inputs: the tiles' used lanes (position xyz, UV xy, colour), the setup's constants, camera and clip block.
+        uint32_t badQw = 0, firstBad = 0xFFFFu;
+        // RenderWare's batch sits at its TOP (double buffered), the native one at 0.
+        const uint32_t rwTop = (top & 0x3FFu) * 16u;
+        for (uint32_t i = 0; i < count && rwTop + i * 48u + 48u <= 0x4000u; ++i)
+        {
+            const uint8_t *n = g_crowdMem + i * 48u, *r = vuBefore + rwTop + i * 48u;
+            if (std::memcmp(n, r, 12) != 0 || std::memcmp(n + 16u, r + 16u, 8) != 0 || std::memcmp(n + 32u, r + 32u, 16) != 0)
+            {
+                if (!badQw)
+                    firstBad = 0x400u | i;
+                ++badQw;
+            }
+        }
+        auto check = [&](uint32_t a, uint32_t bytes)
+        {
+            if (std::memcmp(g_crowdMem + a * 16u, vuBefore + a * 16u, bytes) != 0)
+            {
+                if (!badQw)
+                    firstBad = a;
+                ++badQw;
+            }
+        };
+        for (uint32_t a = 957u; a < 957u + s_cur.numConst; ++a)
+            check(a, 16);
+        for (uint32_t a = 1008u; a <= 1011u; ++a)
+            check(a, 16);
+        for (uint32_t a = 1015u; a <= 1017u; ++a)
+            check(a, 12);
+        check(1019u, 16);
+        check(1021u, 16);
+        check(1022u, 16);
+        check(1023u, 16);
+        rw.verts.clear();
+        rw.tris.clear();
+        rw.tag = 0;
+        if (kickBytes)
+            gifTrisKick(&rw, kicks, kickBytes);
+        s_tris += nat.tris.size() / 3u;
+        const bool outOk = nat.verts.size() == rw.verts.size() && nat.tris == rw.tris &&
+                           (nat.verts.empty() || std::memcmp(nat.verts.data(), rw.verts.data(), nat.verts.size() * sizeof(Im2DVertex)) == 0);
+        s_inBad += badQw ? 1u : 0u;
+        s_outBad += outOk ? 0u : 1u;
+        s_exact += (!badQw && outOk) ? 1u : 0u;
+        if ((badQw || !outOk) && s_shown < 40)
+        {
+            ++s_shown;
+            uint32_t firstV = 0;
+            while (firstV < nat.verts.size() && firstV < rw.verts.size() &&
+                   std::memcmp(&nat.verts[firstV], &rw.verts[firstV], sizeof(Im2DVertex)) == 0)
+                ++firstV;
+            std::printf("[nrw-crowd] MISMATCH pc=%x batch %u count=%u inputs: %u differ (first %u: native %08x %08x %08x %08x rw %08x %08x %08x %08x) "
+                        "verts native %zu rw %zu, tris native %zu rw %zu, first differing vertex %u\n",
+                        pc, static_cast<uint32_t>(s_batch), count, badQw, firstBad, rd32(g_crowdMem, (firstBad & 0x3FFu) * 16u), rd32(g_crowdMem, (firstBad & 0x3FFu) * 16u + 4u),
+                        rd32(g_crowdMem, (firstBad & 0x3FFu) * 16u + 8u), rd32(g_crowdMem, (firstBad & 0x3FFu) * 16u + 12u),
+                        rd32(vuBefore, (firstBad & 0x3FFu) * 16u), rd32(vuBefore, (firstBad & 0x3FFu) * 16u + 4u),
+                        rd32(vuBefore, (firstBad & 0x3FFu) * 16u + 8u), rd32(vuBefore, (firstBad & 0x3FFu) * 16u + 12u),
+                        nat.verts.size(), rw.verts.size(), nat.tris.size() / 3u, rw.tris.size() / 3u, firstV);
+            if (firstV < nat.verts.size() && firstV < rw.verts.size())
+            {
+                const Im2DVertex &a = nat.verts[firstV], &b = rw.verts[firstV];
+                std::printf("[nrw-crowd]   native xyz %.4f %.4f %.0f st %.5f %.5f %.5f rgba %u %u %u %u | rw xyz %.4f %.4f %.0f st %.5f %.5f %.5f rgba %u %u %u %u\n",
+                            a.x, a.y, a.z, a.s, a.t, a.q, a.rgba[0], a.rgba[1], a.rgba[2], a.rgba[3], b.x, b.y, b.z, b.s, b.t, b.q,
+                            b.rgba[0], b.rgba[1], b.rgba[2], b.rgba[3]);
+            }
+            std::fflush(stdout);
+        }
+        if ((s_runs % 25u) == 0u)
+        {
+            std::printf("[nrw-crowd] verified %llu batches (%llu triangles): %llu exact, inputs differ %llu, triangles differ %llu, unpaired %llu\n",
+                        (unsigned long long)s_runs, (unsigned long long)s_tris, (unsigned long long)s_exact, (unsigned long long)s_inBad,
+                        (unsigned long long)s_outBad, (unsigned long long)s_unpaired);
+            std::fflush(stdout);
+        }
+    }
+
+    // marker(): run a crowd job batch by batch and fill the job's vertices / indices / GIF tag. False: nothing to draw.
+    bool crowdMarker(const Entry &e, MeshJob &job)
+    {
+        const CrowdJob &j = g_crowdJobs[e.code & (kCrowdJobs - 1u)];
+        static GifTris out;
+        out.verts.clear();
+        out.tris.clear();
+        out.tag = 0;
+        if (!crowdRunChain(j, out, g_crowdMem))
+            return false;
+        if (out.tris.empty())
+            return false;
+        const uint32_t nv = static_cast<uint32_t>(out.verts.size());
+        const uint32_t vAt = markerRingAlloc(nv * static_cast<uint32_t>(sizeof(Im2DVertex)));
+        std::memcpy(g_ring.data() + vAt, out.verts.data(), nv * sizeof(Im2DVertex));
+        const uint32_t iAt = markerRingAlloc(static_cast<uint32_t>(out.tris.size()) * 2u);
+        std::memcpy(g_ring.data() + iAt, out.tris.data(), out.tris.size() * 2u);
+        job.verts = vAt;
+        job.numVerts = nv;
+        job.ringIndices = iAt;
+        job.numIndices = static_cast<uint32_t>(out.tris.size());
+        job.envAlpha = e.envAlpha; // the setup's ALPHA_2
+        // GIF tag of the kicks (PRE + PRIM: strips, textured, blended, context 2) -> the job's PRIM.
+        std::memcpy(job.vu[vuIndex(1018)], &out.tag, 8);
+        return true;
+    }
+
+    bool crowdNode(uint8_t *ee, PS2Memory &memory, uint32_t objPvt, uint32_t atomic, int mode)
+    {
+        const int cm = crowdMode();
+        if (cm == 0 || mode != 1)
+            return false;
+        // Why crowd objects stay on RenderWare (verify mode / PS2X_NRW_STATS): one counter per check below.
+        static uint64_t s_why[12] = {}, s_calls = 0;
+        static const bool s_stats = cm == 2 || std::getenv("PS2X_NRW_STATS") != nullptr;
+        auto reject = [&](int k)
+        {
+            ++s_why[k];
+            if (s_stats && (++s_calls % 2000u) == 1u)
+            {
+                std::printf("[nrw-crowd] node rejects: finalize %llu object %llu verts %llu meshes %llu pipe %llu texture %llu frames %llu program %llu compiled %llu camera %llu consts %llu room %llu\n",
+                            (unsigned long long)s_why[0], (unsigned long long)s_why[1], (unsigned long long)s_why[2], (unsigned long long)s_why[3],
+                            (unsigned long long)s_why[4], (unsigned long long)s_why[5], (unsigned long long)s_why[6], (unsigned long long)s_why[7],
+                            (unsigned long long)s_why[8], (unsigned long long)s_why[9], (unsigned long long)s_why[10], (unsigned long long)s_why[11]);
+                std::fflush(stdout);
+            }
+            return false;
+        };
+        if (rd32(ee, objPvt + 20u))
+            return reject(0);
+        const uint32_t crowd = rd32(ee, kGp - 0x7C58u); // the crowd being rendered (RpCrowdRender)
+        const uint32_t geom = rd32(ee, atomic + 24u), frame = rd32(ee, atomic + 4u);
+        if (!crowd || ee[atomic & 0x1FFFFFFu] != 1u || !geom || !frame || rd32(ee, geom + 24u) != 1u)
+            return reject(1);
+        // RenderWare's instance data of the crowd mesh (made on its first render through RenderWare).
+        const uint32_t res = meshResEntry(ee, atomic, geom), chain = res ? rd32(ee, res + 0x20u) : 0u;
+        if (!chain)
+            return reject(2);
+        // The crowd material pipeline (its bridge, no post-mesh callback) on the one mesh.
+        const uint32_t header = rd32(ee, geom + 84u);
+        uint16_t numMeshes = 0;
+        if (header)
+            std::memcpy(&numMeshes, ee + ((header + 4u) & 0x1FFFFFFu), 2);
+        if (numMeshes != 1u)
+            return reject(3);
+        const uint32_t mesh = header + 16u + rd32(ee, header + 12u), material = rd32(ee, mesh + 8u);
+        const uint32_t groupPipe = rd32(ee, objPvt + 24u), pipe = groupPipe ? groupPipe : (material ? rd32(ee, material + 8u) : 0u);
+        const uint32_t nodes = pipe ? rd32(ee, pipe + 8u) : 0u, matPvt = nodes ? rd32(ee, nodes + 20u) : 0u;
+        if (!material || !matPvt || rd32(ee, matPvt + 12u) != kCrowdBridge || rd32(ee, matPvt + 16u) != 0u)
+            return reject(4);
+        // The crowd's current texture and animation (_rpCrowdPS2AllObjectSetupCallBack).
+        const uint32_t textures = rd32(ee, crowd + 0x28u), anims = rd32(ee, crowd + 0x30u);
+        const uint32_t texture = textures ? rd32(ee, textures + rd32(ee, crowd + 0x34u) * 4u) : 0u;
+        const uint32_t raster = texture ? rd32(ee, texture) : 0u;
+        const uint32_t anim = anims ? rd32(ee, anims + rd32(ee, crowd + 0x38u) * 4u) : 0u;
+        if (!raster || !anim || (ee[(raster + 32u) & 0x1FFFFFFu] & 7u) != 4u || !rd32(ee, raster + 36u))
+            return reject(5);
+        const uint32_t numFrames = rd32(ee, anim + 4u);
+        const uint32_t cols = rd32(ee, crowd + 0x24u), rows = rd32(ee, crowd + 0x20u);
+        if (numFrames == 0u || numFrames > kCrowdMaxFrames || !cols || !rows)
+            return reject(6);
+        const VuChainProgram *prog = crowdProgram(ee);
+        if (!prog)
+            return reject(7);
+        const uint32_t cam = rd32(ee, kRwGlobals);
+        if (!cam)
+            return reject(9);
+        static ObjExpect obj;
+        computeObjectConstants(ee, atomic, false, objPvt, obj, false, true);
+        if (obj.unsupported)
+            return reject(10);
+        MarkerSlot slot;
+        if (cm == 1 && !reserveMarkers(ee, 1u, slot))
+        {
+            nstat(kNsNoRoom);
+            return reject(11);
+        }
+        CrowdJob snap;
+        CrowdJob &j = cm == 2 ? snap : g_crowdJobs[g_crowdJobNext & (kCrowdJobs - 1u)];
+        j.prog = prog;
+        j.atomic = atomic;
+        j.res = res;
+        j.chain = chain;
+        j.numConst = 3u + numFrames;
+        // 957: the output GIF tag's upper words (PRE, PRIM 0x25C: strips, IIP, TME, ABE, context 2; regs ST RGBAQ
+        // XYZF2 ST XYZF2); 958: frames, 0.5 * height / camera +0x6C, current frame - frames, 1 / cols;
+        // 959: crowd +8, rows, crowd +4, 1 / rows; 960..: each frame's UV rectangle (ints) / cols.
+        auto f32 = [&](uint32_t a) { float f; std::memcpy(&f, ee + (a & 0x1FFFFFFu), 4); return f; };
+        uint32_t curFrame = 0;
+        const float t = f32(crowd + 0x3Cu), dur = f32(anim);
+        if (!(t < 0.0f) && t < dur)
+            curFrame = static_cast<uint32_t>(static_cast<float>(numFrames) * t / dur);
+        const float invCols = 1.0f / static_cast<float>(cols), invRows = 1.0f / static_cast<float>(rows);
+        const float height = 0.5f * (f32(crowd + 0x18u) / f32(cam + 0x6Cu));
+        const uint32_t q957[4] = {0u, 0x512E4000u, 0x00042412u, 0u};
+        uint32_t q958[4] = {numFrames, 0u, curFrame - numFrames, 0u}, q959[4] = {rd32(ee, crowd + 8u), rows, rd32(ee, crowd + 4u), 0u};
+        std::memcpy(&q958[1], &height, 4);
+        std::memcpy(&q958[3], &invCols, 4);
+        std::memcpy(&q959[3], &invRows, 4);
+        std::memcpy(j.consts, q957, 16);
+        std::memcpy(j.consts + 16u, q958, 16);
+        std::memcpy(j.consts + 32u, q959, 16);
+        for (uint32_t i = 0; i < numFrames; ++i)
+            for (uint32_t k = 0; k < 4u; ++k)
+            {
+                const float v = static_cast<float>(static_cast<int32_t>(rd32(ee, anim + 8u + i * 16u + k * 4u))) * invCols;
+                std::memcpy(j.consts + (3u + i) * 16u + k * 4u, &v, 4);
+            }
+        // 1008..1018: object constants; 1019: material colour (textured scale); 1021..1023: the small clip planes
+        // (the bridge zeroes the large-band globals before choosing) and flags.
+        j.camMask = 0;
+        for (uint32_t i = 0; i <= 10u; ++i)
+            if (obj.mask & (1ull << vuIndex(1008u + i)))
+            {
+                std::memcpy(j.cam + i * 16u, obj.vu[vuIndex(1008u + i)], 16);
+                j.camMask |= 1u << i;
+            }
+        uint8_t col[4];
+        std::memcpy(col, ee + ((material + 4u) & 0x1FFFFFFu), 4);
+        const float sc = f32(kGp - 0x7F7Cu);
+        const float c1019[4] = {col[0] * sc, col[1] * sc, col[2] * sc, col[3] * sc};
+        std::memcpy(j.cam + 11u * 16u, c1019, 16);
+        std::memcpy(j.cam + 13u * 16u, ee + (0x4BE150u & 0x1FFFFFFu), 16);
+        std::memcpy(j.cam + 14u * 16u, ee + (0x4BE160u & 0x1FFFFFFu), 16);
+        const uint32_t transType = ee[(kGp - 0x793Cu) & 0x1FFFFFFu];
+        const uint32_t w1023[4] = {transType & 7u, 0u, rd32(ee, kGp - 0x7988u) == 3u ? 0x20u : 0u, rd32(ee, kGp - 0x7930u)};
+        std::memcpy(j.cam + 15u * 16u, w1023, 16);
+        j.camMask |= (1u << 11) | (1u << 13) | (1u << 14) | (1u << 15);
+        // Does the crowd program run as compiled code? Once, on this object's first batch (EE side, own memory).
+        static int s_compiled = 0;
+        if (s_compiled == 0)
+        {
+            alignas(16) static uint8_t probeMem[0x4000];
+            static GifTris probeOut;
+            s_compiled = crowdRunChain(j, probeOut, probeMem, 0) ? 1 : -1;
+            std::printf("[nrw-crowd] program %s as compiled code (%zu triangles on the first batch)\n",
+                        s_compiled > 0 ? "runs" : "does NOT run", probeOut.tris.size() / 3u);
+            std::fflush(stdout);
+        }
+        if (s_compiled < 0)
+            return reject(8);
+        if (cm == 2)
+        {
+            std::lock_guard<std::mutex> lock(g_crowdMx);
+            if (g_crowdExpect.size() >= 64u)
+                g_crowdExpect.erase(g_crowdExpect.begin());
+            g_crowdExpect.push_back(snap);
+            return false; // RenderWare draws; each of its batches is repeated natively and compared
+        }
+        const uint32_t jobIndex = g_crowdJobNext++ & (kCrowdJobs - 1u);
+        useResEntry(ee, res); // the tiles live in the instance data
+        const uint32_t fa = rd32(ee, texture + 80u);
+        const uint64_t tex1Global = rd64(ee, kGp - 0x79D8u);
+        const uint32_t rext = raster + rd32(ee, kGp - 0x798Cu);
+        const uint64_t kl = ee[(rext + 20u) & 0x1FFFFFFu] | (static_cast<uint64_t>(ee[(rext + 21u) & 0x1FFFFFFu]) << 8);
+        uint64_t tex1 = (tex1Global & 0xFFFFF000FFE7FDE3ull) | ((kl & 0xFFFu) << 32) | ee[(rext + 22u) & 0x1FFFFFFu] | (((kl >> 12) & 3u) << 19);
+        tex1 = (tex1 & ~0x1E0ull) | texFilterBits(fa & 0xFFu);
+        const uint32_t idx = g_next.fetch_add(1, std::memory_order_relaxed) & (kTableSize - 1u);
+        Entry &e = g_table[idx];
+        e.native = true;
+        e.gsFromRegs = false;
+        e.kind = kIm2DMesh;
+        e.object = atomic;
+        e.mesh = mesh;
+        e.meshFlags = 0;
+        e.primType = 4u;
+        e.transType = transType;
+        e.matCol = 0xFFFFFFFFu;
+        e.texture = texture;
+        e.vu1CodeIndex = 0;
+        e.surfProps = 0;
+        e.code = kCrowdEntry | jobIndex; // vertices come from the program run at the marker
+        e.verts = 0;
+        e.normals = e.uvs = e.prelit = 0;
+        e.numVerts = 0;
+        e.geomFlags = 0;
+        e.gsTest = 0x503FDu;  // TEST_2: alpha > 0x3F, depth GEQUAL
+        e.gsTex1 = tex1;
+        e.gsClamp = 0u;       // CLAMP_2: repeat
+        e.geomGen = 0;
+        e.envTexture = 0;
+        e.envFlags = 0;
+        e.envAlpha = 0x8000000044ull; // ALPHA_2: (Cs - Cd) * As + Cd (submitIm2D applies it to raster-state jobs)
+        e.ringIndices = 0;
+        e.numIndices = 0;
+        std::memset(g_nativeVu[idx & (kNativeVuRing - 1u)], 0, sizeof(float) * 4u * kVuQwCount);
+        writeMarkers(ee, memory, slot, &idx, 1u);
+        nstat(kNsNative);
+        return true;
+    }
+
     bool nodeBody(uint8_t *ee, PS2Memory &memory, uint32_t self, uint32_t params)
     {
         const int mode = nodeMode();
@@ -2462,6 +3152,8 @@ namespace nrw
         if (setupCB == 0x300250u)
             return im3dNode(ee, memory, objPvt, object, mode);
         if (setupCB == 0x2976F0u && pgenNode(ee, memory, objPvt, object, mode))
+            return true;
+        if (setupCB == kCrowdSetup && crowdNode(ee, memory, objPvt, object, mode))
             return true;
         bool sector, gameCB = false, g3x = false, pgen = false, skin = false;
         if (setupCB == 0x2976F0u)
@@ -3071,6 +3763,8 @@ namespace nrw
             }
             if (e.kind == kIm2DMesh && (e.code & kPGenEntry) && !pgenMarker(e, job))
                 return; // no live particles
+            if (e.kind == kIm2DMesh && (e.code & kCrowdEntry) && !crowdMarker(e, job))
+                return; // nothing visible
         }
         else if (const uint8_t *vu = memory.getVU1Data())
             std::memcpy(job.vu, vu + kVuFirstQw * 16u, sizeof(job.vu));

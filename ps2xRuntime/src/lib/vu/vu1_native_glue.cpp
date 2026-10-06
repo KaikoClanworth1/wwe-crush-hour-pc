@@ -21,6 +21,10 @@ namespace nrw
 {
     bool pgenVerifyWanted();                                                              // native_rw.cpp
     void pgenVerifyRun(const uint8_t *vuBefore, const uint8_t *kicks, uint32_t kickBytes); // native_rw.cpp
+    bool crowdVerifyWanted();                                                             // native_rw.cpp
+    bool crowdIsImage(const uint8_t *code);                                               // native_rw.cpp
+    void crowdVerifyRun(uint32_t pc, uint32_t top, uint32_t itop, const uint8_t *vuBefore, const uint8_t *kicks,
+                        uint32_t kickBytes);                                              // native_rw.cpp
 }
 
 namespace ps2vu1n
@@ -365,8 +369,17 @@ bool ps2vu1nTryRun(VU1State &state, uint8_t *vuData, uint32_t dataSize, PS2Memor
 
     // PS2X_NRW_PGEN=verify: RenderWare's run of a particle program, compared with the native run of the same object.
     static thread_local std::vector<uint8_t> s_pgenBefore, s_pgenKicks;
-    bool pgenVerify = false;
-    if (state.pc == 0u && g_code && g_codeSize >= 0x4000u && nrw::pgenVerifyWanted())
+    bool pgenVerify = false, crowdVerify = false;
+    const uint32_t crowdTop = state.top, crowdItop = state.itop;
+    // PS2X_NRW_CROWD=verify: the same for the crowd program (every batch: entry 0 or the 0x520 continuation).
+    if (g_code && g_codeSize >= 0x4000u && nrw::crowdVerifyWanted() && nrw::crowdIsImage(g_code))
+    {
+        crowdVerify = true;
+        s_pgenBefore.assign(vuData, vuData + std::min<uint32_t>(dataSize, 0x4000u));
+        s_pgenKicks.clear();
+        g_kickCapture = &s_pgenKicks;
+    }
+    else if (state.pc == 0u && g_code && g_codeSize >= 0x4000u && nrw::pgenVerifyWanted())
     {
         uint32_t w0;
         std::memcpy(&w0, g_code, 4);
@@ -395,6 +408,13 @@ bool ps2vu1nTryRun(VU1State &state, uint8_t *vuData, uint32_t dataSize, PS2Memor
         g_kickCapture = nullptr;
         if (s_pgenBefore.size() == 0x4000u)
             nrw::pgenVerifyRun(s_pgenBefore.data(), s_pgenKicks.data(), static_cast<uint32_t>(s_pgenKicks.size()));
+    }
+    if (crowdVerify)
+    {
+        g_kickCapture = nullptr;
+        if (s_pgenBefore.size() == 0x4000u)
+            nrw::crowdVerifyRun(entryPc, crowdTop, crowdItop, s_pgenBefore.data(), s_pgenKicks.data(),
+                                static_cast<uint32_t>(s_pgenKicks.size()));
     }
     if (r == kFallback)
     {
@@ -442,8 +462,18 @@ bool ps2vu1nTryRun(VU1State &state, uint8_t *vuData, uint32_t dataSize, PS2Memor
 // 16 KB micro memory the program would have been uploaded to (its compiled regions are found by code hash, cached
 // under `key`), `data` the 16 KB data memory it reads and writes. Every packet it kicks goes to `onKick`; nothing
 // reaches the GS. Returns false when the image has no compiled code at `pc` or the program did not end.
+bool ps2vu1nRunPrivateTop(const uint8_t *image, uint64_t key, uint8_t *data, uint32_t pc, uint32_t top, uint32_t itop,
+                          void (*onKick)(void *user, const uint8_t *packet, uint32_t bytes), void *user);
+
 bool ps2vu1nRunPrivate(const uint8_t *image, uint64_t key, uint8_t *data, uint32_t pc,
                        void (*onKick)(void *user, const uint8_t *packet, uint32_t bytes), void *user)
+{
+    return ps2vu1nRunPrivateTop(image, key, data, pc, 0u, 0u, onKick, user);
+}
+
+// The same with the VIF TOP / ITOP values the program reads with XTOP / XITOP (input batch address and count).
+bool ps2vu1nRunPrivateTop(const uint8_t *image, uint64_t key, uint8_t *data, uint32_t pc, uint32_t top, uint32_t itop,
+                          void (*onKick)(void *user, const uint8_t *packet, uint32_t bytes), void *user)
 {
     using namespace ps2vu1n;
     static std::mutex s_lock;
@@ -468,6 +498,8 @@ bool ps2vu1nRunPrivate(const uint8_t *image, uint64_t key, uint8_t *data, uint32
     VU1State state{};
     state.vf[0][3] = 1.0f;
     state.pc = pc;
+    state.top = top;
+    state.itop = itop;
     Ctx c;
     c.s = &state;
     c.mem = data;

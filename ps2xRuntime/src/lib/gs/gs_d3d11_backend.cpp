@@ -2189,6 +2189,8 @@ struct GSD3D11Backend::Impl
             const uint32_t mmag = static_cast<uint32_t>((job.gsTex1 >> 5) & 1u), mmin = static_cast<uint32_t>((job.gsTex1 >> 6) & 7u);
             s.linearFilter = mmag != 0u || mmin == 1u || (mmin & 4u) != 0u;
             rasterTex0(s, job.texture);
+            if (job.envAlpha)
+                s.context.alpha = job.envAlpha; // the job's own ALPHA (the crowd's setup sets ALPHA_2)
             pendingRasterTex = job.texture;
         }
         for (uint32_t i = 0; i + 2u < job.numIndices; i += 3u)
