@@ -428,6 +428,11 @@ struct GSD3D11Backend::Impl
         uint64_t key = 0;
         bool strip = false;
     };
+    // RwIm3D jobs: per-draw geometry from the snapshot ring in dynamic buffers (DISCARD on each write).
+    NativeSector im3dSector;
+    NativeMesh im3dMesh;
+    uint32_t im3dVbCap = 0, im3dIbCap = 0;
+    std::vector<NativeVtx> im3dVtx;
     std::unordered_map<uint32_t, NativeSector> nativeSectors;
     std::unordered_map<uint32_t, NativeMesh> nativeMeshes;
     const nrw::MeshJob *nativeJob = nullptr;
@@ -1909,8 +1914,60 @@ struct GSD3D11Backend::Impl
     }
 
     // Vertex / index buffers for a RenderWare world sector mesh, built once from EE memory.
+    // Upload n bytes into a dynamic buffer, growing it as needed.
+    bool uploadDynamic(ComPtr<ID3D11Buffer> &buf, uint32_t &cap, UINT bind, const void *data, uint32_t bytes)
+    {
+        if (!buf || cap < bytes)
+        {
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = std::max<uint32_t>(bytes, 256u << 10);
+            bd.Usage = D3D11_USAGE_DYNAMIC;
+            bd.BindFlags = bind;
+            bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            buf.Reset();
+            if (FAILED(dev->CreateBuffer(&bd, nullptr, &buf)))
+                return false;
+            cap = bd.ByteWidth;
+        }
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(ctx->Map(buf.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            return false;
+        std::memcpy(m.pData, data, bytes);
+        ctx->Unmap(buf.Get(), 0);
+        return true;
+    }
+
+    // RwIm3D job: RxObjSpace3DVertex {pos, RGBA, normal, u, v} and indices from the snapshot ring (unlit: no normals).
+    bool prepareIm3D(const nrw::MeshJob &job)
+    {
+        const uint8_t *ring = nrw::ring();
+        if (!ring || job.numVerts == 0u || job.numIndices < 3u)
+            return false;
+        im3dVtx.resize(job.numVerts);
+        const uint8_t *src = ring + job.verts;
+        for (uint32_t i = 0; i < job.numVerts; ++i, src += nrw::kIm3DVertexStride)
+        {
+            NativeVtx &o = im3dVtx[i];
+            std::memcpy(o.pos, src, 12);
+            std::memcpy(o.col, src + 12, 4);
+            std::memcpy(o.uv, src + 28, 8);
+            o.nrm[0] = o.nrm[1] = o.nrm[2] = o.nrm[3] = 0;
+        }
+        if (!uploadDynamic(im3dSector.vb, im3dVbCap, D3D11_BIND_VERTEX_BUFFER, im3dVtx.data(),
+                           job.numVerts * static_cast<uint32_t>(sizeof(NativeVtx))) ||
+            !uploadDynamic(im3dMesh.ib, im3dIbCap, D3D11_BIND_INDEX_BUFFER, ring + job.ringIndices, job.numIndices * 2u))
+            return false;
+        im3dMesh.numIndices = job.numIndices;
+        im3dMesh.strip = (job.meshHeaderFlags & 1u) != 0u;
+        nativeSector = &im3dSector;
+        nativeMesh = &im3dMesh;
+        return true;
+    }
+
     bool prepareNative(const nrw::MeshJob &job)
     {
+        if (job.kind == nrw::kIm3DMesh)
+            return prepareIm3D(job);
         const uint8_t *ee = nrw::rdram();
         if (!ee)
             return false;

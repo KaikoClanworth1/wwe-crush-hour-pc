@@ -28,6 +28,8 @@ namespace nrw
             uint64_t gsTest, gsTex1, gsClamp;
             uint32_t geomGen; // bumped whenever the game edited the geometry (vertex buffer cache key)
             uint32_t envTexture, envFlags; // G3x Gem env pass (MeshJob::envTexture..)
+            uint32_t ringIndices, numIndices;  // kIm3DMesh
+            bool gsFromRegs;                   // native constants, GS state (texture, blending) from the GS registers
             float envCoef, envR[3], envU[3];
             uint64_t envAlpha, envTex1;
         };
@@ -1207,6 +1209,77 @@ namespace nrw
         constexpr uint32_t kDmaPktType = 0x48FDECu, kDmaBufTop = 0x48FE08u, kDmaBufData = 0x48FE0Cu;
         constexpr uint32_t kDmaPktPtr = 0x48FE2Cu, kDmaSprInMem = 0x48FE40u, kDmaSprBase = 0x48FE44u;
         constexpr uint32_t kDmaDirectHdr = 0x48FDF4u; // header tag of an open GIF DIRECT section (back-patched)
+
+        // Room for n marker qwords in RenderWare's open VIF packet (what _rwDMAOpenVIFPkt's fast path checks before
+        // letting a caller write into the same packet). A packet may have a GIF DIRECT section open (type flag
+        // 0x80000000): its header tag at 0x48FDF4 is back-patched with the section length when the next non-DIRECT
+        // writer opens the packet, so anything appended before that becomes GIF data; writeMarkers closes it first
+        // like _rwDMAOpenVIFPkt does (an empty section gives its reserved header qword back).
+        struct MarkerSlot
+        {
+            uint32_t pktType = 0, ptr = 0, sprBase = 0, inMem = 0, directHdr = 0, directQwc = 0, inMemAfter = 0;
+            bool directOpen = false;
+        };
+        bool reserveMarkers(const uint8_t *ee, uint32_t n, MarkerSlot &m)
+        {
+            m.pktType = rd32(ee, kDmaPktType);
+            m.ptr = rd32(ee, kDmaPktPtr);
+            m.sprBase = rd32(ee, kDmaSprBase);
+            m.inMem = rd32(ee, kDmaSprInMem);
+            m.directOpen = (m.pktType & 0x80000000u) != 0u;
+            m.directHdr = m.directOpen ? rd32(ee, kDmaDirectHdr) : 0u;
+            m.directQwc = m.directOpen ? ((((m.inMem - m.directHdr) + (m.ptr - m.sprBase)) >> 4) - 1u) : 0u;
+            m.inMemAfter = (m.directOpen && m.directQwc == 0u) ? m.inMem - 16u : m.inMem;
+            const uint32_t need = n * 16u;
+            return (m.pktType & 0x7FFFFFFFu) == 0x1101u && !(m.directOpen && !m.directHdr) && (m.ptr - m.sprBase) + need <= 0x2000u &&
+                   m.inMemAfter + (m.ptr - m.sprBase) + need < rd32(ee, kDmaBufData);
+        }
+
+        // Append one marker per index and advance RenderWare's packet pointer. RenderWare's VIF "packet" is a DMA
+        // chain in which every writer starts with its own tag (openVU1SetupPktNew writes CNT qwc first; bridges write
+        // CALL tags), so each marker is a tag too: CNT qwc 0 whose TTE upper half carries MARK 0xC0DE + NOP index --
+        // the same qword the bridge hook stores in place of a mesh's CALL.
+        void writeMarkers(uint8_t *ee, PS2Memory &memory, const MarkerSlot &m, const uint32_t *idxs, uint32_t n)
+        {
+            if (m.directOpen)
+            {
+                if (m.directQwc != 0u)
+                {
+                    // DMA CNT qwc, TTE upper half: VIF NOP + DIRECT qwc.
+                    const uint32_t hdrTag[4] = {0x10000000u | m.directQwc, 0u, 0u, 0x50000000u | m.directQwc};
+                    std::memcpy(ee + (m.directHdr & 0x1FFFFF0u), hdrTag, 16);
+                }
+                else
+                    wr32(ee, kDmaSprInMem, m.inMemAfter);
+                wr32(ee, kDmaDirectHdr, 0u);
+                wr32(ee, kDmaPktType, m.pktType & 0x7FFFFFFFu);
+            }
+            uint8_t *dst = (m.ptr & 0xF0000000u) == 0x70000000u ? memory.getScratchpad() + (m.ptr & 0x3FFFu) : ee + (m.ptr & 0x1FFFFFFu);
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                const uint32_t w[4] = {0x10000000u, 0u, 0x07000000u | kMarkerMark, idxs[i] & 0xFFFFu};
+                std::memcpy(dst + i * 16u, w, 16);
+            }
+            wr32(ee, kDmaPktPtr, m.ptr + n * 16u);
+            wr32(ee, kDmaBufTop, m.inMemAfter + (m.ptr - m.sprBase) + n * 16u);
+            g_nodeMarkersWritten += n;
+        }
+
+        // Ring of transient vertex data snapshotted on the EE side (RwIm3D vertices live in the game's buffers only
+        // until the call returns); consumed by the GS side in stream order, long before the ring wraps.
+        constexpr uint32_t kRingSize = 32u << 20;
+        std::vector<uint8_t> g_ring(kRingSize);
+        uint32_t g_ringPos = 0;
+        uint32_t ringAlloc(uint32_t bytes)
+        {
+            bytes = (bytes + 15u) & ~15u;
+            if (g_ringPos + bytes > kRingSize)
+                g_ringPos = 0;
+            const uint32_t at = g_ringPos;
+            g_ringPos += bytes;
+            return at;
+        }
+
     }
 
     namespace
@@ -1388,6 +1461,7 @@ namespace nrw
         Entry &e = g_table[idx];
         e.native = false;
         e.envTexture = 0;
+        e.gsFromRegs = false;
         e.kind = kind;
         e.verts = verts;
         e.normals = normals;
@@ -1437,6 +1511,160 @@ namespace nrw
         g_g3xDirectional = directional;
     }
 
+    // RwIm3DPS2AllObjectSetupCallBack objects (RwIm3DTransform + RwIm3DRender[Indexed]Primitive). The object is the
+    // rwIm3DPoolStash {flags, ltm, numVerts, objVerts, .., primType @36, indices @40, numIndices @44}; the mesh is
+    // RenderWare's static Im3D mesh (material 0x466390: white, alpha 254, surface properties 1). The generic VU1
+    // program draws it unlit with the vertices' RGBA; texture and blending come from the render states (GS
+    // registers), so the job takes those from the GS. Vertices and indices are snapshotted into the ring.
+    bool im3dNode(uint8_t *ee, PS2Memory &memory, uint32_t objPvt, uint32_t stash, int mode)
+    {
+        static const bool s_on = []()
+        {
+            const char *v = std::getenv("PS2X_NRW_IM3D"); // =0: Im3D stays on RenderWare
+            return !(v && *v == '0');
+        }();
+        if (!s_on || mode != 1 || rd32(ee, objPvt + 20u))
+            return false;
+        const uint32_t cam = rd32(ee, kRwGlobals);
+        // RwIm3DTransform records the vertex array in the rwIm3DPool that holds the stash {numElements u16 @-12,
+        // elements @-8, stride @-4}; the stash's own numVerts/objVerts are only filled by some transform paths.
+        const uint32_t flags = rd32(ee, stash), ltm = rd32(ee, stash + 4u);
+        uint32_t numVerts = rd32(ee, stash + 8u), objVerts = rd32(ee, stash + 12u);
+        if (!numVerts || !objVerts)
+        {
+            uint16_t n16;
+            std::memcpy(&n16, ee + ((stash - 12u) & 0x1FFFFFFu), 2);
+            numVerts = n16;
+            objVerts = rd32(ee, stash - 8u);
+            if (rd32(ee, stash - 4u) != kIm3DVertexStride)
+                objVerts = 0u;
+        }
+        const uint32_t primType = rd32(ee, stash + 36u);
+        const uint32_t indices = rd32(ee, stash + 40u);
+        const uint32_t numIndices = indices ? rd32(ee, stash + 44u) : numVerts;
+        if (!cam || !objVerts || numVerts == 0u || numVerts > 65535u || numIndices < 3u || numIndices > (1u << 20) ||
+            (primType != 3u && primType != 4u)) // tri lists / strips (lines, fans, points: RW)
+        {
+            nstat(kNsPrim);
+            static const bool s_diag = std::getenv("PS2X_NRW_STATS") != nullptr;
+            static uint64_t s_hist[8] = {}, s_n = 0;
+            if (s_diag)
+            {
+                ++s_hist[primType & 7u];
+                if ((++s_n % 20000u) == 0u)
+                    std::printf("[nrw-im3d-prim] by type 0..7: %llu %llu %llu %llu %llu %llu %llu %llu (verts %u idx %u)\n",
+                                (unsigned long long)s_hist[0], (unsigned long long)s_hist[1], (unsigned long long)s_hist[2],
+                                (unsigned long long)s_hist[3], (unsigned long long)s_hist[4], (unsigned long long)s_hist[5],
+                                (unsigned long long)s_hist[6], (unsigned long long)s_hist[7], numVerts, numIndices);
+            }
+            return false;
+        }
+        // The group pipeline must be the Im3D one (RwIm3DPS2AllBridgeCallBack, generic code array).
+        const uint32_t gp = rd32(ee, objPvt + 24u), nodes = gp ? rd32(ee, gp + 8u) : 0u, mp = nodes ? rd32(ee, nodes + 20u) : 0u;
+        if (!mp || rd32(ee, mp + 12u) != 0x3004D0u || rd32(ee, mp + 24u) != 0x407440u || rd32(ee, mp + 16u) != 0u)
+        {
+            nstat(kNsPipe);
+            return false;
+        }
+        MarkerSlot slot;
+        if (!reserveMarkers(ee, 1u, slot))
+        {
+            nstat(kNsNoRoom);
+            return false;
+        }
+        // Constants: RwIm3DPS2AllTransformSetupFunc (LTM x view, or the view matrix), no lights, the frustum test
+        // result from the stash flags (4: inside), prim/trans from the primitive type.
+        static ObjExpect ex;
+        ex.mask = 0;
+        ex.unsupported = false;
+        const Mat view = readMat(ee, cam + 32u);
+        Mat t = view;
+        if (ltm)
+            matMul(t, readMat(ee, ltm), view);
+        for (int i = 0; i < 4; ++i)
+            putq(ex.vu[vuIndex(1008u + i)], t.r[i][0], t.r[i][1], t.r[i][2], t.r[i][2]);
+        putq(ex.vu[vuIndex(1012)], 0, 0, 0, 0);
+        putq(ex.vu[vuIndex(1013)], 0, 0, 0, 0);
+        for (uint32_t i = 0; i < 5; ++i)
+            std::memcpy(ex.vu[vuIndex(1014u + i)], ee + ((kSkyCamBlock + i * 16u) & 0x1FFFFFFu), 16);
+        for (uint32_t a = kVuFirstQw; a < 1008u; ++a)
+            putq(ex.vu[vuIndex(a)], 0, 0, 0, 0); // no lights (terminator at 980)
+        const uint32_t transBase = ee[(kGp - 0x793Cu) & 0x1FFFFFFu];
+        if (transBase & 8u) // parallel-projection camera (HUD): RenderWare's parallel VU1 variant, not drawn natively
+        {
+            nstat(kNsPrim);
+            return false;
+        }
+        const bool strip = primType == 4u;
+        uint32_t transType = strip ? transBase : ((transBase | 4u) & 0xFFu);
+        if (!(flags & 4u))
+            transType |= 2u;
+        constexpr uint32_t kIm3DMaterial = 0x466390u;
+        uint8_t col[4];
+        std::memcpy(col, ee + ((kIm3DMaterial + 4u) & 0x1FFFFFFu), 4);
+        const uint64_t primGlobal = rd64(ee, kGp - 0x7CC0u);
+        meshConstants(ee, transType, strip ? 4u : 3u, col, primGlobal, rd32(ee, kGp - 0x797Cu) != 0u, kIm3DMaterial + 12u, 0.0f, ex);
+        {
+            static const bool s_log = std::getenv("PS2X_NRW_IM3DLOG") != nullptr;
+            static uint64_t s_n = 0;
+            if (s_log && ((++s_n % 997u) == 0u))
+            {
+                float v0[9];
+                std::memcpy(v0, ee + (objVerts & 0x1FFFFFFu), 36);
+                uint32_t c0;
+                std::memcpy(&c0, ee + ((objVerts + 12u) & 0x1FFFFFFu), 4);
+                std::printf("[nrw-im3d] stash=%08x flags=%x ltm=%08x verts=%u@%08x (stash %u) prim=%u idx=%08x n=%u trans=%u tex=%d "
+                            "v0=(%g %g %g) rgba=%08x uv=(%g %g) cam=%08x prim1018=%llx\n",
+                            stash, flags, ltm, numVerts, objVerts, rd32(ee, stash + 8u), primType, indices, numIndices, transType,
+                            (int)((primGlobal >> 4) & 1u), v0[0], v0[1], v0[2], c0, v0[7], v0[8], cam,
+                            (unsigned long long)((*reinterpret_cast<const uint64_t *>(&ex.vu[vuIndex(1018)][0]) >> 47) & 0x7FFu));
+                std::fflush(stdout);
+            }
+        }
+        // Snapshot vertices and indices.
+        const uint32_t vbytes = numVerts * kIm3DVertexStride, ibytes = numIndices * 2u;
+        const uint32_t vAt = ringAlloc(vbytes), iAt = ringAlloc(ibytes);
+        std::memcpy(g_ring.data() + vAt, ee + (objVerts & 0x1FFFFFFu), std::min<uint32_t>(vbytes, 0x2000000u - (objVerts & 0x1FFFFFFu)));
+        uint16_t *ix = reinterpret_cast<uint16_t *>(g_ring.data() + iAt);
+        if (indices)
+            std::memcpy(ix, ee + (indices & 0x1FFFFFFu), std::min<uint32_t>(ibytes, 0x2000000u - (indices & 0x1FFFFFFu)));
+        else
+            for (uint32_t i = 0; i < numIndices; ++i)
+                ix[i] = static_cast<uint16_t>(i);
+        const uint32_t idx = g_next.fetch_add(1, std::memory_order_relaxed) & (kTableSize - 1u);
+        Entry &e = g_table[idx];
+        e.native = true;
+        e.gsFromRegs = true;
+        e.kind = kIm3DMesh;
+        e.object = stash;
+        e.mesh = 0;
+        e.meshFlags = strip ? 1u : 0u;
+        e.primType = strip ? 4u : 3u;
+        e.transType = transType;
+        std::memcpy(&e.matCol, col, 4);
+        e.texture = 0;
+        e.vu1CodeIndex = transType & 0x1Fu;
+        e.surfProps = kIm3DMaterial + 12u;
+        e.code = 0;
+        e.verts = vAt;
+        e.normals = 0;
+        e.uvs = 0;
+        e.prelit = 0;
+        e.numVerts = numVerts;
+        e.geomFlags = 0;
+        e.gsTest = e.gsTex1 = e.gsClamp = 0;
+        e.geomGen = 0;
+        e.envTexture = 0;
+        e.ringIndices = iAt;
+        e.numIndices = numIndices;
+        std::memcpy(g_nativeVu[idx & (kNativeVuRing - 1u)], ex.vu, sizeof(ex.vu));
+        writeMarkers(ee, memory, slot, &idx, 1u);
+        nstat(kNsNative);
+        return true;
+    }
+
+    const uint8_t *ring() { return g_ring.data(); }
+
     bool nodeBody(uint8_t *ee, PS2Memory &memory, uint32_t self, uint32_t params)
     {
         const int mode = nodeMode();
@@ -1448,6 +1676,8 @@ namespace nrw
         if (!objPvt || !object)
             return false;
         const uint32_t setupCB = rd32(ee, objPvt + 16u);
+        if (setupCB == 0x300250u)
+            return im3dNode(ee, memory, objPvt, object, mode);
         bool sector, gameCB = false, g3x = false, pgen = false;
         if (setupCB == 0x2976F0u)
         {
@@ -1722,21 +1952,8 @@ namespace nrw
                 return false;
             }
         }
-        // Room for one marker qword per mesh in RenderWare's open VIF packet (what its _rwDMAOpenVIFPkt fast
-        // path checks before letting a caller write into the same packet).
-        // A VIF packet may have a GIF DIRECT section open (type flag 0x80000000): its header tag at 0x48FDF4 is
-        // back-patched with the section length when the next non-DIRECT writer opens the packet, so anything
-        // appended before that becomes GIF data. Close it first like _rwDMAOpenVIFPkt does (an empty section
-        // gives its reserved header qword back).
-        const uint32_t pktType = rd32(ee, kDmaPktType);
-        const uint32_t ptr = rd32(ee, kDmaPktPtr), sprBase = rd32(ee, kDmaSprBase), inMem = rd32(ee, kDmaSprInMem);
-        const bool directOpen = (pktType & 0x80000000u) != 0u;
-        const uint32_t directHdr = directOpen ? rd32(ee, kDmaDirectHdr) : 0u;
-        const uint32_t directQwc = directOpen ? ((((inMem - directHdr) + (ptr - sprBase)) >> 4) - 1u) : 0u;
-        const uint32_t inMemAfter = (directOpen && directQwc == 0u) ? inMem - 16u : inMem;
-        const uint32_t need = numMeshes * 16u;
-        if (mode == 1 && ((pktType & 0x7FFFFFFFu) != 0x1101u || (directOpen && !directHdr) || (ptr - sprBase) + need > 0x2000u ||
-                          inMemAfter + (ptr - sprBase) + need >= rd32(ee, kDmaBufData)))
+        MarkerSlot slot;
+        if (mode == 1 && !reserveMarkers(ee, numMeshes, slot))
         {
             nstat(kNsNoRoom);
             return false;
@@ -1750,6 +1967,11 @@ namespace nrw
         }
         // RpAtomic/RpWorldSector PS2All prim/trans setup: strip -> PRIM 4, list -> PRIM 3 + LIST; clip unless inside.
         const uint32_t transBase = ee[(kGp - 0x793Cu) & 0x1FFFFFFu];
+        if (transBase & 8u) // parallel-projection camera (HUD): RenderWare's parallel VU1 variant, not drawn natively
+        {
+            nstat(kNsPrim);
+            return false;
+        }
         const uint32_t primType = (hdrFlags & 1u) ? 4u : 3u;
         uint32_t transType = (hdrFlags & 1u) ? transBase : ((transBase | 4u) & 0xFFu);
         if (gameCB || pgen || frustumTest(ee, object, sector, cam) != 2u)
@@ -1822,6 +2044,7 @@ namespace nrw
             e.gsClamp = clamp;
             e.geomGen = geomGen;
             e.envTexture = 0;
+            e.gsFromRegs = false;
             if (g3x)
             {
                 const uint32_t matPipe = rd32(ee, material + 8u);
@@ -1863,32 +2086,7 @@ namespace nrw
             nstat(kNsNative); // would have been drawn natively
             return false;
         }
-        // Append the markers and advance RenderWare's packet pointer. RenderWare's VIF "packet" is a DMA chain in
-        // which every writer starts with its own tag (openVU1SetupPktNew writes CNT qwc first; bridges write CALL
-        // tags), so each marker is a tag too: CNT qwc 0 whose TTE upper half carries MARK 0xC0DE + NOP index --
-        // the same qword the bridge hook stores in place of a mesh's CALL.
-        if (directOpen)
-        {
-            if (directQwc != 0u)
-            {
-                // DMA CNT qwc, TTE upper half: VIF NOP + DIRECT qwc.
-                const uint32_t hdrTag[4] = {0x10000000u | directQwc, 0u, 0u, 0x50000000u | directQwc};
-                std::memcpy(ee + (directHdr & 0x1FFFFF0u), hdrTag, 16);
-            }
-            else
-                wr32(ee, kDmaSprInMem, inMemAfter);
-            wr32(ee, kDmaDirectHdr, 0u);
-            wr32(ee, kDmaPktType, pktType & 0x7FFFFFFFu);
-        }
-        uint8_t *dst = (ptr & 0xF0000000u) == 0x70000000u ? memory.getScratchpad() + (ptr & 0x3FFFu) : ee + (ptr & 0x1FFFFFFu);
-        for (uint32_t i = 0; i < numMeshes; ++i)
-        {
-            const uint32_t w[4] = {0x10000000u, 0u, 0x07000000u | kMarkerMark, idxs[i] & 0xFFFFu};
-            std::memcpy(dst + i * 16u, w, 16);
-        }
-        wr32(ee, kDmaPktPtr, ptr + need);
-        wr32(ee, kDmaBufTop, inMemAfter + (ptr - sprBase) + need);
-        g_nodeMarkersWritten += numMeshes;
+        writeMarkers(ee, memory, slot, idxs, numMeshes);
         nstat(kNsNative);
         return true;
     }
@@ -1921,8 +2119,10 @@ namespace nrw
             job.gsTest = e.gsTest;
             job.gsTex1 = e.gsTex1;
             job.gsClamp = e.gsClamp;
-            job.stateFlags = kStateNative;
+            job.stateFlags = e.gsFromRegs ? 0u : kStateNative;
             job.reserved = e.geomGen;
+            job.ringIndices = e.ringIndices;
+            job.numIndices = e.numIndices;
             job.envTexture = e.envTexture;
             if (e.envTexture)
             {

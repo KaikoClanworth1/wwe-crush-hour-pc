@@ -24,6 +24,7 @@ namespace nrw
     {
         kWorldSectorMesh = 1,
         kAtomicMesh = 2, // rigid RpAtomic (one morph target) on RenderWare's generic PS2All VU1 program
+        kIm3DMesh = 3,   // RwIm3D primitive: vertices/indices snapshotted into the job ring (ring()), GS state from registers
     };
 
     // VU1 data memory snapshot range: lights (976..) through per-object constants (..1023).
@@ -46,7 +47,8 @@ namespace nrw
         uint32_t surfProps = 0;       // RwSurfaceProperties (EE address)
         uint32_t pad[2]{};
         // Vertex source (EE addresses; 0 = absent), taken from the sector or the atomic's geometry.
-        uint32_t verts = 0, normals = 0, uvs = 0, prelit = 0, numVerts = 0, geomFlags = 0, pad2[2]{};
+        uint32_t verts = 0, normals = 0, uvs = 0, prelit = 0, numVerts = 0, geomFlags = 0;
+        uint32_t ringIndices = 0, numIndices = 0; // kIm3DMesh: index offset / count in ring() (verts = vertex offset)
         float vu[kVuQwCount][4]{};    // VU1 data memory kVuFirstQw..
         // Native node path (RenderWare's PS2All pipeline skipped): the GS state its mesh bridge would have
         // set, applied by the backend to this draw only (the emulated GS registers stay untouched).
@@ -118,6 +120,9 @@ namespace nrw
     // VU1 light list (980..) -> per light colour*coefficient (w: 1 ambient, 2 directional, 3 point) and object-space
     // direction or position (w: 1/radius); returns the count. Stops at the terminator or a spot light.
     int parseLights(const MeshJob &job, float *colOut, float *dirOut, int maxLights);
+    // Snapshot ring of transient vertex data (kIm3DMesh jobs; written on the EE side, read in stream order).
+    const uint8_t *ring();
+    constexpr uint32_t kIm3DVertexStride = 36u; // RxObjSpace3DVertex: pos, RGBA, normal, u, v
     // Runtime wiring.
     void setGs(GS *gs);
     void setRdram(const uint8_t *rdram);
