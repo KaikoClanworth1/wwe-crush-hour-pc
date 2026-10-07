@@ -95,7 +95,7 @@ namespace ps2host
         double g_shotInterval = 5.0;    // PS2X_SCREENSHOT_SEC
         double g_nextShot = 0.0;
         int g_shotIndex = 0;
-        struct AutoPress { double t, until; uint16_t button; int anchorHit; }; // anchorHit 0 = absolute time
+        struct AutoPress { double t, until; uint16_t button; int anchorHit; int pad; }; // anchorHit 0 = absolute time
         std::vector<AutoPress> g_autoPress; // PS2X_AUTOINPUT="12:START,@0.5:RIGHT,@3+1.0:CROSS" ('@[n+]t' = t s after anchor call n)
         HWND g_hwnd = nullptr;
         std::atomic<bool> g_quit{false};
@@ -691,14 +691,22 @@ float4 ps_main(VsOut i) : SV_Target
                     const size_t dash = when.find('-', 1);
                     const double t = std::atof(when.c_str());
                     const double until = dash != std::string::npos ? std::atof(when.c_str() + dash + 1) : t + 0.25;
-                    const std::string b = item.substr(colon + 1);
+                    // "BUTTON#n": pad n (1-based; default 1), e.g. "CROSS#2" for a split-screen player 2.
+                    std::string b = item.substr(colon + 1);
+                    int padIndex = 0;
+                    const size_t hash = b.find('#');
+                    if (hash != std::string::npos)
+                    {
+                        padIndex = std::clamp(std::atoi(b.c_str() + hash + 1) - 1, 0, kMaxPads - 1);
+                        b.erase(hash);
+                    }
                     static const std::pair<const char *, uint16_t> names[] = {
                         {"START", kBtnStart}, {"SELECT", kBtnSelect}, {"CROSS", kBtnCross}, {"CIRCLE", kBtnCircle},
                         {"SQUARE", kBtnSquare}, {"TRIANGLE", kBtnTriangle}, {"UP", kBtnUp}, {"DOWN", kBtnDown},
                         {"LEFT", kBtnLeft}, {"RIGHT", kBtnRight}, {"L1", kBtnL1}, {"R1", kBtnR1}, {"L2", kBtnL2}, {"R2", kBtnR2}};
                     for (const auto &n : names)
                         if (b == n.first)
-                            g_autoPress.push_back({t, until, n.second, anchorHit});
+                            g_autoPress.push_back({t, until, n.second, anchorHit, padIndex});
                 }
                 if (end == std::string::npos)
                     break;
@@ -906,7 +914,10 @@ float4 ps_main(VsOut i) : SV_Target
     void pollInput()
     {
         PadState pads[kMaxPads];
-        for (int i = 0; i < kMaxPads; ++i)
+        // Hidden test runs (PS2X_BACKGROUND) and PS2X_NO_XINPUT=1 ignore real controllers: XInput is global, so a
+        // pad the user plays something else with would otherwise drive the test too.
+        static const bool s_noXinput = std::getenv("PS2X_BACKGROUND") != nullptr || std::getenv("PS2X_NO_XINPUT") != nullptr;
+        for (int i = 0; i < kMaxPads && !s_noXinput; ++i)
         {
             XINPUT_STATE xs{};
             if (XInputGetState(static_cast<DWORD>(i), &xs) != ERROR_SUCCESS)
@@ -951,8 +962,10 @@ float4 ps_main(VsOut i) : SV_Target
                 if (ap.anchorHit && anchorAt < 0.0)
                     continue;
                 const double rt = ap.anchorHit ? t - anchorAt : t;
+                if (ap.pad > 0)
+                    pads[ap.pad].connected = true; // a scripted pad 2..4 is plugged in from boot
                 if (rt >= ap.t && rt < ap.until)
-                    pads[0].buttons |= ap.button;
+                    pads[ap.pad].buttons |= ap.button;
             }
         }
         std::lock_guard lock(g_inputMutex);

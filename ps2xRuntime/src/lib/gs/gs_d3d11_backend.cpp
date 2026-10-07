@@ -2542,6 +2542,19 @@ struct GSD3D11Backend::Impl
                     std::fflush(stdout);
                 }
             }
+            {
+                // PS2X_RTFALLBACK_LOG=<n>: a texture at a render target's address that is decoded from VRAM instead.
+                static int s_fbLog = std::getenv("PS2X_RTFALLBACK_LOG") ? std::atoi(std::getenv("PS2X_RTFALLBACK_LOG")) : 0;
+                if (s_fbLog > 0 && srcRt &&
+                    !(srcRt->fbw == std::max<uint32_t>(t.tbw, 1u) && bitsPerPixel(srcRt->psm) == bitsPerPixel(t.psm) && !srcRt->needsUpload))
+                {
+                    --s_fbLog;
+                    std::printf("[rt-fallback] frame=%llu tex tbp=%u tbw=%u psm=%u %ux%u -> rt fbw=%u psm=%u %ux%u needsUpload=%d up=%u-%u%c",
+                                static_cast<unsigned long long>(frameCounter), t.tbp0, t.tbw, t.psm, st.textureWidth, st.textureHeight,
+                                srcRt->fbw, srcRt->psm, srcRt->w, srcRt->h, srcRt->needsUpload ? 1 : 0, srcRt->upY0, srcRt->upY1, 10);
+                    std::fflush(stdout);
+                }
+            }
             if (srcRt && srcRt->fbw == std::max<uint32_t>(t.tbw, 1u) && bitsPerPixel(srcRt->psm) == bitsPerPixel(t.psm) && !srcRt->needsUpload)
             {
                 texDims[2] = static_cast<float>(srcRt->w);
@@ -2823,7 +2836,10 @@ struct GSD3D11Backend::Impl
                                         std::chrono::duration<double>(std::chrono::steady_clock::now() - s_firstDraw).count() >= s_traceSec);
         // PS2X_GS_TRACE_TBP=<tbp>: only draws sampling that texture address count (e.g. a locked env map).
         static const long s_traceTbp = std::getenv("PS2X_GS_TRACE_TBP") ? std::atol(std::getenv("PS2X_GS_TRACE_TBP")) : -1;
-        const bool traceTexOk = s_traceTbp < 0 || (pendingState.prim.tme && static_cast<long>(pendingState.context.tex0.tbp0) == s_traceTbp);
+        // PS2X_GS_TRACE_GSONLY=1: skip native jobs that carry their own state (meshes, particles, crowd).
+        static const bool s_traceGsOnly = std::getenv("PS2X_GS_TRACE_GSONLY") != nullptr;
+        const bool traceTexOk = (s_traceTbp < 0 || (pendingState.prim.tme && static_cast<long>(pendingState.context.tex0.tbp0) == s_traceTbp)) &&
+                                !(s_traceGsOnly && ((nativeJob && (nativeJob->stateFlags & nrw::kStateNative) != 0u) || pendingRasterTex != 0u));
         if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk && traceTexOk && !pending.empty())
         {
             if (s_traced == 0)
