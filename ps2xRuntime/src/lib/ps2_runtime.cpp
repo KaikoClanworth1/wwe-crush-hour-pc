@@ -2981,6 +2981,28 @@ extern "C" void ps2x_widescreen_view_window(uint8_t *rdram, uint32_t camera, uin
 #endif
 }
 
+// Widescreen: a HUD element placed at a normalized (0..1) screen x taken from the 16:9 3D camera (a car's name tag,
+// tools/patch_ws_enemyinfo.py). The backend draws the HUD layer 3/4 as wide about the centre, so spread it by 4/3
+// here and it lands over the car. Same switch as the backend's HUD layer (Widescreen=1, PS2X_WS_HUD != 0).
+extern "C" void ps2x_ws_hud_x(uint8_t *rdram, uint32_t addr)
+{
+#if defined(PS2X_NATIVE_HOST)
+    static const bool s_on = []()
+    {
+        const char *v = std::getenv("PS2X_WS_HUD");
+        return ps2host::config().widescreen && !(v && *v == '0');
+    }();
+    if (!s_on || !rdram)
+        return;
+    float x = 0.0f;
+    std::memcpy(&x, rdram + (addr & 0x01FFFFFCu), 4);
+    x = 0.5f + (x - 0.5f) * (4.0f / 3.0f);
+    std::memcpy(rdram + (addr & 0x01FFFFFCu), &x, 4);
+#else
+    (void)rdram, (void)addr;
+#endif
+}
+
 static void eeWatchStore(const R5900Context *ctx, uint32_t vaddr, uint32_t size, uint64_t lo, uint64_t hi)
 {
     static const long long s_watch = std::getenv("PS2X_EE_WATCH") ? std::strtoll(std::getenv("PS2X_EE_WATCH"), nullptr, 16) : -1;

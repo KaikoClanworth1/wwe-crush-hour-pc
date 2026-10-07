@@ -166,7 +166,7 @@ namespace
     const char *kGsShader = R"(
 cbuffer Draw : register(b0)
 {
-    float4 rtSize;      // native w, h
+    float4 rtSize;      // native w, h; z: 2D-layer x scale for widescreen (1 = none), w: its centre x
     float4 texDims;     // GS texture w, h (TW/TH), storage w, h (for normalization)
     float4 fogColor;    // 0..255
     float4 p0;          // x tfx, y tcc, z tme, w fge
@@ -211,7 +211,10 @@ NativeOut vs_native(NativeIn v)
     NativeOut o;
     // Homogeneous output so D3D clips like the VU1 clip routines; behind the camera z stays linear in w.
     const float zn = clip.w > 0.0 ? z / nMisc.z : scr.z / nMisc.z;
-    o.pos = float4(xy.x / rtSize.x * 2.0 - 1.0, 1.0 - xy.y / rtSize.y * 2.0, zn, 1.0) * clip.w;
+    // Widescreen 2D layer: rtSize.z > 0 scales the whole draw, < 0 only vertices flagged in nrm.w (per triangle).
+    const float hs = rtSize.z >= 0.0 ? rtSize.z : (v.nrm.w != 0 ? -rtSize.z : 1.0);
+    const float hx = rtSize.w + (xy.x - rtSize.w) * hs;
+    o.pos = float4(hx / rtSize.x * 2.0 - 1.0, 1.0 - xy.y / rtSize.y * 2.0, zn, 1.0) * clip.w;
     const float cz = nClip.x + nClip.y * clip.w;
     o.cd = nClip.z != 0.0 ? float2(clip.w - cz, clip.w + cz) : float2(clip.w, clip.w);
     float4 col = float4(v.col);
@@ -249,7 +252,8 @@ NativeOut vs_native(NativeIn v)
 PsIn vs_main(VsIn v)
 {
     PsIn o;
-    o.pos = float4(v.pos.x / rtSize.x * 2.0 - 1.0, 1.0 - v.pos.y / rtSize.y * 2.0, v.pos.z, 1.0);
+    const float hx = rtSize.w + (v.pos.x - rtSize.w) * abs(rtSize.z); // widescreen 2D layer (1 otherwise)
+    o.pos = float4(hx / rtSize.x * 2.0 - 1.0, 1.0 - v.pos.y / rtSize.y * 2.0, v.pos.z, 1.0);
     o.col = v.col;
     o.tc = v.tc;
     return o;
@@ -384,6 +388,7 @@ float4 ps_blit(BlitOut i) : SV_Target
         uint32_t texa;
         uint32_t clutVersion;
         uint32_t colclamp;
+        uint32_t hud; // widescreen 2D-layer x scale (float bits; 0 = none)
 
         bool operator==(const DrawKey &o) const { return std::memcmp(this, &o, sizeof(DrawKey)) == 0; }
     };
@@ -435,6 +440,7 @@ struct GSD3D11Backend::Impl
     NativeMesh im3dMesh;
     uint32_t im3dVbCap = 0, im3dIbCap = 0;
     std::vector<NativeVtx> im3dVtx;
+    std::vector<float> im3dX; // widescreen 2D layer: Im3D vertex screen x
     std::unordered_map<uint32_t, NativeSector> nativeSectors;
     std::unordered_map<uint32_t, NativeMesh> nativeMeshes;
     const nrw::MeshJob *nativeJob = nullptr;
@@ -608,6 +614,22 @@ struct GSD3D11Backend::Impl
 
     std::vector<Vtx> pending;
     DrawKey pendingKey{};
+    // Widescreen=1 (the 3D cameras get a 16:9 view window and the 4:3 frame is shown stretched to 16:9): the 2D
+    // layer -- RwIm2D and parallel-projection (HUD camera) draws -- is drawn 3/4 as wide about the frame's centre,
+    // so HUD, text and menu panels keep their proportions. Draws nearly as wide as the frame (fades, flashes,
+    // the motion blur, full-screen backgrounds) stay full width. PS2X_WS_HUD=0 turns it off.
+    float hudScale = 1.0f;
+    static bool hudWidescreen()
+    {
+        static const bool s_on = []()
+        {
+            const char *v = std::getenv("PS2X_WS_HUD");
+            return ps2host::config().widescreen && !(v && *v == '0');
+        }();
+        return s_on;
+    }
+    static constexpr float kHudScale = 0.75f;      // (4/3) / (16/9)
+    static constexpr float kHudFullWidth = 576.0f; // 90% of the 640-pixel frame
     GSDrawState pendingState{};
     bool hasPending = false;
     uint64_t frameCounter = 0;
@@ -1890,6 +1912,8 @@ struct GSD3D11Backend::Impl
         k.scx1 = c.scissor.x1;
         k.scy0 = c.scissor.y0;
         k.scy1 = c.scissor.y1;
+        if (hudScale != 1.0f)
+            std::memcpy(&k.hud, &hudScale, 4);
         return k;
     }
 
@@ -2052,6 +2076,31 @@ struct GSD3D11Backend::Impl
                 o.nrm[k] = static_cast<int8_t>(v >= 127.0f ? 127 : (v <= -128.0f ? -128 : static_cast<int>(v)));
             }
             o.nrm[3] = 0;
+        }
+        if ((job.transType & 8u) != 0u && hudWidescreen())
+        {
+            // Widescreen 2D layer, per triangle: sprite batches mix HUD pieces with full-width quads (fades).
+            // Vertices of triangles narrower than the frame get nrm.w = 1 (the shader scales those).
+            auto vu = [&](uint32_t a) { return job.vu[nrw::vuIndex(a)]; };
+            const float c0 = vu(1008u)[0], c1 = vu(1009u)[0], c2 = vu(1010u)[0], c3 = vu(1011u)[0] - 0.5f;
+            const float sx = vu(1015u)[0];
+            im3dX.resize(job.numVerts);
+            for (uint32_t i = 0; i < job.numVerts; ++i)
+            {
+                const float *p = im3dVtx[i].pos;
+                im3dX[i] = sx * (c0 * p[0] + c1 * p[1] + c2 * p[2] + c3);
+            }
+            const uint16_t *ix = reinterpret_cast<const uint16_t *>(ring + job.ringIndices);
+            const bool strip = (job.meshHeaderFlags & 1u) != 0u;
+            const uint32_t tris = strip ? job.numIndices - 2u : job.numIndices / 3u;
+            for (uint32_t t = 0; t < tris; ++t)
+            {
+                const uint32_t a = strip ? t : t * 3u;
+                const uint16_t i0 = ix[a] % job.numVerts, i1 = ix[a + 1u] % job.numVerts, i2 = ix[a + 2u] % job.numVerts;
+                const float x0 = std::min({im3dX[i0], im3dX[i1], im3dX[i2]}), x1 = std::max({im3dX[i0], im3dX[i1], im3dX[i2]});
+                if (x1 - x0 < kHudFullWidth)
+                    im3dVtx[i0].nrm[3] = im3dVtx[i1].nrm[3] = im3dVtx[i2].nrm[3] = 1;
+            }
         }
         if (!uploadDynamic(im3dSector.vb, im3dVbCap, D3D11_BIND_VERTEX_BUFFER, im3dVtx.data(),
                            job.numVerts * static_cast<uint32_t>(sizeof(NativeVtx))) ||
@@ -2254,6 +2303,43 @@ struct GSD3D11Backend::Impl
         ++pipeGen; // the next ordinary draw rebinds the standard pipeline
     }
 
+    // Widescreen 2D layer: the x extent (GS pixels, XYOFFSET included) of a parallel-projection job, with
+    // bindNative's ISO math (screen = scale * (C.v - 0.5) + offset, no divide). Vertices: the Im3D ring or the
+    // atomic / sector position array in EE memory.
+    bool isoExtentX(const nrw::MeshJob &job, float &x0, float &x1) const
+    {
+        auto vu = [&](uint32_t a) { return job.vu[nrw::vuIndex(a)]; };
+        const float c0 = vu(1008u)[0], c1 = vu(1009u)[0], c2 = vu(1010u)[0], c3 = vu(1011u)[0] - 0.5f;
+        const float sx = vu(1015u)[0], off = vu(1016u)[0] + vu(1017u)[0];
+        const uint8_t *src = nullptr;
+        uint32_t stride = 12u;
+        if (job.kind == nrw::kIm3DMesh)
+        {
+            const uint8_t *ring = nrw::ring();
+            src = ring ? ring + job.verts : nullptr;
+            stride = nrw::kIm3DVertexStride;
+        }
+        else if (const uint8_t *ee = nrw::rdram())
+        {
+            const uint32_t p = job.verts & 0x1FFFFFFFu;
+            if (p && p < 0x2000000u && p + job.numVerts * 12ull <= 0x2000000u)
+                src = ee + p;
+        }
+        if (!src || job.numVerts == 0u)
+            return false;
+        x0 = 1e30f;
+        x1 = -1e30f;
+        for (uint32_t i = 0; i < job.numVerts; ++i, src += stride)
+        {
+            float pos[3];
+            std::memcpy(pos, src, 12);
+            const float x = sx * (c0 * pos[0] + c1 * pos[1] + c2 * pos[2] + c3) + off;
+            x0 = std::min(x0, x);
+            x1 = std::max(x1, x);
+        }
+        return true;
+    }
+
     // RwIm2D drawn natively (nrw::im2d): the screen-space triangles RenderWare's Im2D VU1 program would have kicked,
     // through the standard GS-vertex path with the register state and the job's PRIM (TRIANGLE).
     void submitIm2D(const GSDrawState &st, const nrw::MeshJob &job)
@@ -2267,6 +2353,12 @@ struct GSD3D11Backend::Impl
         b.state = st;
         b.vertexCount = 3;
         const bool rasterState = (job.stateFlags & nrw::kStateNative) != 0u && job.texture != 0u;
+        // RwIm2D (screen space) is the 2D layer: with widescreen, triangles narrower than the frame are drawn 3/4 as
+        // wide about its centre (GS window x: XYOFFSET + half the frame width); full-width ones (fades) stay.
+        const bool hud2d = !(job.stateFlags & nrw::kStateNative) && hudWidescreen() &&
+                           std::max<uint32_t>(st.context.frame.fbw, 1u) * 64u >= 512u;
+        const float hudCx = static_cast<float>(st.context.xyoffset.ofx) / 16.0f +
+                            0.5f * static_cast<float>(std::max<uint32_t>(st.context.frame.fbw, 1u) * 64u);
         if (rasterState)
         {
             // Game particles: no RenderWare bridge ran, so its GS state is applied here and the texture is decoded
@@ -2302,6 +2394,14 @@ struct GSD3D11Backend::Impl
                 o.u = o.v = 0;
                 o.fog = 255;
             }
+            if (hud2d)
+            {
+                const float x0 = std::min({b.vertices[0].x, b.vertices[1].x, b.vertices[2].x});
+                const float x1 = std::max({b.vertices[0].x, b.vertices[1].x, b.vertices[2].x});
+                if (x1 - x0 < kHudFullWidth)
+                    for (uint32_t k = 0; k < 3u; ++k)
+                        b.vertices[k].x = hudCx + (b.vertices[k].x - hudCx) * kHudScale;
+            }
             submit(b);
         }
         if (rasterState)
@@ -2309,6 +2409,7 @@ struct GSD3D11Backend::Impl
             flushPending();
             pendingRasterTex = 0;
         }
+        hudScale = 1.0f; // the pending batch keeps its scale in its key
     }
 
     void submitNative(const GSDrawState &st, const nrw::MeshJob &job)
@@ -2339,6 +2440,17 @@ struct GSD3D11Backend::Impl
             return;
         pending.clear();
         pendingState = st;
+        hudScale = 1.0f;
+        if ((job.transType & 8u) != 0u && hudWidescreen())
+        {
+            // Parallel projection (HUD / 2D cameras): the 2D layer. Im3D per triangle (prepareIm3D flagged the
+            // vertices), other objects as a whole unless they span (nearly) the whole frame.
+            float x0 = 0.0f, x1 = 0.0f;
+            if (job.kind == nrw::kIm3DMesh)
+                hudScale = -kHudScale;
+            else if (isoExtentX(job, x0, x1) && (x1 - x0) < kHudFullWidth)
+                hudScale = kHudScale;
+        }
         if (job.stateFlags & nrw::kStateNative)
         {
             // RenderWare's mesh bridge did not run (native node path): apply the GS state it would have set to
@@ -2396,6 +2508,7 @@ struct GSD3D11Backend::Impl
         nativeJob = nullptr;
         nativeSector = nullptr;
         nativeMesh = nullptr;
+        hudScale = 1.0f;
         ++statNativeDraws;
     }
 
@@ -2649,6 +2762,17 @@ struct GSD3D11Backend::Impl
         DrawCB cbd{};
         cbd.rtSize[0] = static_cast<float>(rt->w);
         cbd.rtSize[1] = static_cast<float>(rt->h);
+        {
+            float hs = 1.0f;
+            if (nativeJob)
+                hs = hudScale;
+            else if (pendingKey.hud)
+                std::memcpy(&hs, &pendingKey.hud, 4);
+            if (std::max<uint32_t>(c.frame.fbw, 1u) * 64u < 512u)
+                hs = 1.0f; // a camera texture (e.g. the arena screen's feed), not the stretched frame
+            cbd.rtSize[2] = hs;
+            cbd.rtSize[3] = 0.5f * static_cast<float>(std::min<uint32_t>(rt->w, std::max<uint32_t>(c.frame.fbw, 1u) * 64u));
+        }
         std::memcpy(cbd.texDims, texDims, sizeof(texDims));
         cbd.fogColor[0] = st.fogR;
         cbd.fogColor[1] = st.fogG;
