@@ -6,6 +6,10 @@
 #include "runtime/gs/ps2_gs_psmt4.h"
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "host/win32_host.h"
+namespace ps2host
+{
+    void setPresentWide(bool wide); // win32_host.cpp: Widescreen=1 frame shown 16:9 (else 4:3 with bars)
+}
 #include "runtime/gs/ps2_gif_arbiter.h"
 extern thread_local GifPathId g_gifCurrentPath;
 
@@ -630,6 +634,12 @@ struct GSD3D11Backend::Impl
     }
     static constexpr float kHudScale = 0.75f;      // (4/3) / (16/9)
     static constexpr float kHudFullWidth = 576.0f; // 90% of the 640-pixel frame
+    // Frames without a 3D scene (movies, loading and text screens) are shown 4:3 with side bars instead, their 2D
+    // untouched: a frame is "wide" when the previous one drew perspective world / object meshes into the frame;
+    // the 2D correction and the presentation aspect use the same flag (latched with the frame in Present).
+    bool frame3D = false;     // this frame drew perspective sectors / atomics into a frame-sized target
+    bool hudOn = false;       // this frame's 2D correction (hudWidescreen() && the previous frame had 3D)
+    bool displayWide = true;  // the latched frame: 16:9 (or 4:3 with bars)
     GSDrawState pendingState{};
     bool hasPending = false;
     uint64_t frameCounter = 0;
@@ -2077,7 +2087,7 @@ struct GSD3D11Backend::Impl
             }
             o.nrm[3] = 0;
         }
-        if ((job.transType & 8u) != 0u && hudWidescreen())
+        if ((job.transType & 8u) != 0u && hudOn)
         {
             // Widescreen 2D layer, per triangle: sprite batches mix HUD pieces with full-width quads (fades).
             // Vertices of triangles narrower than the frame get nrm.w = 1 (the shader scales those).
@@ -2355,7 +2365,7 @@ struct GSD3D11Backend::Impl
         const bool rasterState = (job.stateFlags & nrw::kStateNative) != 0u && job.texture != 0u;
         // RwIm2D (screen space) is the 2D layer: with widescreen, triangles narrower than the frame are drawn 3/4 as
         // wide about its centre (GS window x: XYOFFSET + half the frame width); full-width ones (fades) stay.
-        const bool hud2d = !(job.stateFlags & nrw::kStateNative) && hudWidescreen() &&
+        const bool hud2d = !(job.stateFlags & nrw::kStateNative) && hudOn &&
                            std::max<uint32_t>(st.context.frame.fbw, 1u) * 64u >= 512u;
         const float hudCx = static_cast<float>(st.context.xyoffset.ofx) / 16.0f +
                             0.5f * static_cast<float>(std::max<uint32_t>(st.context.frame.fbw, 1u) * 64u);
@@ -2441,7 +2451,10 @@ struct GSD3D11Backend::Impl
         pending.clear();
         pendingState = st;
         hudScale = 1.0f;
-        if ((job.transType & 8u) != 0u && hudWidescreen())
+        if ((job.kind == nrw::kWorldSectorMesh || job.kind == nrw::kAtomicMesh) && (job.transType & 8u) == 0u &&
+            std::max<uint32_t>(st.context.frame.fbw, 1u) * 64u >= 512u)
+            frame3D = true;
+        if ((job.transType & 8u) != 0u && hudOn)
         {
             // Parallel projection (HUD / 2D cameras): the 2D layer. Im3D per triangle (prepareIm3D flagged the
             // vertices), other objects as a whole unless they span (nearly) the whole frame.
@@ -3433,6 +3446,13 @@ PresentationFrame GSD3D11Backend::Present(const GSPresentationRequest &request)
     Impl &d = *m_impl;
     d.flushPending();
     ++d.frameCounter;
+    {
+        // Widescreen: this frame's aspect is the one its 2D was drawn for; the next frame decides from this one.
+        static const bool s_hud = Impl::hudWidescreen();
+        d.displayWide = !s_hud || d.hudOn;
+        d.hudOn = s_hud && d.frame3D;
+        d.frame3D = false;
+    }
     PresentationFrame result{};
     if (d.gpuReady && d.presentRequest(request))
     {
@@ -3574,6 +3594,7 @@ bool GSD3D11Backend::PresentLatchedToHost()
     std::lock_guard lock(ps2host::d3dLock());
     if (!d->hasDisplay || !d->displaySrv)
         return false;
+    ps2host::setPresentWide(d->displayWide);
     ps2host::presentTexture(d->displaySrv.Get(), d->displayW, d->displayH, 1.0f, 1.0f);
     return true;
 }

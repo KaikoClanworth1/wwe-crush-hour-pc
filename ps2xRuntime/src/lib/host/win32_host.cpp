@@ -481,6 +481,9 @@ float4 ps_main(VsOut i) : SV_Target
             g_ctx->PSSetShaderResources(0, 1, &nullSrv);
         }
 
+        // Widescreen=1: the GS backend shows frames without a 3D scene (movies, loading screens) 4:3 with bars.
+        std::atomic<bool> g_presentWide{true};
+
         void drawBlit(ID3D11ShaderResourceView *srv, uint32_t srcW, uint32_t srcH, float u1, float v1)
         {
             g_d3dEpoch.fetch_add(1, std::memory_order_relaxed); // GS backend state cache must rebind
@@ -493,7 +496,7 @@ float4 ps_main(VsOut i) : SV_Target
             float vw = bw, vh = bh;
             if (g_config.keepAspect)
             {
-                const float aspect = g_config.widescreen ? (16.0f / 9.0f) : (4.0f / 3.0f);
+                const float aspect = (g_config.widescreen && g_presentWide.load(std::memory_order_relaxed)) ? (16.0f / 9.0f) : (4.0f / 3.0f);
                 if (bw / bh > aspect)
                     vw = bh * aspect;
                 else
@@ -895,6 +898,8 @@ float4 ps_main(VsOut i) : SV_Target
         g_ctx->UpdateSubresource(g_uploadTex.Get(), 0, nullptr, rgba, stride, 0);
         drawBlit(g_uploadSrv.Get(), width, height, 1.0f, 1.0f);
     }
+
+    void setPresentWide(bool wide) { g_presentWide.store(wide, std::memory_order_relaxed); }
 
     void presentTexture(void *srv, uint32_t width, uint32_t height, float u1, float v1)
     {
