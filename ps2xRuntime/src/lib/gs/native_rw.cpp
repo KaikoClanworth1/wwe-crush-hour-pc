@@ -2384,8 +2384,12 @@ namespace nrw
         };
         for (uint32_t a = 0; a < 3u * j.numVerts; ++a)
             check(a);
+        // The programs' own scratch (absolute stores, written before they are read): sprite / instanced 729..733,
+        // their 2Cam versions 736..744, 2Cam streak 640..648 (streak's own lies inside 271..637).
+        const uint32_t scratch0 = j.variant == 4u ? 640u : j.variant >= 3u ? 736u : 729u;
+        const uint32_t scratch1 = j.variant == 4u ? 649u : j.variant >= 3u ? 745u : 734u;
         for (uint16_t a : j.prog->uploaded)
-            if (!(a >= 271u && a < 638u) && !(a >= 729u && a < 734u))
+            if (!(a >= 271u && a < 638u) && !(a >= scratch0 && a < scratch1))
                 check(a);
         for (uint32_t a = 984u; a <= 1017u; ++a)
             check(a);
