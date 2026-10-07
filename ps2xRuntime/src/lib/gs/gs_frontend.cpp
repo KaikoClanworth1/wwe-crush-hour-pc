@@ -1621,6 +1621,46 @@ void GS::vertexKick(bool drawing)
 
     if (drawing && m_backend)
     {
+        // PS2X_GS_PRIMSTATS=1: what still reaches the GS as PS2 drawing commands (the native RenderWare path draws
+        // through its own jobs): primitives per (type, TME/FST/ABE, context, TEX0 TBP/PSM, FRAME FBP), every 10 s.
+        static const bool s_primStats = std::getenv("PS2X_GS_PRIMSTATS") != nullptr;
+        if (s_primStats)
+        {
+            static std::vector<std::pair<uint64_t, uint64_t>> s_hist;
+            static uint64_t s_total = 0;
+            static auto s_last = std::chrono::steady_clock::now();
+            const GSContext &c = m_ctx[m_prim.ctxt ? 1 : 0];
+            const uint64_t key = static_cast<uint64_t>(m_prim.type) | (m_prim.tme ? 8ull : 0ull) | (m_prim.fst ? 16ull : 0ull) |
+                                 (m_prim.abe ? 32ull : 0ull) | (m_prim.ctxt ? 64ull : 0ull) |
+                                 (static_cast<uint64_t>(m_prim.tme ? c.tex0.tbp0 & 0x3FFFu : 0u) << 8) |
+                                 (static_cast<uint64_t>(m_prim.tme ? c.tex0.psm & 0x3Fu : 0u) << 22) |
+                                 (static_cast<uint64_t>(c.frame.fbp & 0x1FFu) << 28);
+            ++s_total;
+            auto it = std::find_if(s_hist.begin(), s_hist.end(), [&](const auto &p) { return p.first == key; });
+            if (it != s_hist.end())
+                ++it->second;
+            else if (s_hist.size() < 4096u)
+                s_hist.emplace_back(key, 1u);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_last > std::chrono::seconds(10))
+            {
+                s_last = now;
+                std::sort(s_hist.begin(), s_hist.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+                std::printf("[gs-prims] %llu primitives from GS packets in 10 s, %zu kinds:", static_cast<unsigned long long>(s_total), s_hist.size());
+                for (size_t i = 0; i < s_hist.size() && i < 10u; ++i)
+                {
+                    const uint64_t k = s_hist[i].first;
+                    std::printf(" [type %u tme %u fst %u abe %u ctx %u tbp %05x psm %02x fbp %03x: %llu]", static_cast<unsigned>(k & 7u),
+                                static_cast<unsigned>((k >> 3) & 1u), static_cast<unsigned>((k >> 4) & 1u), static_cast<unsigned>((k >> 5) & 1u),
+                                static_cast<unsigned>((k >> 6) & 1u), static_cast<unsigned>((k >> 8) & 0x3FFFu), static_cast<unsigned>((k >> 22) & 0x3Fu),
+                                static_cast<unsigned>((k >> 28) & 0x1FFu), static_cast<unsigned long long>(s_hist[i].second));
+                }
+                std::printf("%c", 10);
+                std::fflush(stdout);
+                s_hist.clear();
+                s_total = 0;
+            }
+        }
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
         m_backend->Submit(batch);

@@ -38,6 +38,7 @@ namespace nrw
             bool gsFromRegs;                   // native constants, GS state (texture, blending) from the GS registers
             float envCoef, envR[3], envU[3];
             uint64_t envAlpha, envTex1;
+            uint8_t g3xLightSrc; // G3x ADL lights: 0 not G3x, 1 from VU1 995..997 at the marker, 2 from the RpLights
         };
         uint64_t g_nodeMarkersWritten = 0; // PS2X_NRW_ENVLOG diagnostics
         // Edit generation per RpGeometry: RpGeometryLock marks lockedSinceLastInst, RenderWare re-instances.
@@ -439,6 +440,7 @@ namespace nrw
             uint64_t mask = 0; // bit i: VU1 kVuFirstQw + i was computed
             uint32_t setupCB = 0;
             bool unsupported = false;
+            bool g3xVuLights = false; // g3xLightBlock: lights from VU1 memory at the marker
         };
         constexpr uint32_t kExpectRing = 16384u;
         ObjExpect g_objExpect[kExpectRing];
@@ -447,12 +449,31 @@ namespace nrw
         // game's renderer, VU1-resident 995..997). 0 until the game uploads them.
         uint32_t g_g3xAmbient = 0, g_g3xDirectional = 0;
 
+        // G3x light source (PS2X_NRW_G3X_LIGHTS): the G3x program lights with what VU1 995..997 hold when it runs --
+        // RpPDS_G3x_ADL_LightingUpload's ambient colour, directional colour and directional "at", or, in the title and
+        // menus (no upload), whatever an earlier upload left there. Default ("vu"): the header (inverse LTM) here, the
+        // ambient + directional slots from VU1 memory at the marker. "rplight": from the uploaded RpLights (objects
+        // before the first upload stay on RenderWare); "check": as rplight, compared with VU1 at the marker.
+        int g3xLightMode()
+        {
+            static const int s_mode = []()
+            {
+                const char *v = std::getenv("PS2X_NRW_G3X_LIGHTS");
+                if (v && std::strcmp(v, "rplight") == 0)
+                    return 0;
+                if (v && std::strcmp(v, "check") == 0)
+                    return 2;
+                return 1;
+            }();
+            return s_mode;
+        }
+
         // The light block RenderWare's generic program would need for a PDS G3x ADL object: header (inverse LTM),
         // ambient, directional. Same math as the G3x program (object-space direction normalised by the LTM scale,
         // light * surface coefficient * material colour, clamped at 1).
-        bool g3xLightBlock(const uint8_t *ee, uint32_t object, LightBlock &lb)
+        bool g3xLightBlock(const uint8_t *ee, uint32_t object, LightBlock &lb, bool fromVu)
         {
-            if (!g_g3xAmbient || !g_g3xDirectional)
+            if (!fromVu && (!g_g3xAmbient || !g_g3xDirectional))
                 return false;
             const uint32_t frame = rd32(ee, object + 4u);
             if (!frame)
@@ -467,6 +488,16 @@ namespace nrw
                 if (invScale > 0.0f)
                     recip = 1.0f / invScale;
             }
+            if (fromVu)
+            {
+                for (int r = 0; r < 3; ++r) // header (applyLight's)
+                    putq(lb.q[r], inv.r[r][0], inv.r[r][1], inv.r[r][2], invScale);
+                putq(lb.q[3], inv.r[3][0], inv.r[3][1], inv.r[3][2], recip);
+                for (int r = 4; r < 7; ++r)
+                    putq(lb.q[r], 0, 0, 0, 0);
+                lb.count = 7; // ambient (980), directional colour + direction (981, 982): VU1 at the marker
+                return true;
+            }
             applyLight(ee, g_g3xAmbient, &inv, invScale, recip, lb);
             applyLight(ee, g_g3xDirectional, &inv, invScale, recip, lb);
             return !lb.unsupported;
@@ -479,6 +510,7 @@ namespace nrw
         {
             ex.mask = 0;
             ex.unsupported = false;
+            ex.g3xVuLights = false;
             const uint32_t cam = rd32(ee, kRwGlobals);
             if (!cam)
             {
@@ -517,7 +549,9 @@ namespace nrw
             lb.unsupported = false;
             if (g3x)
             {
-                if (!g3xLightBlock(ee, object, lb))
+                const int lm = g3xLightMode();
+                ex.g3xVuLights = lm == 1 || (lm == 2 && (!g_g3xAmbient || !g_g3xDirectional));
+                if (!g3xLightBlock(ee, object, lb, ex.g3xVuLights))
                 {
                     ex.unsupported = true;
                     return;
@@ -1117,9 +1151,11 @@ namespace nrw
         // 2 MatFX effect, 3 G3x non-Gem pipeline, 4 Gem env rejected, 5 texture not a plain texture raster.
         uint64_t g_pipeWhy[6] = {};
 
+        int g_lastNs = -1; // the last nstat category (why the last object stayed on RenderWare)
         void nstat(int k)
         {
             static const bool s_on = std::getenv("PS2X_NRW_STATS") != nullptr;
+            g_lastNs = k;
             ++g_nstat[k];
             uint64_t total = 0;
             for (uint64_t v : g_nstat)
@@ -1336,6 +1372,46 @@ namespace nrw
                 g_ringPos = 0;
             const uint32_t at = g_ringPos;
             g_ringPos += bytes;
+            return at;
+        }
+
+        // A morph blend on the CPU (RenderWare's PS2 generic program interpolates two instanced targets): position and
+        // normal = a + f (b - a), into the ring as RxObjSpace3DVertex (pos, RGBA, normal, u, v).
+        uint32_t morphVertices(const uint8_t *ee, uint32_t numVerts, uint32_t vA, uint32_t nA, uint32_t vB, uint32_t nB, float f,
+                               uint32_t uvs, uint32_t prelit)
+        {
+            const uint32_t at = ringAlloc(numVerts * kIm3DVertexStride);
+            uint8_t *out = g_ring.data() + at;
+            for (uint32_t v = 0; v < numVerts; ++v, out += kIm3DVertexStride)
+            {
+                float a[3], b[3], na[3] = {0.0f, 0.0f, 0.0f}, nb[3] = {0.0f, 0.0f, 0.0f}, p[3], n[3];
+                std::memcpy(a, ee + ((vA + v * 12u) & 0x1FFFFFFu), 12);
+                std::memcpy(b, ee + ((vB + v * 12u) & 0x1FFFFFFu), 12);
+                if (nA)
+                    std::memcpy(na, ee + ((nA + v * 12u) & 0x1FFFFFFu), 12);
+                if (nB)
+                    std::memcpy(nb, ee + ((nB + v * 12u) & 0x1FFFFFFu), 12);
+                else
+                    std::memcpy(nb, na, 12);
+                for (int c = 0; c < 3; ++c)
+                {
+                    p[c] = a[c] + f * (b[c] - a[c]);
+                    n[c] = na[c] + f * (nb[c] - na[c]);
+                }
+                std::memcpy(out, p, 12);
+                if (prelit)
+                    std::memcpy(out + 12, ee + ((prelit + v * 4u) & 0x1FFFFFFu), 4);
+                else
+                {
+                    const uint8_t black[4] = {0, 0, 0, 255};
+                    std::memcpy(out + 12, black, 4);
+                }
+                std::memcpy(out + 16, n, 12);
+                if (uvs)
+                    std::memcpy(out + 28, ee + ((uvs + v * 8u) & 0x1FFFFFFu), 8);
+                else
+                    std::memset(out + 28, 0, 8);
+            }
             return at;
         }
 
@@ -1574,9 +1650,36 @@ namespace nrw
                 stat(2);
                 return false;
             }
-            if (code == 0u || code != g_sectorCode)
+            // Any variant of the generic program (rwPDS_G3_Generic_VU1Transforms: perspective / parallel, clip, fog;
+            // the MatFX array's first four entries are the same programs) -- the native renderer draws them all from
+            // the constants RenderWare uploaded. These are mostly objects the node path leaves to RenderWare because
+            // their texture is a live camera texture: RenderWare's bridge has placed it and set TEX0, so the draw
+            // samples the render target where it really is. PS2X_NRW_BRIDGE_ATOMICS=0: only the sectors' variant.
+            static const bool s_anyGeneric = []()
+            {
+                const char *v = std::getenv("PS2X_NRW_BRIDGE_ATOMICS");
+                return !(v && *v == '0');
+            }();
+            bool generic = code != 0u && code == g_sectorCode;
+            for (uint32_t i = 0; s_anyGeneric && !generic && code != 0u && i < 8u; ++i)
+                generic = rd32(rdram, 0x407440u + i * 4u) == code;
+            if (!generic)
             {
                 stat(3);
+                if (s_stats)
+                {
+                    // Which VU1 programs keep atomics off the bridge path (once per program).
+                    static std::vector<uint32_t> s_codes;
+                    if (s_codes.size() < 32u && std::find(s_codes.begin(), s_codes.end(), code) == s_codes.end())
+                    {
+                        s_codes.push_back(code);
+                        const uint32_t texture = rd32(rdram, pipeData + 0x40), raster = texture ? rd32(rdram, texture) : 0u;
+                        std::printf("[nrw-bridge-other] code=%08x index=%u codeArray=%08x atomic=%08x rasterType=%u\n", code,
+                                    vu1CodeIndex, rd32(rdram, rd32(rdram, pipeData + 0x04) + 0x18), object,
+                                    raster ? (rdram[(raster + 32u) & 0x1FFFFFFu] & 7u) : 0u);
+                        std::fflush(stdout);
+                    }
+                }
                 return false;
             }
             const uint32_t geom = rd32(rdram, object + 24u);
@@ -1602,6 +1705,7 @@ namespace nrw
         }
         const uint32_t idx = g_next.fetch_add(1, std::memory_order_relaxed) & (kTableSize - 1u);
         Entry &e = g_table[idx];
+        e.g3xLightSrc = 0;
         e.native = false;
         e.envTexture = 0;
         e.envFlags = 0;
@@ -1765,6 +1869,7 @@ namespace nrw
         std::memcpy(g_ring.data() + iAt, tri.data(), tri.size() * 2u);
         const uint32_t idx = g_next.fetch_add(1, std::memory_order_relaxed) & (kTableSize - 1u);
         Entry &e = g_table[idx];
+        e.g3xLightSrc = 0;
         e.native = true;
         e.gsFromRegs = true;
         e.kind = kIm2DMesh;
@@ -1934,6 +2039,7 @@ namespace nrw
                 ix[i] = static_cast<uint16_t>(i);
         const uint32_t idx = g_next.fetch_add(1, std::memory_order_relaxed) & (kTableSize - 1u);
         Entry &e = g_table[idx];
+        e.g3xLightSrc = 0;
         e.native = true;
         e.gsFromRegs = true;
         e.kind = kIm3DMesh;
@@ -2462,6 +2568,7 @@ namespace nrw
         tex1 = (tex1 & ~0x1E0ull) | texFilterBits(fa & 0xFFu);
         const uint32_t idx = g_next.fetch_add(1, std::memory_order_relaxed) & (kTableSize - 1u);
         Entry &e = g_table[idx];
+        e.g3xLightSrc = 0;
         e.native = true;
         e.gsFromRegs = false;
         e.kind = kIm2DMesh;
@@ -3106,6 +3213,7 @@ namespace nrw
         tex1 = (tex1 & ~0x1E0ull) | texFilterBits(fa & 0xFFu);
         const uint32_t idx = g_next.fetch_add(1, std::memory_order_relaxed) & (kTableSize - 1u);
         Entry &e = g_table[idx];
+        e.g3xLightSrc = 0;
         e.native = true;
         e.gsFromRegs = false;
         e.kind = kIm2DMesh;
@@ -3138,6 +3246,11 @@ namespace nrw
         return true;
     }
 
+    bool nodeObject(uint8_t *ee, PS2Memory &memory, uint32_t objPvt, uint32_t object, uint32_t setupCB, int mode,
+                    int clip = -1, bool probe = false);
+    constexpr uint32_t kPcplSector = 0xFFFF5EC7u; // nodeObject setup type: a sector of PCPL_WPipeNodeBody
+    int worldNodeMode();
+
     bool nodeBody(uint8_t *ee, PS2Memory &memory, uint32_t self, uint32_t params)
     {
         const int mode = nodeMode();
@@ -3155,6 +3268,15 @@ namespace nrw
             return true;
         if (setupCB == kCrowdSetup && crowdNode(ee, memory, objPvt, object, mode))
             return true;
+        return nodeObject(ee, memory, objPvt, object, setupCB, mode);
+    }
+
+    // One object of a PS2All-style node: objPvt = the node's private data (setup callback +16, finalize +20, group
+    // pipeline +24, light offset +28, null block +36), setupCB = which object setup it stands for. clip: -1 = RW's
+    // frustum test, else the caller's decision (1 = the clipping variant). probe: run every check, draw nothing.
+    bool nodeObject(uint8_t *ee, PS2Memory &memory, uint32_t objPvt, uint32_t object, uint32_t setupCB, int mode, int clip,
+                    bool probe)
+    {
         bool sector, gameCB = false, g3x = false, pgen = false, skin = false;
         if (setupCB == 0x2976F0u)
         {
@@ -3172,8 +3294,8 @@ namespace nrw
         }
         else if (setupCB == 0x2FDBB0u)
             sector = false; // RpAtomicPS2AllObjectSetupCallBack
-        else if (setupCB == 0x302720u)
-            sector = true; // RpWorldSectorPS2AllObjectSetupCallBack
+        else if (setupCB == 0x302720u || setupCB == kPcplSector)
+            sector = true; // RpWorldSectorPS2AllObjectSetupCallBack, or a sector of the game's world node
         else if (setupCB == 0x2E0540u && skinNative() && mode == 1)
         {
             // RpPDS_G3_Skin_PS2AllObjectSetupCallBack (drivers, wrestlers): RenderWare's atomic setup with RpSkin bone
@@ -3241,7 +3363,7 @@ namespace nrw
             }
             return false;
         }
-        if (rd32(ee, objPvt + 20u))
+        if (setupCB != kPcplSector && rd32(ee, objPvt + 20u)) // (the game's world node calls its finalize itself)
         {
             nstat(kNsFinalize);
             return false;
@@ -3250,6 +3372,8 @@ namespace nrw
         if (!cam || !world)
             return false;
         uint32_t header, verts, normals, uvs, prelit, numVerts, geomFlags = 0, geomGen = 0;
+        uint32_t morphEndVerts = 0, morphEndNormals = 0; // a morph blend between two targets (ring vertices)
+        float morphF = 0.0f;
         if (sector)
         {
             if (rd32(ee, object) != 0xFFFFFFFFu)
@@ -3269,8 +3393,23 @@ namespace nrw
         else
         {
             const uint32_t geom = rd32(ee, object + 24u), frame = rd32(ee, object + 4u);
-            if (ee[object & 0x1FFFFFFu] != 1u || !geom || !frame || rd32(ee, geom + 24u) != 1u || (rd32(ee, object + 76u) & 2u))
+            const uint32_t numTargets = geom ? rd32(ee, geom + 24u) : 0u;
+            if (ee[object & 0x1FFFFFFu] != 1u || !geom || !frame || numTargets == 0u || numTargets > 256u || (rd32(ee, object + 76u) & 2u))
             {
+                static int s_morphShown = 0;
+                if (geom && rd32(ee, geom + 24u) > 1u && s_morphShown < 16 && std::getenv("PS2X_NRW_STATS"))
+                {
+                    // Morph-target atomics (RpInterpolator at +76: flags, start/end target +80/+82, time, recipTime,
+                    // position +92).
+                    ++s_morphShown;
+                    float t[3];
+                    std::memcpy(t, ee + ((object + 84u) & 0x1FFFFFFu), 12);
+                    int16_t se[2];
+                    std::memcpy(se, ee + ((object + 80u) & 0x1FFFFFFu), 4);
+                    std::printf("[nrw-morph] setup=%08x atomic=%08x geom=%08x targets=%u verts=%u interp flags=%x start=%d end=%d time=%g recip=%g pos=%g\n",
+                                setupCB, object, geom, rd32(ee, geom + 24u), rd32(ee, geom + 20u), rd32(ee, object + 76u), se[0], se[1], t[0], t[1], t[2]);
+                    std::fflush(stdout);
+                }
                 nstat(kNsObject);
                 return false;
             }
@@ -3293,7 +3432,41 @@ namespace nrw
             const auto gi = g_geomGen.find(geom);
             geomGen = gi == g_geomGen.end() ? 0u : gi->second;
             header = rd32(ee, geom + 84u);
-            const uint32_t mt = rd32(ee, geom + 92u);
+            uint32_t mt = rd32(ee, geom + 92u);
+            if (numTargets > 1u && mt)
+            {
+                // Morph targets (RpInterpolator at +76: start / end target +80 / +82, recipTime +88, position +92):
+                // factor = position * recipTime. One target when they coincide (or the factor is 0 / 1), else the
+                // blend is done on the CPU into the vertex ring.
+                int16_t se[2];
+                std::memcpy(se, ee + ((object + 80u) & 0x1FFFFFFu), 4);
+                float recip, pos;
+                std::memcpy(&recip, ee + ((object + 88u) & 0x1FFFFFFu), 4);
+                std::memcpy(&pos, ee + ((object + 92u) & 0x1FFFFFFu), 4);
+                if (se[0] < 0 || se[1] < 0 || static_cast<uint32_t>(se[0]) >= numTargets || static_cast<uint32_t>(se[1]) >= numTargets)
+                {
+                    nstat(kNsObject);
+                    return false;
+                }
+                const float f = pos * recip;
+                const uint32_t mtA = mt + static_cast<uint32_t>(se[0]) * 28u, mtB = mt + static_cast<uint32_t>(se[1]) * 28u;
+                if (se[0] == se[1] || !(f > 0.0f))
+                    mt = mtA;
+                else if (!(f < 1.0f))
+                    mt = mtB;
+                else
+                {
+                    mt = mtA;
+                    morphEndVerts = rd32(ee, mtB + 20u);
+                    morphEndNormals = rd32(ee, mtB + 24u);
+                    morphF = f;
+                    if (!morphEndVerts)
+                    {
+                        nstat(kNsObject);
+                        return false;
+                    }
+                }
+            }
             geomFlags = rd32(ee, geom + 8u);
             verts = mt ? rd32(ee, mt + 20u) : 0u;
             normals = mt ? rd32(ee, mt + 24u) : 0u;
@@ -3501,8 +3674,28 @@ namespace nrw
             // skips -- drawing them natively blacked out the menus and the arena intro, which composite through them.
             const uint32_t texture = rd32(ee, material), raster = texture ? rd32(ee, texture) : 0u;
             const uint32_t rasterType = raster ? (ee[(raster + 32u) & 0x1FFFFFFu] & 7u) : 0u;
-            if (texture && (!raster || rasterType != 4u || !rd32(ee, raster + 36u)))
+            // Camera textures on sectors (the arena's big screen): drawn from the render target where RenderWare's
+            // texture cache keeps it, while its cache entry is resident (the raster extension's TEX0 is then current).
+            // A camera raster (type 2: a camera's frame buffer used as texture, the arena screens) is fixed in VRAM.
+            const bool residentRt = sector && ((rasterType == 5u && rd32(ee, raster + rd32(ee, kGp - 0x798Cu) + 0x58u) != 0u) ||
+                                               (rasterType == 2u && worldNodeMode() == 1));
+            if (texture && (!raster || (rasterType != 4u && !residentRt) || (rasterType == 4u && !rd32(ee, raster + 36u))))
             {
+                if (sector && raster && std::getenv("PS2X_NRW_STATS"))
+                {
+                    // Sector textures that keep sectors on RenderWare (once per raster).
+                    static std::vector<uint32_t> s_seen;
+                    if (s_seen.size() < 24u && std::find(s_seen.begin(), s_seen.end(), raster) == s_seen.end())
+                    {
+                        s_seen.push_back(raster);
+                        const uint32_t ext = raster + rd32(ee, kGp - 0x798Cu);
+                        std::printf("[nrw-sector-tex] sector=%08x raster=%08x type=%u fmt=%02x %ux%u chain=%08x pixels=%08x cacheEntry=%08x extOff=%u%c",
+                                    object, raster, rasterType, ee[(raster + 35u) & 0x1FFFFFFu], rd32(ee, raster + 12u),
+                                    rd32(ee, raster + 16u), rd32(ee, raster + 36u), rd32(ee, raster + 4u), rd32(ee, ext + 0x58u),
+                                    rd32(ee, kGp - 0x798Cu), 10);
+                        std::fflush(stdout);
+                    }
+                }
                 ++g_pipeWhy[5];
                 static const bool s_texDiag = std::getenv("PS2X_NRW_STATS") != nullptr;
                 static int s_texShown = 0;
@@ -3520,7 +3713,7 @@ namespace nrw
             }
         }
         MarkerSlot slot;
-        if (mode == 1 && !reserveMarkers(ee, numMeshes, slot))
+        if (mode == 1 && !probe && !reserveMarkers(ee, numMeshes, slot))
         {
             nstat(kNsNoRoom);
             return false;
@@ -3529,7 +3722,7 @@ namespace nrw
         computeObjectConstants(ee, object, sector, objPvt, obj, g3x, pgen);
         if (obj.unsupported)
         {
-            nstat(g3x && (!g_g3xAmbient || !g_g3xDirectional) ? kNsG3xNoLights : kNsLight);
+            nstat(g3x && !obj.g3xVuLights && (!g_g3xAmbient || !g_g3xDirectional) ? kNsG3xNoLights : kNsLight);
             return false;
         }
         // RpAtomic/RpWorldSector PS2All prim/trans setup: strip -> PRIM 4, list -> PRIM 3 + LIST; clip unless inside.
@@ -3541,12 +3734,15 @@ namespace nrw
         }
         const uint32_t primType = (hdrFlags & 1u) ? 4u : 3u;
         uint32_t transType = (hdrFlags & 1u) ? transBase : ((transBase | 4u) & 0xFFu);
-        if (gameCB || pgen || skin || frustumTest(ee, object, sector, cam) != 2u)
+        if (probe)
+            return true;
+        if (gameCB || pgen || skin || morphEndVerts || (clip >= 0 ? clip != 0 : frustumTest(ee, object, sector, cam) != 2u))
             transType |= 2u;
         const bool modulate = !pgen && (gameCB || (sector ? (rd32(ee, world + 8u) & 0x40u) != 0u : (geomFlags & 0x40u) != 0u));
         const uint64_t primGlobal = rd64(ee, kGp - 0x7CC0u);
         const uint64_t testGlobal = rd64(ee, kGp - 0x79F8u), tex1Global = rd64(ee, kGp - 0x79D8u), clampGlobal = rd64(ee, kGp - 0x79E0u);
         uint32_t skinRing = 0;
+        const bool morphBlend = morphEndVerts != 0u;
         if (skin)
         {
             skinRing = skinVertices(ee, object, rd32(ee, object + 24u), numVerts, verts, normals, uvs, prelit);
@@ -3556,6 +3752,8 @@ namespace nrw
                 return false;
             }
         }
+        else if (morphBlend)
+            skinRing = morphVertices(ee, numVerts, verts, normals, morphEndVerts, morphEndNormals, morphF, uvs, prelit);
         uint32_t idxs[64];
         for (uint32_t i = 0; i < numMeshes; ++i)
         {
@@ -3598,6 +3796,7 @@ namespace nrw
                 continue;
             }
             Entry &e = g_table[idx];
+            e.g3xLightSrc = g3x ? (obj.g3xVuLights ? 1u : 2u) : 0u;
             e.native = true;
             e.kind = sector ? kWorldSectorMesh : kAtomicMesh;
             e.object = object;
@@ -3621,9 +3820,10 @@ namespace nrw
             e.gsClamp = clamp;
             e.geomGen = geomGen;
             e.envTexture = 0;
-            e.envFlags = (raster && (ee[(raster + 32u) & 0x1FFFFFFu] & 7u) == 5u) ? kBaseRenderTarget : 0u;
+            const uint32_t baseType = raster ? (ee[(raster + 32u) & 0x1FFFFFFu] & 7u) : 0u;
+            e.envFlags = (baseType == 5u || baseType == 2u) ? kBaseRenderTarget : 0u;
             e.gsFromRegs = false;
-            if (skin)
+            if (skin || morphBlend)
             {
                 // This frame's skinned vertices (ring) with the mesh's indices: drawn like an Im3D job, with this
                 // mesh's native GS state and the atomic's lit constants.
@@ -3707,6 +3907,119 @@ namespace nrw
         return true;
     }
 
+    // ---- The game's world renderer (PCPL_WPipeNodeBody) --------------------------------------------------------------
+    // One call draws every sector in the camera's visible list (PCPL_CameraWorldExt(camera) = camera + *(gp - 0x7BA0):
+    // sector array +0, count +8) with RenderWare's sector setup rules (the node's private data has PS2All's layout:
+    // light offset +0x1C, null block +0x24, finalize +0x14), its own clip test and the game bridge per mesh. Natively
+    // every sector goes through nodeObject (constants, lights, meshes from the RenderWare structures) and RenderWare
+    // builds no packets for them. All or nothing per call: when a visible sector cannot be drawn this way or the open
+    // VIF packet lacks room for every marker, RenderWare draws the world as before (its bridges then still draw
+    // natively through the bridge hook). PS2X_NRW_WORLDNODE=0: always RenderWare; =probe: count, draw nothing.
+    int worldNodeMode()
+    {
+        static const int s_mode = []()
+        {
+            const char *v = std::getenv("PS2X_NRW_WORLDNODE");
+            if (v && std::strcmp(v, "probe") == 0)
+                return 2;
+            return (v && *v == '0') ? 0 : 1;
+        }();
+        return s_mode;
+    }
+
+    namespace
+    {
+        // PCPL_WPipeNodeBody's clip test: plane i = {n.xyz, d, corner index bytes} at camera + *(0x48FEE0) + 0x60
+        // (stride 0x14); the sector needs the clipping variant when its box corner picked by (1 - index) per axis
+        // (box at sector + 0x68: two corners of three floats) lies on the outer side of a plane.
+        bool pcplNeedsClip(const uint8_t *ee, uint32_t cam, uint32_t sector)
+        {
+            auto f32 = [&](uint32_t a) { float f; std::memcpy(&f, ee + (a & 0x1FFFFFFu), 4); return f; };
+            const uint32_t planes = cam + rd32(ee, 0x48FEE0u) + 0x60u, box = sector + 0x68u;
+            for (uint32_t i = 0; i < 6u; ++i)
+            {
+                const uint32_t pl = planes + i * 0x14u;
+                const uint32_t cx = 1u - ee[(pl + 0x10u) & 0x1FFFFFFu], cy = 1u - ee[(pl + 0x11u) & 0x1FFFFFFu],
+                               cz = 1u - ee[(pl + 0x12u) & 0x1FFFFFFu];
+                const float x = f32(box + cx * 12u), y = f32(box + cy * 12u + 4u), z = f32(box + cz * 12u + 8u);
+                const float acc = x * f32(pl) + y * f32(pl + 4u); // ADDA.S, then MADD.S
+                const float dist = (acc + z * f32(pl + 8u)) - f32(pl + 12u);
+                if (!(dist <= 0.0f))
+                    return true;
+            }
+            return false;
+        }
+    }
+
+    bool pcplWorldNode(uint8_t *ee, PS2Memory &memory, uint32_t self, uint32_t params)
+    {
+        (void)params;
+        const int wm = worldNodeMode();
+        if (wm == 0 || nodeMode() != 1 || !enabled() || !g_gs)
+            return false;
+        const uint32_t objPvt = rd32(ee, self + 0x14u), cam = rd32(ee, kRwGlobals);
+        if (!objPvt || !cam || rd32(ee, objPvt + 0x14u))
+            return false; // (a finalize callback: RenderWare)
+        const uint32_t ext = cam + rd32(ee, kGp - 0x7BA0u);
+        const uint32_t list = rd32(ee, ext), count = rd32(ee, ext + 8u);
+        if (!list || count == 0u || count > 4096u)
+            return false;
+        // All or nothing (trimming the game's visible list for RenderWare broke later frames): probe every visible
+        // sector, and the marker room, before drawing any.
+        static std::vector<uint8_t> clips;
+        clips.assign(count, 0u);
+        uint32_t meshes = 0, bad = 0;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const uint32_t sector = rd32(ee, list + i * 4u);
+            uint16_t polys = 0;
+            if (sector)
+                std::memcpy(&polys, ee + ((sector + 0x8Cu) & 0x1FFFFFFu), 2);
+            if (!sector || polys == 0u)
+                continue; // the node skips sectors without polygons
+            clips[i] = pcplNeedsClip(ee, cam, sector) ? 1u : 0u;
+            if (!nodeObject(ee, memory, objPvt, sector, kPcplSector, 1, clips[i], true))
+            {
+                ++bad;
+                continue;
+            }
+            const uint32_t header = rd32(ee, sector + 128u);
+            uint16_t n = 0;
+            std::memcpy(&n, ee + ((header + 4u) & 0x1FFFFFFu), 2);
+            meshes += n;
+        }
+        MarkerSlot room;
+        const bool fits = reserveMarkers(ee, meshes, room);
+        static const bool s_stats = wm == 2 || std::getenv("PS2X_NRW_STATS") != nullptr;
+        static uint64_t s_calls = 0, s_native = 0, s_unsupported = 0, s_noRoom = 0, s_sectors = 0, s_badSectors = 0;
+        ++s_calls;
+        s_sectors += count;
+        s_badSectors += bad;
+        s_unsupported += bad ? 1u : 0u;
+        s_noRoom += (!bad && !fits) ? 1u : 0u;
+        s_native += (!bad && fits) ? 1u : 0u;
+        if (s_stats && (s_calls % 600u) == 1u)
+        {
+            std::printf("[nrw-world] node calls %llu: native %llu, unsupported sector %llu, no room %llu; sectors %llu (unsupported %llu)%c",
+                        (unsigned long long)s_calls, (unsigned long long)s_native, (unsigned long long)s_unsupported,
+                        (unsigned long long)s_noRoom, (unsigned long long)s_sectors, (unsigned long long)s_badSectors, 10);
+            std::fflush(stdout);
+        }
+        if (wm == 2 || bad || !fits)
+            return false;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const uint32_t sector = rd32(ee, list + i * 4u);
+            uint16_t polys = 0;
+            if (sector)
+                std::memcpy(&polys, ee + ((sector + 0x8Cu) & 0x1FFFFFFu), 2);
+            if (!sector || polys == 0u)
+                continue;
+            nodeObject(ee, memory, objPvt, sector, kPcplSector, 1, clips[i], false);
+        }
+        return true;
+    }
+
     void marker(PS2Memory &memory, uint32_t index)
     {
         if (!g_gs)
@@ -3740,6 +4053,53 @@ namespace nrw
         if (e.native)
         {
             std::memcpy(job.vu, g_nativeVu[index & (kNativeVuRing - 1u)], sizeof(job.vu));
+            if (e.g3xLightSrc == 2u && g3xLightMode() == 2)
+            {
+                // Check: the RpLight-derived lights against what RenderWare's own upload left in VU1 995..997.
+                const uint8_t *vu = memory.getVU1Data();
+                static uint64_t s_n = 0, s_diff = 0;
+                float l[3][4] = {};
+                if (vu)
+                    std::memcpy(l, vu + 995u * 16u, sizeof(l));
+                bool diff = false;
+                for (int q = 0; q < 3; ++q)
+                    for (int c = 0; c < 3; ++c)
+                        diff |= !(std::fabs(job.vu[vuIndex(980 + q)][c] - l[q][c]) <= 1e-4f);
+                s_diff += diff ? 1u : 0u;
+                if ((s_n++ % 20000u) == 0u || (diff && s_diff <= 5u))
+                {
+                    std::printf("[nrw-g3x-lightcheck] %llu G3x meshes, VU1 lights differ %llu%s%c", (unsigned long long)s_n,
+                                (unsigned long long)s_diff, diff ? " (this one)" : "", 10);
+                    std::fflush(stdout);
+                }
+            }
+            if (e.g3xLightSrc == 1u)
+            {
+                // RpPDS_G3x_ADL_LightingUpload's VU1 layout: 995 ambient colour, 996 directional colour, 997 the
+                // directional light frame's "at". As RenderWare-generic lights after the header (g3xLightBlock).
+                float l[3][4] = {};
+                if (const uint8_t *vu = memory.getVU1Data())
+                    std::memcpy(l, vu + 995u * 16u, sizeof(l));
+                for (auto &q : l)
+                    for (float &f : q)
+                        if (!std::isfinite(f))
+                            f = 0.0f;
+                const uint32_t ambient = 2u, directional = 1u;
+                putq(job.vu[vuIndex(980)], l[0][0], l[0][1], l[0][2], 0.0f);
+                std::memcpy(&job.vu[vuIndex(980)][3], &ambient, 4);
+                putq(job.vu[vuIndex(981)], l[1][0], l[1][1], l[1][2], 0.0f);
+                std::memcpy(&job.vu[vuIndex(981)][3], &directional, 4);
+                putq(job.vu[vuIndex(982)], l[2][0], l[2][1], l[2][2], 0.0f);
+                static const bool s_log = std::getenv("PS2X_NRW_STATS") != nullptr;
+                static uint64_t s_n = 0;
+                if (s_log && (s_n++ % 600u) == 0u)
+                {
+                    std::printf("[nrw-g3x-vulights] %llu: ambient %.3f %.3f %.3f directional %.3f %.3f %.3f at %.3f %.3f %.3f%c",
+                                (unsigned long long)s_n, l[0][0], l[0][1], l[0][2], l[1][0], l[1][1], l[1][2], l[2][0], l[2][1],
+                                l[2][2], 10);
+                    std::fflush(stdout);
+                }
+            }
             job.gsTest = e.gsTest;
             job.gsTex1 = e.gsTex1;
             job.gsClamp = e.gsClamp;
