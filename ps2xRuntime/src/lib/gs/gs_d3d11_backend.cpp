@@ -3,6 +3,8 @@
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
+#include "runtime/gs/ps2_gs_psmt4.h"
+#include "runtime/gs/ps2_gs_psmt8.h"
 #include "host/win32_host.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 extern thread_local GifPathId g_gifCurrentPath;
@@ -514,6 +516,92 @@ struct GSD3D11Backend::Impl
     std::array<PageWrite, 512> pageHist{};
     uint32_t uploadSeq = 0;
     const bool staleLog = std::getenv("PS2X_STALE_LOG") != nullptr;
+    // PS2X_CLOBBER_LOG=<n>: the last writer of every 256-byte GS block (host->local uploads, local->local copies,
+    // render-target write-backs). A draw sampling a VRAM texture or CLUT whose blocks were last written by something
+    // other than its own upload prints one line per (texture, writer) pair, up to n lines.
+    struct BlockWriter { uint32_t seq = 0; char kind = 0; uint32_t base = 0, bw = 0, psm = 0, x = 0, y = 0, w = 0, h = 0; uint64_t frame = 0; };
+    const int clobberLogInit = std::getenv("PS2X_CLOBBER_LOG") ? std::atoi(std::getenv("PS2X_CLOBBER_LOG")) : 0;
+    int clobberLeft = clobberLogInit;
+    std::vector<uint32_t> blockLast;     // per block: writer ring index + 1
+    std::vector<BlockWriter> writers;    // ring
+    uint32_t writerNext = 0;
+    std::vector<uint64_t> clobberSeen;
+
+    static uint32_t gsBlockOf(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
+    {
+        switch (psm)
+        {
+        case GS_PSM_T4: return (GSPSMT4::addrPSMT4(base, bw, x, y) >> 9) & 0x3FFFu;
+        case GS_PSM_T8: return (GSPSMT8::addrPSMT8(base, bw, x, y) >> 8) & 0x3FFFu;
+        case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S:
+            return (GSPSMCT16::addrPSMCT16(base, bw, x, y) >> 8) & 0x3FFFu;
+        default: return (GSPSMCT32::addrPSMCT32(base, bw, x, y) >> 8) & 0x3FFFu;
+        }
+    }
+    template <class F>
+    static void forEachGsBlock(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h, F f)
+    {
+        uint32_t cw = 8, ch = 8;
+        switch (psm)
+        {
+        case GS_PSM_T4: cw = 32; ch = 16; break;
+        case GS_PSM_T8: cw = 16; ch = 16; break;
+        case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S: cw = 16; ch = 8; break;
+        default: break;
+        }
+        if (w == 0u || h == 0u || w > 4096u || h > 4096u)
+            return;
+        for (uint32_t yy = y & ~(ch - 1u); yy < y + h; yy += ch)
+            for (uint32_t xx = x & ~(cw - 1u); xx < x + w; xx += cw)
+                f(gsBlockOf(psm, base, std::max<uint32_t>(bw, 1u), xx, yy));
+    }
+    void recordWriter(char kind, uint32_t base, uint32_t bw, uint32_t psm, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+    {
+        if (clobberLogInit <= 0)
+            return;
+        if (blockLast.empty())
+        {
+            blockLast.assign(16384u, 0u);
+            writers.resize(1u << 16);
+        }
+        const uint32_t idx = writerNext++ & ((1u << 16) - 1u);
+        writers[idx] = {writerNext, kind, base, bw, psm, x, y, w, h, frameCounter};
+        forEachGsBlock(psm, base, bw, x, y, w, h, [&](uint32_t b) { blockLast[b] = idx + 1u; });
+    }
+    void checkClobber(const char *what, uint32_t base, uint32_t bw, uint32_t psm, uint32_t w, uint32_t h, uint32_t tbp0)
+    {
+        if (clobberLeft <= 0 || blockLast.empty())
+            return;
+        const BlockWriter *bad = nullptr;
+        uint32_t badBlock = 0;
+        forEachGsBlock(psm, base, bw, 0, 0, w, h, [&](uint32_t b)
+        {
+            if (bad || !blockLast[b])
+                return;
+            const BlockWriter &wr = writers[blockLast[b] - 1u];
+            // Uploads and copies are RenderWare's texture cache at work (it batches several textures and CLUTs into
+            // one transfer). Suspect: a render-target write-back (this backend's own VRAM write) over a texture other
+            // than the target itself.
+            if (wr.kind != 'R' || wr.base == base || wr.base == tbp0)
+                return;
+            bad = &wr;
+            badBlock = b;
+        });
+        if (!bad)
+            return;
+        const uint64_t key = (static_cast<uint64_t>(tbp0) << 40) ^ (static_cast<uint64_t>(base) << 20) ^
+                             (static_cast<uint64_t>(bad->kind) << 56) ^ bad->base;
+        if (std::find(clobberSeen.begin(), clobberSeen.end(), key) != clobberSeen.end())
+            return;
+        clobberSeen.push_back(key);
+        --clobberLeft;
+        std::printf("[clobber] frame=%llu %s base=%u bw=%u psm=%u %ux%u (tex tbp=%u): block %u last written by %c base=%u bw=%u psm=%u "
+                    "rect=(%u,%u %ux%u) seq=%u frame=%llu (now seq %u)%c",
+                    static_cast<unsigned long long>(frameCounter), what, base, bw, psm, w, h, tbp0, badBlock, bad->kind, bad->base,
+                    bad->bw, bad->psm, bad->x, bad->y, bad->w, bad->h, bad->seq, static_cast<unsigned long long>(bad->frame),
+                    writerNext, 10);
+        std::fflush(stdout);
+    }
     std::array<uint16_t, 512> clut{};
     std::array<uint32_t, 2> clutCbp{0xFFFFFFFFu, 0xFFFFFFFFu};
     uint32_t clutVersion = 0;
@@ -854,6 +942,8 @@ struct GSD3D11Backend::Impl
             }
         }
         ctx->Unmap(staging.Get(), 0);
+        if (yEnd > yFirst && xEnd > xFirst)
+            recordWriter('R', rt.fbpBlock, rt.fbw, rt.psm, xFirst, yFirst, xEnd - xFirst, yEnd - yFirst);
         rt.gpuDirty = false;
         rt.dirtyY0 = 0xFFFFFFFFu;
         rt.dirtyY1 = 0u;
@@ -2497,7 +2587,16 @@ struct GSD3D11Backend::Impl
                     }
                 }
                 if (!texSrv && !nativeState)
+                {
                     texSrv = decodedTexture(st, w, h);
+                    if (clobberLeft > 0)
+                    {
+                        const uint32_t cw = std::min<uint32_t>(st.textureWidth, std::max<uint32_t>(t.tbw, 1u) * 64u);
+                        checkClobber("texture", t.tbp0, t.tbw, t.psm, cw, st.textureHeight, t.tbp0);
+                        if (isIndexed(t.psm))
+                            checkClobber("clut", t.cbp, 1u, t.cpsm, isIndexed8(t.psm) ? 16u : 8u, isIndexed8(t.psm) ? 16u : 2u, t.tbp0);
+                    }
+                }
                 static const long s_staleTbp = std::getenv("PS2X_STALE_TBP") ? std::atol(std::getenv("PS2X_STALE_TBP")) : -1;
                 if (staleLog && (t.psm == 10u || t.psm == 2u || static_cast<long>(t.tbp0) == s_staleTbp))
                 {
@@ -2756,12 +2855,15 @@ struct GSD3D11Backend::Impl
                 std::printf(" ");
             }
             std::printf("[gs-trace] #%llu n=%zu fbp=%u psm=%u fbmsk=%08x tme=%d tex=%u/%u psm=%u %ux%u tfx=%u tcc=%u abe=%d alpha=%llx test=%llx "
-                        "sc=%u,%u-%u,%u v0=(%.1f,%.1f z=%.4f rgba=%.0f,%.0f,%.0f,%.0f st=%.3f,%.3f,%.3f) zte=%u ztst=%u zmsk=%d zbp=%u zpsm=%u\n",
+                        "sc=%u,%u-%u,%u v0=(%.1f,%.1f z=%.4f rgba=%.0f,%.0f,%.0f,%.0f st=%.3f,%.3f,%.3f) zte=%u ztst=%u zmsk=%d zbp=%u zpsm=%u "
+                        "clut=%u/%u csm=%u csa=%u fst=%d\n",
                         static_cast<unsigned long long>(statDraws), pending.size(), c.frame.fbp, c.frame.psm, c.frame.fbmsk,
                         st.prim.tme ? 1 : 0, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, st.textureWidth, st.textureHeight,
                         c.tex0.tfx, c.tex0.tcc, st.prim.abe ? 1 : 0, static_cast<unsigned long long>(c.alpha),
                         static_cast<unsigned long long>(c.test), c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1,
-                        v0.x, v0.y, v0.z, v0.r, v0.g, v0.b, v0.a, v0.s, v0.t, v0.q, ztest, ztst, c.zbuf.zmask ? 1 : 0, static_cast<unsigned>(c.zbuf.zbp), static_cast<unsigned>(c.zbuf.psm));
+                        v0.x, v0.y, v0.z, v0.r, v0.g, v0.b, v0.a, v0.s, v0.t, v0.q, ztest, ztst, c.zbuf.zmask ? 1 : 0, static_cast<unsigned>(c.zbuf.zbp), static_cast<unsigned>(c.zbuf.psm),
+                        static_cast<unsigned>(c.tex0.cbp), static_cast<unsigned>(c.tex0.cpsm), static_cast<unsigned>(c.tex0.csm),
+                        static_cast<unsigned>(c.tex0.csa), st.prim.fst ? 1 : 0);
         }
 
         // Debug: PS2X_SKIP_CYCLE="tbp:psm,tbp:psm,..." hides one textured draw class at a time (4 s each,
@@ -3099,6 +3201,7 @@ void GSD3D11Backend::BeginTransfer(const GSTransferCommand &command)
             ++d.statSkippedSyncs;
         }
         d.syncOverlapping(df, dl);
+        d.recordWriter('U', bb.dbp, bb.dbw, bb.dpsm, tp.dsax, tp.dsay, tr.rrw, tr.rrh);
         d.invalidateOverlapping(df, dl);
         d.markPagesDirty(df, dl);
         d.uploadFirst = df;
@@ -3118,6 +3221,7 @@ void GSD3D11Backend::BeginTransfer(const GSTransferCommand &command)
     {
         d.syncOverlapping(sf, sl);
         d.syncOverlapping(df, dl);
+        d.recordWriter('C', bb.dbp, bb.dbw, bb.dpsm, tp.dsax, tp.dsay, tr.rrw, tr.rrh);
         d.invalidateOverlapping(df, dl);
         d.markPagesDirty(df, dl);
     }

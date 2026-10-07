@@ -1290,17 +1290,19 @@ namespace nrw
             uint32_t pktType = 0, ptr = 0, sprBase = 0, inMem = 0, directHdr = 0, directQwc = 0, inMemAfter = 0;
             bool directOpen = false;
         };
-        // Native jobs that sample their texture from VRAM (RwIm3D / ISO / Im2D: GS state from the registers) also get
-        // the PATH3 release their RenderWare packet would have carried: masked GIF texture uploads are released one per
-        // MSKPATH3 unmask, and every RenderWare batch releases the upload queued for its own draw. Without it the
-        // native draw sampled VRAM before its texture arrived once no RenderWare batch happened to sit in between
-        // (native ISO + native MatFX Gem: the Match Type panel's sprites). PS2X_NRW_P3RELEASE=0 turns it off.
+        // An extra PATH3 release on native jobs that sample VRAM (RwIm3D / Im2D). Off by default: the texture cache's
+        // own upload (RpSkyTexCacheAccessRaster from RwRenderStateSet, before the draw) already puts the release in
+        // the VIF stream -- no upload is ever left for the next frame without these (PS2X_P3_DEPTH: late=0) -- so an
+        // extra one let the next draw's upload land early, over a texture still to be drawn: name tags on cars lost
+        // glyphs ("HI##NI" for CHRIS BENOIT) while the texture cache was busy. They were added against the Match Type
+        // panel's garbage, whose real cause was the PATH3 backlog (fixed by the kick drain in ps2_memory.cpp).
+        // PS2X_NRW_P3RELEASE=1 turns them back on.
         bool path3Release()
         {
             static const bool s_on = []()
             {
                 const char *v = std::getenv("PS2X_NRW_P3RELEASE");
-                return !(v && *v == '0');
+                return v && *v == '1';
             }();
             return s_on;
         }

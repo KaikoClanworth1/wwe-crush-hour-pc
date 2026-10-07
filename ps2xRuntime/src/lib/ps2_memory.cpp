@@ -2350,8 +2350,30 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
                 const char *v = std::getenv("PS2X_P3_KICK_DRAIN");
                 return !(v && *v == '0');
             }();
+            static uint64_t s_lateTotal = 0; // PS2X_P3_DEPTH: packets only released by the next kick (a frame late)
             if (s_kickDrain && !m_path3MaskedFifo.empty())
             {
+                s_lateTotal += m_path3MaskedFifo.size();
+                // PS2X_P3_LATE_LOG=<n>: the destination of each packet released late (its A+D BITBLTBUF).
+                static int s_lateLog = std::getenv("PS2X_P3_LATE_LOG") ? std::atoi(std::getenv("PS2X_P3_LATE_LOG")) : 0;
+                for (const auto &pkt : m_path3MaskedFifo)
+                {
+                    if (s_lateLog <= 0)
+                        break;
+                    for (size_t q = 16u; q + 16u <= pkt.size() && q < 16u * 8u; q += 16u)
+                    {
+                        uint64_t v = 0, reg = 0;
+                        std::memcpy(&v, pkt.data() + q, 8);
+                        std::memcpy(&reg, pkt.data() + q + 8u, 8);
+                        if ((reg & 0xFFu) != 0x50u)
+                            continue;
+                        --s_lateLog;
+                        std::printf("[p3late] %zu queued at kick: dbp=%u dbw=%u dpsm=%u bytes=%zu%c", m_path3MaskedFifo.size(),
+                                    static_cast<unsigned>((v >> 32) & 0x3FFFu), static_cast<unsigned>((v >> 48) & 0x3Fu),
+                                    static_cast<unsigned>((v >> 56) & 0x3Fu), pkt.size(), 10);
+                        break;
+                    }
+                }
                 m_path3Masked = false;
                 flushMaskedPath3Packets(false);
                 m_path3Masked = true;
@@ -2389,8 +2411,10 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
                 static const auto s_t0 = std::chrono::steady_clock::now();
                 if (s_depth && (++s_kicks % 30u) == 0u)
                 {
-                    std::printf("[p3q] t=%.1f depth=%zu\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count(),
-                                m_path3MaskedFifo.size());
+                    std::printf("[p3q] t=%.1f depth=%zu late=%llu (last 30 kicks)\n",
+                                std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count(),
+                                m_path3MaskedFifo.size(), static_cast<unsigned long long>(s_lateTotal));
+                    s_lateTotal = 0;
                     std::fflush(stdout);
                 }
             }
