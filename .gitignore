@@ -23,3 +23,9 @@ android/app/.cxx/
 android/local.properties
 android/.gradle/ 
 .idea/
+# WWE Crush Hour port: only the port's own files. Game data (disc image, extracted files, generated game
+# code, microcode dumps, decoded textures) stays outside the repository.
+port/tools/__pycache__/
+port/tools/xbox_icons/*.png
+*.iso
+*.bmp
