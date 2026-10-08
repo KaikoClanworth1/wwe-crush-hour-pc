@@ -961,8 +961,14 @@ float4 ps_main(VsOut i) : SV_Target
         if (!g_autoPress.empty())
         {
             const double t = nowSeconds();
+            // PS2X_AUTOINPUT_STOP_AT_ANCHOR=1: timed (unanchored) presses end at the first anchor call -- the START
+            // taps that get a slow boot past the title must not reach the menu the anchored presses navigate.
+            static const bool s_stopAtAnchor = std::getenv("PS2X_AUTOINPUT_STOP_AT_ANCHOR") != nullptr;
+            const bool anchored = g_autoAnchorAt[0].load() >= 0.0;
             for (const auto &ap : g_autoPress)
             {
+                if (!ap.anchorHit && s_stopAtAnchor && anchored)
+                    continue;
                 const double anchorAt = ap.anchorHit ? g_autoAnchorAt[ap.anchorHit - 1].load() : 0.0;
                 if (ap.anchorHit && anchorAt < 0.0)
                     continue;

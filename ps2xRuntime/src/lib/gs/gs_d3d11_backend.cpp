@@ -10,6 +10,7 @@ namespace ps2host
 {
     void setPresentWide(bool wide); // win32_host.cpp: Widescreen=1 frame shown 16:9 (else 4:3 with bars)
 }
+#include "xbox_button_icons.inc"
 #include "runtime/gs/ps2_gif_arbiter.h"
 extern thread_local GifPathId g_gifCurrentPath;
 
@@ -1584,6 +1585,7 @@ struct GSD3D11Backend::Impl
                 return nullptr;
             dev->CreateShaderResourceView(rt.tex.Get(), nullptr, &rt.srv);
         }
+        applyXboxIcons(rasterPx, tw, th);
         ctx->UpdateSubresource(rt.tex.Get(), 0, nullptr, rasterPx.data(), tw * 4u, 0);
         rt.key = key;
         rt.w = tw;
@@ -1757,6 +1759,7 @@ struct GSD3D11Backend::Impl
                 }
             }
         }
+        applyXboxIcons(px, tw, th);
         ctx->UpdateSubresource(ct.tex.Get(), 0, nullptr, px.data(), tw * 4u, 0);
         if (!ct.srv)
             dev->CreateShaderResourceView(ct.tex.Get(), nullptr, &ct.srv);
@@ -2311,6 +2314,50 @@ struct GSD3D11Backend::Impl
         ctx->IASetPrimitiveTopology(nativeMesh->strip ? D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
                                                       : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ++pipeGen; // the next ordinary draw rebinds the standard pipeline
+    }
+
+    // Xbox button prompts (PS2X_XBOX_ICONS=0: the original PS2 ones). Two of the game's 512x256 textures carry PS2
+    // button art: the menu font (prompt glyphs square / triangle / circle / cross) and the Controller Options panel
+    // (pad picture, button list, "L2 button" etc.). tools/make_xbox_icons.py edits them with the Xbox 360 glyphs of
+    // WWE SmackDown vs Raw 2011 (X / Y / B / A, LT / LB / RT / RB / RS) and stores the changed rectangles; a decoded
+    // texture is identified by a hash of its rows 122..159, columns 72..219. PS2X_ICON_LOG=<dir> writes every other
+    // 512x256 texture there once (icon_<hash>.rgba: input for the tool).
+    void applyXboxIcons(std::vector<uint32_t> &pixels, uint32_t tw, uint32_t th)
+    {
+        static const bool s_on = []()
+        {
+            const char *v = std::getenv("PS2X_XBOX_ICONS");
+            return !(v && *v == '0');
+        }();
+        if (!s_on || tw != 512u || th != 256u || pixels.size() < 512u * 256u)
+            return;
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t y = 122u; y < 160u; ++y)
+            h = fnv1a(&pixels[y * 512u + 72u], (220u - 72u) * 4u, h);
+        bool known = false;
+        for (const XboxIconPatch &p : kXboxIconPatches)
+        {
+            if (p.texture != h)
+                continue;
+            known = true;
+            for (uint32_t y = 0; y < p.h; ++y)
+                std::memcpy(&pixels[(p.y + y) * 512u + p.x], p.texels + y * p.w, p.w * 4u);
+        }
+        static const char *s_log = std::getenv("PS2X_ICON_LOG");
+        static std::vector<uint64_t> s_seen;
+        if (!known && s_log && s_seen.size() < 64u && std::find(s_seen.begin(), s_seen.end(), h) == s_seen.end())
+        {
+            s_seen.push_back(h);
+            std::printf("[xbox-icons] 512x256 texture %016llx (no patch)%c", static_cast<unsigned long long>(h), 10);
+            std::fflush(stdout);
+            char path[600];
+            std::snprintf(path, sizeof(path), "%s/icon_%016llx.rgba", s_log, static_cast<unsigned long long>(h));
+            if (FILE *f = std::fopen(path, "wb"))
+            {
+                std::fwrite(pixels.data(), 4, 512u * 256u, f);
+                std::fclose(f);
+            }
+        }
     }
 
     // Widescreen 2D layer: the x extent (GS pixels, XYOFFSET included) of a parallel-projection job, with
