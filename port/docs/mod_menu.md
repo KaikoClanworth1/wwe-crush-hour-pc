@@ -1,0 +1,57 @@
+# In-game mod menu
+
+`ps2xRuntime/src/lib/host/mod_menu.cpp`, hooks from `port/tools/patch_modmenu.py`, the "m" plank from
+`port/tools/make_mod_button.py`. `PS2X_MODMENU=0` turns it all off.
+
+## Opening it
+
+- **Main menu:** an "m" plank sits right of "options" on the menu sign. RIGHT on "options" gives it the focus
+  (highlighted), A opens the menu; LEFT / B / Y gives the focus back, UP / DOWN go back and move the game's
+  highlight on. Closing the menu returns the focus to the plank.
+- **Anywhere** (also in a match): F2, or BACK + RB on a controller.
+- While the plank or the menu has the input, player 1's pad (and the keyboard) reports nothing to the game;
+  buttons held through such a change stay masked until released (no stray "Return" on the main menu).
+
+## Main menu state
+
+`Shell::Update` (0x1d7bd0) calls `ps2x_modmenu_shell(rdram, this)` first: Shell + 0x109C is the active menu (0 =
+main menu: exhibition, new season, load season, multiplayer, options; item counts per menu at 0x3dd350), +0x109D the
+highlighted item, +0x109F the previous one. The game highlights an item by swapping its material's texture
+(`set_menuselect_texture`: materials named `Menu<m><i>0` get `*(Shell + 0xF18 + m*56 + i*8)`, the previous item gets
+`*(Shell + 0xF14 + ...)` back). While the plank has the focus the native renderer draws "options" with its normal
+texture (`nrw::setTextureRemap` in `nodeObject`). The UP / DOWN / button edges of the menu are at Shell + 0x428 /
+0x438 / ...; multiplayer (item 3) is skipped while no second pad is connected (`PcplController::Status`).
+
+## The "m" plank
+
+The sign is one 512x512 texture (`Menu` board) with the five planks painted in. The tool builds a sixth plank from
+it: the right end of "options" (mirrored for the left end), a text-free strip of its body stretched in between, the
+"m" of "multiplayer" with its outline, scaled to 88 % and placed at x 397..489, y 403..471. The highlighted variant
+recolours the frame to the game's highlight blue and the letter lavender. The backend applies the variant's
+rectangle when it decodes a 512x512 texture whose rows 403..471 / columns 112..391 hash to the sign
+(`applyTexturePatches`), and keys 512x512 textures by the variant so the change re-decodes it.
+
+Note: the backend's `fnv1a` seed is 1469598103934665603 (the standard offset basis without its last digit); tools
+that compute texture ids must use the same seed.
+
+## Mods
+
+- **Built-in** (the game's cheats): Unlimited Turbo (`Player::muCheatFlags` 0x4A2298 bit 0: `Player::Update` keeps
+  the turbo count at 6), Power Hungry (bit 1: `Player::IncPower` x5 for human players), Unlock Everything
+  (`WWFOptions::Instance()` = *(0x4A57F8), +0x558: the unlock-everything cheat flag read by the arena, superstar
+  and match type choosers). The game clears the cheat flags when a match starts, so they are set every frame.
+- **pnach files** in `GameFiles/Mods/`: each `[Section]` is a mod (PCSX2 2.x layout; lines before the first section
+  form one named after the file; `description=`, `author=`, `comment=`). `patch=<0|1>,EE,<addr>,<type>,<value>`
+  with byte / short / word / double / be* / extended (0/1/2 writes, 4 serial writes, D and E 16-bit conditions).
+  patch=0 lines run when the mod is turned on, patch=1 lines every frame. The values a mod's writes replaced are
+  kept and written back when it is turned off. Code patches have no effect (the game runs as recompiled code).
+- **Live:** `ps2x_mods_frame` runs at the entry of the game's vsync wait (`ps2_wait_for_vsync`, 0x1771a0) on the
+  EE thread, once per game frame in menus and matches; the menu (host thread) only flips `enabled` under a mutex.
+  `Mods/enabled.txt` keeps the ids that are on (`builtin:<name>` or `<file>|<section>`); the folder is rescanned
+  each time the menu opens.
+
+## Panel
+
+Drawn with GDI into a DIB (Impact title, Arial rows; dark steel panel, the game's highlight blue), premultiplied
+BGRA, re-rendered only when something changed, and drawn by the host after the frame (and the FPS counter) with a
+premultiplied blend, centred, scaled with the window height (1080p = 900 px wide).

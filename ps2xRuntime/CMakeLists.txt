@@ -409,7 +409,7 @@ add_library(ps2_runtime STATIC
 )
 
 if(PS2X_NATIVE_HOST)
-    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/gs/gs_d3d11_backend.cpp src/lib/audio/native_seng.cpp)
+    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/host/mod_menu.cpp src/lib/gs/gs_d3d11_backend.cpp src/lib/audio/native_seng.cpp)
 
     # Private so the (huge) recompiled runner target is not rebuilt when host code changes.
     target_compile_definitions(ps2_runtime PRIVATE PS2X_NATIVE_HOST=1 NOMINMAX WIN32_LEAN_AND_MEAN)

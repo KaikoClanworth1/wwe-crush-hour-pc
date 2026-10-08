@@ -16,6 +16,8 @@ The engine is a fork of [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp) (i
 - Native RenderWare renderer: world (incl. the live arena screens), cars, reflections, skinned drivers,
   particles, the crowd, HUD and menus; split screen verified against the original VU programs
 - Xbox controllers (XInput) with Xbox button prompts (glyphs from WWE SmackDown vs Raw 2011)
+- In-game mod menu (main menu "m" plank, or F2 / BACK + RB): the game's cheats and PCSX2 .pnach cheat files,
+  toggled live
 - 2-player split screen, keyboard support, FPS counter (F1), borderless fullscreen (Alt+Enter)
 
 ## Layout
@@ -44,7 +46,8 @@ The tools currently use the absolute paths of the development machine (`D:\Xbox 
 The disc image, the game's files, the generated game code (`recomp/output/`), the VU1 microcode dumps and
 compiled microcode, symbol / function lists taken from the game, and build outputs.
 
-Two small tracked files are derived from game art and must be regenerated or removed before this repository
+Three small tracked files are derived from game art and must be regenerated or removed before this repository
 is made public: `ps2xRuntime/src/lib/gs/xbox_button_icons.inc` (button-glyph texture patches built from Crush
-Hour's and SmackDown vs Raw 2011's textures by `port/tools/make_xbox_icons.py`) and `ps2xRuntime/res/game.ico`
-(the window icon, from the game's memory-card icon, `port/tools/make_icon.py`).
+Hour's and SmackDown vs Raw 2011's textures by `port/tools/make_xbox_icons.py`), `ps2xRuntime/src/lib/gs/
+mod_button.inc` (the mod menu's "m" plank, built from the main menu sign by `port/tools/make_mod_button.py`) and
+`ps2xRuntime/res/game.ico` (the window icon, from the game's memory-card icon, `port/tools/make_icon.py`).

@@ -41,6 +41,14 @@ namespace nrw
             uint8_t g3xLightSrc; // G3x ADL lights: 0 not G3x, 1 from VU1 995..997 at the marker, 2 from the RpLights
         };
         uint64_t g_nodeMarkersWritten = 0; // PS2X_NRW_ENVLOG diagnostics
+        // Texture substitution for native meshes (setTextureRemap): the mod menu shows the main menu's "options"
+        // item un-highlighted while its M plank has the focus (the game's highlight is a material texture swap).
+        std::atomic<uint32_t> g_texRemapFrom{0}, g_texRemapTo{0};
+        uint32_t texRemap(uint32_t texture)
+        {
+            const uint32_t from = g_texRemapFrom.load(std::memory_order_relaxed);
+            return (from && texture == from) ? g_texRemapTo.load(std::memory_order_relaxed) : texture;
+        }
         // Edit generation per RpGeometry: RpGeometryLock marks lockedSinceLastInst, RenderWare re-instances.
         std::unordered_map<uint32_t, uint32_t> g_geomGen;
         // VU1 constants of native node entries, by marker index (a frame's markers are consumed long before
@@ -1753,6 +1761,12 @@ namespace nrw
         lo = 0x10000000ull;
         hi = (0x07000000ull | kMarkerMark) | (static_cast<uint64_t>(idx & 0xFFFFu) << 32);
         return true;
+    }
+
+    void setTextureRemap(uint32_t from, uint32_t to)
+    {
+        g_texRemapTo.store(to, std::memory_order_relaxed);
+        g_texRemapFrom.store(from, std::memory_order_relaxed);
     }
 
     void g3xLights(uint32_t ambient, uint32_t directional)
@@ -3678,7 +3692,7 @@ namespace nrw
             // Textures must be plain texture rasters with an upload chain. Camera textures (render targets) stay on
             // RenderWare: its texture cache places them in VRAM (RpSkyTexCacheAccessRaster), which the node path
             // skips -- drawing them natively blacked out the menus and the arena intro, which composite through them.
-            const uint32_t texture = rd32(ee, material), raster = texture ? rd32(ee, texture) : 0u;
+            const uint32_t texture = texRemap(rd32(ee, material)), raster = texture ? rd32(ee, texture) : 0u;
             const uint32_t rasterType = raster ? (ee[(raster + 32u) & 0x1FFFFFFu] & 7u) : 0u;
             // Camera textures on sectors (the arena's big screen): drawn from the render target where RenderWare's
             // texture cache keeps it, while its cache entry is resident (the raster extension's TEX0 is then current).
@@ -3764,7 +3778,7 @@ namespace nrw
         for (uint32_t i = 0; i < numMeshes; ++i)
         {
             const uint32_t m = meshes + i * 12u, material = rd32(ee, m + 8u);
-            const uint32_t texture = rd32(ee, material), raster = texture ? rd32(ee, texture) : 0u;
+            const uint32_t texture = texRemap(rd32(ee, material)), raster = texture ? rd32(ee, texture) : 0u;
             uint8_t col[4] = {0xFF, 0xFF, 0xFF, 0xFF};
             if (modulate)
                 std::memcpy(col, ee + ((material + 4u) & 0x1FFFFFFu), 4);

@@ -27,6 +27,10 @@ Status
   run at full speed, car reflections no longer show green garbage.
 - Tested: Exhibition (RAW, SmackDown, Hell in a Cell, Hardcore), New Season, 2-player split screen,
   the pause menu and Options. Cars no longer drop through the floor in Hell in a Cell / Hardcore.
+- Mod menu: on the main menu press RIGHT on "options" to reach the "m" plank and press A (or F2 /
+  BACK + RB anywhere, also in a match). Mods turn on and off live: the game's own cheats (Unlimited
+  Turbo, Power Hungry, Unlock Everything) and PCSX2 cheat files (.pnach) put in GameFiles\Mods
+  (see the README there).
 - If the picture ever stops moving, close and restart.
 - The first time you boot, the memory card screen asks for a button press (A / X key).
   Skip the intro movies with Start / Enter.
@@ -44,6 +48,7 @@ Keyboard (acts as player 1):
   LB / RB       Q / E               LT / RT      1 / 3
   Start         Enter               Back         Tab or Right Shift
   Alt+Enter     toggle fullscreen   F1           FPS counter on/off
+  F2            mod menu (BACK + RB on a controller)
 
 Settings  (GameFiles\ps2x_settings.ini)
 --------

@@ -78,6 +78,12 @@ static LONG WINAPI ps2xCrashFilter(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+namespace modmenu // mod_menu.cpp
+{
+    void filterInput(ps2host::PadState *pads, int count, bool hotkeyDown);
+    bool panel(uint32_t outH, const uint32_t *&px, uint32_t &w, uint32_t &h, bool &changed);
+}
+
 namespace ps2host
 {
     constexpr int kAutoAnchorHits = 32;
@@ -485,6 +491,87 @@ float4 ps_main(VsOut i) : SV_Target
         std::atomic<bool> g_presentWide{true};
         int g_internalScale = 0; // [Display] InternalScale (0 = from the output size)
 
+        // The mod menu panel (mod_menu.cpp renders it): centred over the frame, premultiplied alpha.
+        ComPtr<ID3D11Texture2D> g_modTex;
+        ComPtr<ID3D11ShaderResourceView> g_modSrv;
+        ComPtr<ID3D11PixelShader> g_alphaPs;
+        ComPtr<ID3D11BlendState> g_premulBlend;
+        uint32_t g_modW = 0, g_modH = 0;
+
+        void drawModMenu(float bw, float bh)
+        {
+            const uint32_t *px = nullptr;
+            uint32_t w = 0, h = 0;
+            bool changed = false;
+            if (!modmenu::panel(static_cast<uint32_t>(bh), px, w, h, changed))
+                return;
+            if (!g_alphaPs)
+            {
+                static const char *kAlphaPs = R"(
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return tex.Sample(samp, uv); }
+)";
+                ComPtr<ID3DBlob> b;
+                if (!compileShader(kAlphaPs, "ps_main", "ps_5_0", b))
+                    return;
+                g_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_alphaPs);
+                D3D11_BLEND_DESC bd{};
+                bd.RenderTarget[0].BlendEnable = TRUE;
+                bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+                bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+                bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+                bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+                bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+                bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+                bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+                g_device->CreateBlendState(&bd, &g_premulBlend);
+            }
+            if (!g_modTex || w != g_modW || h != g_modH)
+            {
+                g_modTex.Reset();
+                g_modSrv.Reset();
+                D3D11_TEXTURE2D_DESC td{};
+                td.Width = w;
+                td.Height = h;
+                td.MipLevels = 1;
+                td.ArraySize = 1;
+                td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                td.SampleDesc.Count = 1;
+                td.Usage = D3D11_USAGE_DEFAULT;
+                td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                if (FAILED(g_device->CreateTexture2D(&td, nullptr, &g_modTex)))
+                    return;
+                g_device->CreateShaderResourceView(g_modTex.Get(), nullptr, &g_modSrv);
+                g_modW = w;
+                g_modH = h;
+                changed = true;
+            }
+            if (changed)
+                g_ctx->UpdateSubresource(g_modTex.Get(), 0, nullptr, px, w * 4u, 0);
+            D3D11_VIEWPORT vp{std::floor((bw - static_cast<float>(w)) * 0.5f), std::floor((bh - static_cast<float>(h)) * 0.5f),
+                              static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f};
+            g_ctx->RSSetViewports(1, &vp);
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (SUCCEEDED(g_ctx->Map(g_blitCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            {
+                const float rect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+                std::memcpy(m.pData, rect, sizeof(rect));
+                g_ctx->Unmap(g_blitCb.Get(), 0);
+            }
+            g_ctx->OMSetBlendState(g_premulBlend.Get(), nullptr, 0xFFFFFFFFu);
+            g_ctx->PSSetShader(g_alphaPs.Get(), nullptr, 0);
+            ID3D11ShaderResourceView *srv = g_modSrv.Get();
+            g_ctx->PSSetShaderResources(0, 1, &srv);
+            ID3D11SamplerState *smp = g_pointSampler ? g_pointSampler.Get() : g_linearSampler.Get();
+            g_ctx->PSSetSamplers(0, 1, &smp);
+            g_ctx->Draw(3, 0);
+            ID3D11ShaderResourceView *nullSrv = nullptr;
+            g_ctx->PSSetShaderResources(0, 1, &nullSrv);
+            g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+            g_ctx->PSSetShader(g_blitPs.Get(), nullptr, 0);
+        }
+
         void drawBlit(ID3D11ShaderResourceView *srv, uint32_t srcW, uint32_t srcH, float u1, float v1)
         {
             g_d3dEpoch.fetch_add(1, std::memory_order_relaxed); // GS backend state cache must rebind
@@ -537,6 +624,7 @@ float4 ps_main(VsOut i) : SV_Target
             ID3D11ShaderResourceView *nullSrv = nullptr;
             g_ctx->PSSetShaderResources(0, 1, &nullSrv);
             updateAndDrawFps(bh);
+            drawModMenu(bw, bh);
 
             if (!g_shotDir.empty() && nowSeconds() >= g_nextShot)
             {
@@ -1034,6 +1122,8 @@ float4 ps_main(VsOut i) : SV_Target
         }
         // Keyboard player is always considered present so the game has a pad on port 0.
         k.connected = true;
+        // The mod menu (F2, BACK + RB, or the main menu's m plank) takes player 1's input while it is up.
+        modmenu::filterInput(pads, kMaxPads, g_keys[VK_F2]);
         for (int i = 0; i < kMaxPads; ++i)
             g_pads[i] = pads[i];
     }

@@ -11,6 +11,8 @@ namespace ps2host
     void setPresentWide(bool wide); // win32_host.cpp: Widescreen=1 frame shown 16:9 (else 4:3 with bars)
 }
 #include "xbox_button_icons.inc"
+#include "mod_button.inc"
+extern "C" int ps2x_modmenu_button_state(); // mod_menu.cpp: the main menu's M plank, 0 normal / 1 highlighted
 #include "runtime/gs/ps2_gif_arbiter.h"
 extern thread_local GifPathId g_gifCurrentPath;
 
@@ -1456,6 +1458,8 @@ struct GSD3D11Backend::Impl
             }
             key ^= c * 0x9E3779B97F4A7C15ull;
         }
+        if (tw == 512u && th == 512u)
+            key ^= 0x4D6F644D656E75ull * static_cast<uint64_t>(2 + ps2x_modmenu_button_state()); // the M plank's variant
         RasterTex &rt = rasterTex[raster];
         const bool verify = rasterTexMode() == 2;
         if (rt.srv && rt.key == key && !(verify && !rt.verified))
@@ -1585,7 +1589,25 @@ struct GSD3D11Backend::Impl
                 return nullptr;
             dev->CreateShaderResourceView(rt.tex.Get(), nullptr, &rt.srv);
         }
-        applyXboxIcons(rasterPx, tw, th);
+        applyTexturePatches(rasterPx, tw, th);
+        {
+            // PS2X_RASTER_DUMP=<dir>: every native raster texture once per (raster, contents), RGBA (PS2 alpha).
+            static const char *s_rasterDump = std::getenv("PS2X_RASTER_DUMP");
+            static std::vector<uint64_t> s_dumped;
+            if (s_rasterDump && s_dumped.size() < 4000u &&
+                std::find(s_dumped.begin(), s_dumped.end(), key ^ raster) == s_dumped.end())
+            {
+                s_dumped.push_back(key ^ raster);
+                char path[600];
+                std::snprintf(path, sizeof(path), "%s/raster_%08x_%016llx_psm%u_%ux%u.rgba", s_rasterDump, raster,
+                              static_cast<unsigned long long>(key), t.psm, tw, th);
+                if (FILE *f = std::fopen(path, "wb"))
+                {
+                    std::fwrite(rasterPx.data(), 4, rasterPx.size(), f);
+                    std::fclose(f);
+                }
+            }
+        }
         ctx->UpdateSubresource(rt.tex.Get(), 0, nullptr, rasterPx.data(), tw * 4u, 0);
         rt.key = key;
         rt.w = tw;
@@ -1620,6 +1642,8 @@ struct GSD3D11Backend::Impl
         uint64_t key = fnv1a(&t.tbp0, sizeof(t.tbp0));
         const uint32_t k2[] = {t.tbw, t.psm, tw, th};
         key = fnv1a(k2, sizeof(k2), key);
+        if (tw == 512u && th == 512u)
+            key ^= 0x4D6F644D656E75ull * static_cast<uint64_t>(2 + ps2x_modmenu_button_state()); // the M plank's variant
         if (isIndexed(t.psm))
         {
             const uint32_t k3[] = {t.cpsm, t.csa, t.csm};
@@ -1759,7 +1783,7 @@ struct GSD3D11Backend::Impl
                 }
             }
         }
-        applyXboxIcons(px, tw, th);
+        applyTexturePatches(px, tw, th);
         ctx->UpdateSubresource(ct.tex.Get(), 0, nullptr, px.data(), tw * 4u, 0);
         if (!ct.srv)
             dev->CreateShaderResourceView(ct.tex.Get(), nullptr, &ct.srv);
@@ -2316,45 +2340,66 @@ struct GSD3D11Backend::Impl
         ++pipeGen; // the next ordinary draw rebinds the standard pipeline
     }
 
-    // Xbox button prompts (PS2X_XBOX_ICONS=0: the original PS2 ones). Two of the game's 512x256 textures carry PS2
-    // button art: the menu font (prompt glyphs square / triangle / circle / cross) and the Controller Options panel
-    // (pad picture, button list, "L2 button" etc.). tools/make_xbox_icons.py edits them with the Xbox 360 glyphs of
-    // WWE SmackDown vs Raw 2011 (X / Y / B / A, LT / LB / RT / RB / RS) and stores the changed rectangles; a decoded
-    // texture is identified by a hash of its rows 122..159, columns 72..219. PS2X_ICON_LOG=<dir> writes every other
-    // 512x256 texture there once (icon_<hash>.rgba: input for the tool).
-    void applyXboxIcons(std::vector<uint32_t> &pixels, uint32_t tw, uint32_t th)
+    // Texture patches applied to decoded textures before the upload, a texture identified by a hash of a fixed
+    // region (512x256: rows 122..159, columns 72..219; 512x512: rows 403..471, columns 112..391).
+    //  - Xbox button prompts (PS2X_XBOX_ICONS=0: the PS2 ones): the menu font (prompt glyphs) and the Controller
+    //    Options panel get the Xbox 360 glyphs of WWE SmackDown vs Raw 2011 (port/tools/make_xbox_icons.py).
+    //  - The mod menu's "m" plank on the main menu sign, right of "options", normal or highlighted
+    //    (port/tools/make_mod_button.py, mod_menu.cpp; PS2X_MODMENU=0: none).
+    // PS2X_ICON_LOG=<dir> writes every other texture of those sizes there once (icon_<w>x<h>_<hash>.rgba: input for
+    // the tools).
+    void applyTexturePatches(std::vector<uint32_t> &pixels, uint32_t tw, uint32_t th)
     {
-        static const bool s_on = []()
+        static const bool s_icons = []()
         {
             const char *v = std::getenv("PS2X_XBOX_ICONS");
             return !(v && *v == '0');
         }();
-        if (!s_on || tw != 512u || th != 256u || pixels.size() < 512u * 256u)
+        if (tw != 512u || (th != 256u && th != 512u) || pixels.size() < static_cast<size_t>(tw) * th)
             return;
+        const bool tall = th == 512u;
+        const uint32_t y0 = tall ? 403u : 122u, y1 = tall ? 472u : 160u, x0 = tall ? 112u : 72u, x1 = tall ? 392u : 220u;
         uint64_t h = 1469598103934665603ull;
-        for (uint32_t y = 122u; y < 160u; ++y)
-            h = fnv1a(&pixels[y * 512u + 72u], (220u - 72u) * 4u, h);
+        for (uint32_t y = y0; y < y1; ++y)
+            h = fnv1a(&pixels[y * 512u + x0], (x1 - x0) * 4u, h);
         bool known = false;
-        for (const XboxIconPatch &p : kXboxIconPatches)
+        if (!tall)
         {
-            if (p.texture != h)
-                continue;
-            known = true;
-            for (uint32_t y = 0; y < p.h; ++y)
-                std::memcpy(&pixels[(p.y + y) * 512u + p.x], p.texels + y * p.w, p.w * 4u);
+            for (const XboxIconPatch &p : kXboxIconPatches)
+            {
+                if (p.texture != h)
+                    continue;
+                known = true;
+                if (s_icons)
+                    for (uint32_t y = 0; y < p.h; ++y)
+                        std::memcpy(&pixels[(p.y + y) * 512u + p.x], p.texels + y * p.w, p.w * 4u);
+            }
+        }
+        else
+        {
+            const int state = ps2x_modmenu_button_state();
+            for (const ModButtonPatch &p : kModButtonPatches)
+            {
+                if (!p.texels || p.texture != h)
+                    continue;
+                known = true;
+                if (state >= 0 && p.variant == state)
+                    for (uint32_t y = 0; y < p.h; ++y)
+                        std::memcpy(&pixels[(p.y + y) * 512u + p.x], p.texels + y * p.w, p.w * 4u);
+            }
         }
         static const char *s_log = std::getenv("PS2X_ICON_LOG");
         static std::vector<uint64_t> s_seen;
-        if (!known && s_log && s_seen.size() < 64u && std::find(s_seen.begin(), s_seen.end(), h) == s_seen.end())
+        if (!known && s_log && s_seen.size() < 128u && std::find(s_seen.begin(), s_seen.end(), h) == s_seen.end())
         {
             s_seen.push_back(h);
-            std::printf("[xbox-icons] 512x256 texture %016llx (no patch)%c", static_cast<unsigned long long>(h), 10);
+            std::printf("[tex-patch] %ux%u texture %016llx (no patch)%c", tw, th, static_cast<unsigned long long>(h), 10);
             std::fflush(stdout);
             char path[600];
-            std::snprintf(path, sizeof(path), "%s/icon_%016llx.rgba", s_log, static_cast<unsigned long long>(h));
+            std::snprintf(path, sizeof(path), "%s/icon_%ux%u_%016llx.rgba", s_log, tw, th, static_cast<unsigned long long>(h));
             if (FILE *f = std::fopen(path, "wb"))
             {
-                std::fwrite(pixels.data(), 4, 512u * 256u, f);
+                std::fwrite(pixels.data(), 4, static_cast<size_t>(tw) * th, f);
                 std::fclose(f);
             }
         }
