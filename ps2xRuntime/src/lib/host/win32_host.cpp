@@ -483,6 +483,7 @@ float4 ps_main(VsOut i) : SV_Target
 
         // Widescreen=1: the GS backend shows frames without a 3D scene (movies, loading screens) 4:3 with bars.
         std::atomic<bool> g_presentWide{true};
+        int g_internalScale = 0; // [Display] InternalScale (0 = from the output size)
 
         void drawBlit(ID3D11ShaderResourceView *srv, uint32_t srcW, uint32_t srcH, float u1, float v1)
         {
@@ -587,11 +588,12 @@ float4 ps_main(VsOut i) : SV_Target
         g_config.keepAspect = GetPrivateProfileIntA("Display", "KeepAspect", g_config.keepAspect, iniPath) != 0;
         g_config.widescreen = GetPrivateProfileIntA("Display", "Widescreen", g_config.widescreen, iniPath) != 0;
         g_showFps = GetPrivateProfileIntA("Display", "ShowFPS", g_showFps ? 1 : 0, iniPath) != 0;
-        // InternalScale=N: the GS is rendered at N x the PS2 resolution (640x448 -> 1920x1344 at 3), 1..6. The GS
-        // backend reads PS2X_GS_SCALE when it starts (an explicit PS2X_GS_SCALE wins).
-        const int scale = static_cast<int>(GetPrivateProfileIntA("Display", "InternalScale", 0, iniPath));
-        if (scale >= 1 && scale <= 6 && !std::getenv("PS2X_GS_SCALE"))
-            _putenv_s("PS2X_GS_SCALE", std::to_string(scale).c_str());
+        // InternalScale=N: the GS is rendered at N x the PS2 resolution (640x448 -> 1920x1344 at 3), 1..6;
+        // 0 = from the output size (init). The GS backend reads PS2X_GS_SCALE when it starts (an explicit
+        // PS2X_GS_SCALE wins).
+        g_internalScale = static_cast<int>(GetPrivateProfileIntA("Display", "InternalScale", 0, iniPath));
+        if (g_internalScale >= 1 && g_internalScale <= 6 && !std::getenv("PS2X_GS_SCALE"))
+            _putenv_s("PS2X_GS_SCALE", std::to_string(g_internalScale).c_str());
         if (const char *ws = std::getenv("PS2X_WIDESCREEN")) // test override
             g_config.widescreen = *ws != '0';
         return true;
@@ -629,7 +631,17 @@ float4 ps_main(VsOut i) : SV_Target
             w = GetSystemMetrics(SM_CXSCREEN);
             h = GetSystemMetrics(SM_CYSCREEN);
         }
-        else
+        if (g_internalScale == 0 && !std::getenv("PS2X_GS_SCALE"))
+        {
+            // InternalScale=0: enough GS pixels for the picture on screen. The 640x448 frame fills the screen's
+            // height and 4:3 (or, with Widescreen, 16:9) of its width: 1080p -> 3, 1440p -> 4, 2160p (4K) -> 6.
+            const double outW = static_cast<double>(w), outH = static_cast<double>(h);
+            const double picW = std::min(outW, outH * (g_config.widescreen ? 16.0 / 9.0 : 4.0 / 3.0));
+            const int scale = std::clamp(static_cast<int>(std::ceil(std::max(picW / 640.0, outH / 448.0) - 0.05)), 1, 6);
+            _putenv_s("PS2X_GS_SCALE", std::to_string(scale).c_str());
+            std::printf("[host] output %dx%d: internal scale %d%c", w, h, scale, 10);
+        }
+        if (!g_config.fullscreen)
         {
             RECT r{0, 0, w, h};
             AdjustWindowRect(&r, style, FALSE);

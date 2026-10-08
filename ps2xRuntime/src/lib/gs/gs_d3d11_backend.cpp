@@ -2413,7 +2413,7 @@ struct GSD3D11Backend::Impl
         // RwIm2D (screen space) is the 2D layer: with widescreen, triangles narrower than the frame are drawn 3/4 as
         // wide about its centre (GS window x: XYOFFSET + half the frame width); full-width ones (fades) stay.
         const bool hud2d = !(job.stateFlags & nrw::kStateNative) && hudOn &&
-                           std::max<uint32_t>(st.context.frame.fbw, 1u) * 64u >= 512u;
+                           std::max<uint32_t>(st.context.frame.fbw, 1u) * 64u >= 640u;
         const float hudCx = static_cast<float>(st.context.xyoffset.ofx) / 16.0f +
                             0.5f * static_cast<float>(std::max<uint32_t>(st.context.frame.fbw, 1u) * 64u);
         if (rasterState)
@@ -2499,7 +2499,7 @@ struct GSD3D11Backend::Impl
         pendingState = st;
         hudScale = 1.0f;
         if ((job.kind == nrw::kWorldSectorMesh || job.kind == nrw::kAtomicMesh) && (job.transType & 8u) == 0u &&
-            std::max<uint32_t>(st.context.frame.fbw, 1u) * 64u >= 512u)
+            std::max<uint32_t>(st.context.frame.fbw, 1u) * 64u >= 640u)
             frame3D = true;
         if ((job.transType & 8u) != 0u && hudOn)
         {
@@ -2828,8 +2828,8 @@ struct GSD3D11Backend::Impl
                 hs = hudScale;
             else if (pendingKey.hud)
                 std::memcpy(&hs, &pendingKey.hud, 4);
-            if (std::max<uint32_t>(c.frame.fbw, 1u) * 64u < 512u)
-                hs = 1.0f; // a camera texture (e.g. the arena screen's feed), not the stretched frame
+            if (std::max<uint32_t>(c.frame.fbw, 1u) * 64u < 640u)
+                hs = 1.0f; // a camera texture (the menu panels' 512x256 raster, the arena screen's feed), not the frame
             cbd.rtSize[2] = hs;
             cbd.rtSize[3] = 0.5f * static_cast<float>(std::min<uint32_t>(rt->w, std::max<uint32_t>(c.frame.fbw, 1u) * 64u));
         }
