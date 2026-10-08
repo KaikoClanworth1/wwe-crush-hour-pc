@@ -575,6 +575,10 @@ float4 ps_main(VsOut i) : SV_Target
     {
         if (!iniPath || GetFileAttributesA(iniPath) == INVALID_FILE_ATTRIBUTES)
             return false;
+        // GetPrivateProfile* looks a relative file name up in the Windows directory, not the working directory.
+        char fullPath[MAX_PATH];
+        if (GetFullPathNameA(iniPath, MAX_PATH, fullPath, nullptr) != 0)
+            iniPath = fullPath;
         g_config.width = GetPrivateProfileIntA("Display", "Width", g_config.width, iniPath);
         g_config.height = GetPrivateProfileIntA("Display", "Height", g_config.height, iniPath);
         g_config.fullscreen = GetPrivateProfileIntA("Display", "Fullscreen", g_config.fullscreen, iniPath) != 0;
@@ -583,6 +587,11 @@ float4 ps_main(VsOut i) : SV_Target
         g_config.keepAspect = GetPrivateProfileIntA("Display", "KeepAspect", g_config.keepAspect, iniPath) != 0;
         g_config.widescreen = GetPrivateProfileIntA("Display", "Widescreen", g_config.widescreen, iniPath) != 0;
         g_showFps = GetPrivateProfileIntA("Display", "ShowFPS", g_showFps ? 1 : 0, iniPath) != 0;
+        // InternalScale=N: the GS is rendered at N x the PS2 resolution (640x448 -> 1920x1344 at 3), 1..6. The GS
+        // backend reads PS2X_GS_SCALE when it starts (an explicit PS2X_GS_SCALE wins).
+        const int scale = static_cast<int>(GetPrivateProfileIntA("Display", "InternalScale", 0, iniPath));
+        if (scale >= 1 && scale <= 6 && !std::getenv("PS2X_GS_SCALE"))
+            _putenv_s("PS2X_GS_SCALE", std::to_string(scale).c_str());
         if (const char *ws = std::getenv("PS2X_WIDESCREEN")) // test override
             g_config.widescreen = *ws != '0';
         return true;
