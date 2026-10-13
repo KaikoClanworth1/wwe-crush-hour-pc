@@ -16,6 +16,19 @@
 // swapping its material texture (Shell + 0xF14 + item * 8: normal, + 0xF18: highlighted); while the m plank has the
 // focus the native renderer draws the "options" item with its normal texture (nrw::setTextureRemap).
 // PS2X_MODMENU=0 turns the whole feature off.
+//
+// Restored cut content (built-in mods, hooks in port/tools/patch_cutcontent.py):
+//  - Ladder arena: the finished but unreachable "ladder" level (BUNDLES\LEVELS\K-Z\LADDER, its sound bank, the
+//    shell's "MATCH LADDER" entry and the game's RefereeLadder / BrainLadder code are all on the disc; only the arena
+//    chooser lacks it). The chooser's tables have room for 14 arenas (Shell + 0x113E: level per chooser slot, + 0xFBC:
+//    tile texture per slot, + 0x114C: count; LevelSelection[14][17] at 0x3DD570, slot 13 empty), so the ladder becomes
+//    chooser slot 13 / level 13. The shell script wraps its LEVEL_SELECT at LEVEL_MAX = 13, so the hooks keep a
+//    virtual selection that also reaches slot 13 (ps2x_levelsel_pick). Its tile is drawn by the GS backend over the
+//    Survivor Series tile's texture while slot 13 is selected (ps2x_ladder_tile_state, port/tools/make_ladder_tile.py);
+//    the load screen is the generic one (there is no LOAD_LAD bundle).
+//  - Faarooq: his car bundle (VEHICLES\A-J\FAROOQ, with Ron Simmons driving, his weapons, taunt face and Jim Ross
+//    name calls, all on the disc) has no roster entry; picking Bradshaw (his APA partner) loads Faarooq's car instead
+//    (ps2x_vehicle_name) and the in-game name reads "Faarooq".
 
 #include "host/win32_host.h"
 
@@ -29,6 +42,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <set>
 #include <string>
@@ -59,7 +73,7 @@ namespace
     {
         std::string id;          // "builtin:<name>" or "<file>|<section>"
         std::string name, description, source;
-        int builtin = 0;         // 1 unlimited turbo, 2 power hungry, 3 unlock everything
+        int builtin = 0;         // 1 unlimited turbo, 2 power hungry, 3 unlock everything, 4 ladder arena, 5 Faarooq
         std::vector<Op> ops;
         bool enabled = false;    // wanted (menu)
         bool applied = false;    // live state (EE thread)
@@ -77,6 +91,18 @@ namespace
     constexpr uint32_t kCheatFlags = 0x4A2298u;   // Player::muCheatFlags: bit 0 unlimited turbo, bit 1 power hungry
     constexpr uint32_t kOptionsPtr = 0x4A57F8u;   // WWFOptions::Instance()
     constexpr uint32_t kUnlockAll = 0x558u;       // WWFOptions + 0x558: the "unlock everything" cheat flag
+
+    // Cut content. Guest strings live in LevelSelection's empty slot 13 (17 bytes) and the 2 padding bytes after the
+    // table: "ladder" (the slot's level name), "gen" (load screen) and "farooq" (vehicle bundle name).
+    constexpr uint32_t kLevelSelection = 0x3DD570u;    // char LevelSelection[14][17]
+    constexpr uint32_t kLadderLevel = 13u;              // chooser slot / LevelSelection index of the ladder arena
+    constexpr uint32_t kLadderName = kLevelSelection + kLadderLevel * 17u; // "ladder\0" (7 bytes)
+    constexpr uint32_t kGenName = kLadderName + 7u;     // "gen\0" (4 bytes)
+    constexpr uint32_t kFarooqName = kGenName + 4u;     // "farooq\0" (7 bytes, ends in the padding at 0x3DD66E)
+    constexpr uint32_t kBradshawDisplay = 0x3EBCF8u;    // "Bradshaw" in the superstars' display names (16 bytes)
+    constexpr uint32_t kTileDonorSlot = 12u;            // the ladder tile borrows Survivor Series' tile texture
+    std::atomic<bool> g_ladderOn{false}, g_faarooqOn{false};
+    std::atomic<int> g_ladderTile{-1};                  // ps2x_ladder_tile_state
 
     bool featureOn()
     {
@@ -317,6 +343,22 @@ namespace
                             "time those menus are shown).";
             m.builtin = 3;
             found.push_back(m);
+            m.id = "builtin:ladder_arena";
+            m.name = "Ladder Arena (cut content)";
+            m.description = "Restores the game's unused Ladder Match arena: it follows Survivor Series in the arena "
+                            "chooser (Exhibition and Multiplayer). Play Free for All, Tag Team, Demolition Derby or "
+                            "the cut Ladder Match on it.";
+            m.builtin = 4;
+            // Work in progress: the arena loads and the AI drive, but player 1's car and camera stay frozen in the
+            // start bay (the level predates the IntroManager). Hidden unless PS2X_CUT_LADDER=1.
+            if (std::getenv("PS2X_CUT_LADDER"))
+                found.push_back(m);
+            m.id = "builtin:faarooq";
+            m.name = "Faarooq (unused superstar)";
+            m.description = "Faarooq's finished but unused car, with Ron Simmons at the wheel, his weapons and Jim Ross "
+                            "calling his name: pick Bradshaw (his APA partner) to drive it.";
+            m.builtin = 5;
+            found.push_back(m);
         }
         std::error_code ec;
         std::vector<std::filesystem::path> files;
@@ -465,10 +507,33 @@ namespace
             }
             break;
         }
+        case 4: // ladder arena: the level name of chooser slot 13
+        {
+            static const char kLadder[7] = {'l', 'a', 'd', 'd', 'e', 'r', 0};
+            for (uint32_t i = 0; i < sizeof(kLadder); ++i)
+                ram[kLadderName + i] = on ? static_cast<uint8_t>(kLadder[i]) : 0u;
+            g_ladderOn.store(on);
+            if (!on)
+                g_ladderTile.store(-1);
+            break;
+        }
+        case 5: // Faarooq: his name where the game shows Bradshaw's (the car: ps2x_vehicle_name)
+        {
+            char *shown = reinterpret_cast<char *>(ram + kBradshawDisplay);
+            if (on && std::strcmp(shown, "Bradshaw") == 0)
+                std::memcpy(shown, "Faarooq\0", 9);
+            else if (!on && std::strcmp(shown, "Faarooq") == 0)
+                std::memcpy(shown, "Bradshaw", 9);
+            g_faarooqOn.store(on);
+            break;
+        }
         default:
             break;
         }
     }
+
+    // Arena chooser state (EE thread): the shell script's LEVEL_SELECT as last seen, and the chooser slot shown for it.
+    int g_lsLua = -1, g_lsVirt = -1;
 
     // ------------------------------------------------------------------------------------------------ menu state
     std::atomic<uint32_t> g_shell{0};
@@ -754,6 +819,257 @@ extern "C" int ps2x_modmenu_button_state()
     return (g_focus.load() || (g_open.load() && g_openFromPlank.load())) ? 1 : 0;
 }
 
+// ---------------------------------------------------------------------------------------------------- cut content
+// Shell::OnInitLevelSelect_Tag entry (port/tools/patch_cutcontent.py): its first call (of the shell script's three)
+// starts a new chooser.
+extern "C" void ps2x_levelsel_init(uint8_t *rdram, uint32_t shell)
+{
+    if (rdram && shell && shell < kRam - 0x2000u && rdram[shell + 0x114Cu] == 0u)
+        g_lsLua = g_lsVirt = -1;
+}
+
+// Shell::OnLevelSelection_Tag (move = 1: the chooser shows a slot) and OnSetGameLevel_Tag (move = 0: the slot is
+// picked), on the script's LEVEL_SELECT: the chooser slot to use instead. With the ladder arena on, the chooser gets
+// slot 13 (tile: the donor slot's texture, painted over by the GS backend) and the script's 0..12 wrap is stretched
+// to 14 slots by following its steps: a step right (+1, or 12 -> 0) or left from the last value moves one slot.
+extern "C" uint32_t ps2x_levelsel_pick(uint8_t *rdram, uint32_t shell, uint32_t sel, int move)
+{
+    if (!rdram || !shell || shell >= kRam - 0x2000u)
+        return sel;
+    const int n = static_cast<int>(sel);
+    uint8_t &count = rdram[shell + 0x114Cu];
+    uint8_t &slotLevel = rdram[shell + 0x113Eu + kLadderLevel];
+    const bool on = g_ladderOn.load();
+    // The shared tile texture gets a reference of its own: Shell::Shutdown destroys the textures of all slots.
+    const uint32_t donor = rd32(rdram, shell + 0xFBCu + 4u * kTileDonorSlot);
+    const bool donorOk = donor && donor < kRam - 0x60u;
+    if (on && count == kLadderLevel && donorOk)
+    {
+        slotLevel = static_cast<uint8_t>(kLadderLevel);
+        wr32(rdram, shell + 0xFBCu + 4u * kLadderLevel, donor);
+        wr32(rdram, donor + 0x54u, rd32(rdram, donor + 0x54u) + 1u); // RwTexture::refCount
+        count = static_cast<uint8_t>(kLadderLevel + 1u);
+    }
+    else if (!on && count == kLadderLevel + 1u && slotLevel == kLadderLevel)
+    {
+        const uint32_t tile = rd32(rdram, shell + 0xFBCu + 4u * kLadderLevel);
+        if (tile == donor && donorOk)
+            wr32(rdram, donor + 0x54u, rd32(rdram, donor + 0x54u) - 1u);
+        count = static_cast<uint8_t>(kLadderLevel);
+    }
+    if (!on || count != kLadderLevel + 1u || n < 0 || n >= static_cast<int>(kLadderLevel))
+    {
+        g_lsLua = g_lsVirt = n;
+        g_ladderTile.store(on ? 0 : -1);
+        return sel;
+    }
+    if (move)
+    {
+        const int slots = static_cast<int>(kLadderLevel) + 1;
+        if (g_lsLua < 0 || g_lsVirt < 0 || g_lsVirt >= slots)
+            g_lsVirt = n;
+        else
+        {
+            const int d = ((n - g_lsLua) % 13 + 13) % 13;
+            if (d == 1)
+                g_lsVirt = (g_lsVirt + 1) % slots;
+            else if (d == 12)
+                g_lsVirt = (g_lsVirt + slots - 1) % slots;
+            else if (d != 0)
+                g_lsVirt = n;
+        }
+        g_lsLua = n;
+    }
+    else if (n != g_lsLua || g_lsVirt < 0)
+        return sel;
+    else if (g_lsVirt == static_cast<int>(kLadderLevel))
+        std::printf("[mods] arena chooser: ladder arena picked%c", 10);
+    g_ladderTile.store(g_lsVirt == static_cast<int>(kLadderLevel) ? 1 : 0);
+    return static_cast<uint32_t>(g_lsVirt);
+}
+
+// Shell::OnLevelSelection_Tag: WWFOptions' unlocked-arena bits (+0x24) as tested for the shown level -- the ladder
+// arena (bit 13, never set by the game) counts as unlocked.
+extern "C" uint32_t ps2x_levelsel_unlock(uint32_t mask, uint32_t level)
+{
+    return (level == kLadderLevel && g_ladderOn.load()) ? (mask | (1u << kLadderLevel)) : mask;
+}
+
+// InBetween_set_level_texture entry (the load screen of the next level): "ladder" has no LOAD_LAD bundle; it gets the
+// generic one (LOAD_GEN, whose only texture is "loading": flag 1).
+extern "C" uint32_t ps2x_level_loadscreen(uint8_t *rdram, uint32_t name, uint32_t *flag)
+{
+    if (!rdram || !name || name >= kRam - 16u || std::memcmp(rdram + name, "ladder", 7) != 0)
+        return name;
+    std::memcpy(rdram + kGenName, "gen", 4);
+    *flag = 1u;
+    return kGenName;
+}
+
+// The level a match loads (PlayMode_init_mode): levels\<name>\level<suffix>.wg, the suffix by match type -- "_dd"
+// Demolition Derby, "_dm" the deathmatch types (Free for All), "_tt" Tag Team, none for an arena's own match
+// (gLevelInitData + 0x2EC demolition flag, + 0x2E4 type). The ladder arena only has level.wg (its Ladder Match): every
+// match on it loads that one (ps2x_level_file), and the TYPE of its LEVEL block is read as the match's type
+// (ps2x_level_type, LevelParseSemantics::Type) so it sets up that match's rules.
+constexpr uint32_t kLevelInit = 0x3DA640u; // gLevelInitData: +0 the level's name, +0x2E4 the match type
+
+extern "C" void ps2x_level_file(uint8_t *rdram, uint32_t buf)
+{
+    if (!rdram || !buf || buf >= kRam - 16u || std::memcmp(rdram + kLevelInit, "ladder", 7) != 0)
+        return;
+    std::printf("[mods] ladder arena: %.15s -> level.wg%c", reinterpret_cast<const char *>(rdram + buf), 10);
+    std::memcpy(rdram + buf, "level.wg", 9);
+}
+
+extern "C" uint32_t ps2x_level_type(uint8_t *rdram, uint32_t name)
+{
+    constexpr uint32_t kTypeTable = 0x3F9AF0u; // gLevelTypeLookupTable: 14 x {int type; const char *name}
+    if (!rdram || !name || name >= kRam - 16u || std::memcmp(rdram + kLevelInit, "ladder", 7) != 0 ||
+        _stricmp(reinterpret_cast<const char *>(rdram + name), "ladder") != 0)
+        return name;
+    const uint32_t type = rd32(rdram, kLevelInit + 0x2E4u);
+    for (uint32_t i = 0; i < 14u; ++i)
+        if (rd32(rdram, kTypeTable + 8u * i) == type)
+        {
+            const uint32_t s = rd32(rdram, kTypeTable + 8u * i + 4u);
+            return (s && s < kRam - 16u) ? s : name;
+        }
+    return name;
+}
+
+// VehicleLoader::LoadVehicle entry: the vehicle bundle for a superstar's name -- Faarooq's for Bradshaw when that
+// mod is on (PS2X_FAAROOQ_FOR=<name>: another superstar's, for tests).
+extern "C" uint32_t ps2x_vehicle_name(uint8_t *rdram, uint32_t name)
+{
+    static const std::string s_for = []()
+    {
+        const char *v = std::getenv("PS2X_FAAROOQ_FOR");
+        return std::string(v && *v ? v : "bradshaw");
+    }();
+    if (!rdram || !name || name >= kRam - 16u)
+        return name;
+    const char *who = reinterpret_cast<const char *>(rdram + name);
+    const bool swap = g_faarooqOn.load() && _strnicmp(who, s_for.c_str(), s_for.size() + 1) == 0;
+    std::printf("[mods] vehicle %.15s%s%c", who, swap ? " -> farooq" : "", 10);
+    if (!swap)
+        return name;
+    std::memcpy(rdram + kFarooqName, "farooq", 7);
+    return kFarooqName;
+}
+
+// GS backend: the ladder arena's tile (-1 mod off, 0 not shown, 1 the chooser shows it over the donor's texture).
+extern "C" int ps2x_ladder_tile_state()
+{
+    if (!featureOn() || nowSec() - g_shellSeen.load() > 0.5)
+        return g_ladderOn.load() ? 0 : -1;
+    return g_ladderTile.load();
+}
+
+// Disc reads (Kernel/Stubs/Helpers/Support.h, readCdSectors): same-size fixes to file data as it is read, so the
+// sector-addressed reads stay consistent. LADDER.BND was built with an older toolchain and never rebuilt: its world
+// (levels\ladder\ladder.bsp, RenderWare 3.2) has RW 3.2 collision data in the atomic sectors (chunk 0x11D) that the
+// game's RW 3.4 does not expect; the shipped arenas have none (collision is each arena's Havok physics file).
+// Renamed to an unregistered plugin id, RenderWare skips them; the rest of the 3.2 world is read by RW 3.4's legacy
+// path. Its level.wg places player 1 1.5 units lower than players 2-4 (PLAYERSTART "Player_1" y 12.324, the bay
+// floor is at 10.84); it gets the others' height (13.821). Its script (levels\ladder\init.luc) predates the
+// IntroManager: the intro state machine calls onLevelInit / intro_level / intro_player_N and waits for intro
+// commands that this script never sends, so it never reaches play (state 6: popCamera, countdown, player control)
+// and player 1's camera stays parked in the start bay. Its file-table entry is renamed (init.lux): like the arenas
+// that ship without a script (Cage Match, Bottom Line), the level then goes straight to the match.
+void ps2x_disc_file_patch(const std::filesystem::path &hostPath, uint64_t offset, uint8_t *dst, size_t byteCount)
+{
+    struct FilePatches
+    {
+        bool scanned = false;
+        std::vector<std::pair<uint64_t, uint8_t>> bytes; // file offset, new value
+    };
+    static std::mutex s_mx;
+    static std::vector<std::pair<std::filesystem::path, FilePatches>> s_files;
+    constexpr uint32_t kRenamedId = 0x7FFF011Du; // no plugin registers this id
+    if (!dst || byteCount == 0)
+        return;
+    const std::string leaf = lower(hostPath.filename().string());
+    if (leaf != "ladder.bnd")
+        return;
+    std::lock_guard<std::mutex> lock(s_mx);
+    auto it = std::find_if(s_files.begin(), s_files.end(), [&](const auto &f) { return f.first == hostPath; });
+    if (it == s_files.end())
+    {
+        s_files.emplace_back(hostPath, FilePatches{});
+        it = s_files.end() - 1;
+    }
+    FilePatches &fp = it->second;
+    if (!fp.scanned)
+    {
+        fp.scanned = true;
+        std::ifstream in(hostPath, std::ios::binary);
+        const std::vector<uint8_t> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        auto u32 = [&](size_t o) { uint32_t v = 0; std::memcpy(&v, d.data() + o, 4); return v; };
+        size_t chunks = 0;
+        // The world chunk (0x0B) of RW 3.2 (library id 0x0800FFFF), then its tree: plane sectors (0x0A), atomic
+        // sectors (0x09) and their extensions (0x03) hold the 0x11D chunks.
+        for (size_t o = 0; o + 24 <= d.size(); o += 4)
+        {
+            if (u32(o) != 0x0Bu || u32(o + 8) != 0x0800FFFFu || u32(o + 12) != 0x01u || u32(o + 20) != 0x0800FFFFu)
+                continue;
+            std::vector<std::pair<size_t, size_t>> todo{{o + 12, o + 12 + u32(o + 4)}};
+            while (!todo.empty())
+            {
+                auto [p, end] = todo.back();
+                todo.pop_back();
+                while (p + 12 <= end && end <= d.size())
+                {
+                    const uint32_t type = u32(p), size = u32(p + 4);
+                    if (type == 0x11Du)
+                    {
+                        for (uint32_t k = 0; k < 4; ++k)
+                            fp.bytes.emplace_back(p + k, static_cast<uint8_t>(kRenamedId >> (8u * k)));
+                        ++chunks;
+                    }
+                    else if (type == 0x0Au || type == 0x09u || type == 0x03u)
+                        todo.emplace_back(p + 12, p + 12 + size);
+                    p += 12ull + size;
+                }
+            }
+            break;
+        }
+        // PLAYERSTART "Player_1" { POS 381 12.324 -13.974 }: token 0x4E, the name (padded to 4), token 0x14B, 3 floats.
+        static const uint8_t kStart1[] = {0x4E, 0, 0, 0, 'P', 'l', 'a', 'y', 'e', 'r', '_', '1', 0, ' ', ' ', ' ', 0x4B, 1, 0, 0};
+        size_t starts = 0;
+        for (auto at = std::search(d.begin(), d.end(), std::begin(kStart1), std::end(kStart1)); at != d.end();
+             at = std::search(at + 1, d.end(), std::begin(kStart1), std::end(kStart1)))
+        {
+            const size_t y = static_cast<size_t>(at - d.begin()) + sizeof(kStart1) + 4u;
+            float v = 0.0f;
+            if (y + 4 <= d.size())
+                std::memcpy(&v, d.data() + y, 4);
+            if (v > 12.0f && v < 13.0f)
+            {
+                const float raised = 13.821f;
+                uint8_t b[4];
+                std::memcpy(b, &raised, 4);
+                for (uint32_t k = 0; k < 4; ++k)
+                    fp.bytes.emplace_back(y + k, b[k]);
+                ++starts;
+            }
+        }
+        // The bundle's file table: "c:\autobuild\carnage\assets\levels\ladder\init.luc" (NUL-terminated).
+        static const char kScript[] = "\\levels\\ladder\\init.luc";
+        size_t scripts = 0;
+        for (auto at = std::search(d.begin(), d.end(), std::begin(kScript), std::end(kScript)); at != d.end();
+             at = std::search(at + 1, d.end(), std::begin(kScript), std::end(kScript)))
+        {
+            fp.bytes.emplace_back(static_cast<uint64_t>(at - d.begin()) + sizeof(kScript) - 2u, static_cast<uint8_t>('x'));
+            ++scripts;
+        }
+        std::printf("[mods] %s: %zu RW 3.2 collision chunks skipped, %zu start raised, %zu script hidden%c",
+                    leaf.c_str(), chunks, starts, scripts, 10);
+    }
+    for (const auto &[at, value] : fp.bytes)
+        if (at >= offset && at < offset + byteCount)
+            dst[at - offset] = value;
+}
+
 // ---------------------------------------------------------------------------------------------------- host side
 namespace modmenu
 {
@@ -919,3 +1235,4 @@ namespace modmenu
         return true;
     }
 }
+

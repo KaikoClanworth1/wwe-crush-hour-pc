@@ -2,6 +2,9 @@
 #include <cctype>
 #include "runtime/host_file_cache.h"
 
+// mod_menu.cpp: same-size fixes applied to disc file data as it is read (restored cut content).
+void ps2x_disc_file_patch(const std::filesystem::path &hostPath, uint64_t offset, uint8_t *dst, size_t byteCount);
+
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
@@ -494,7 +497,10 @@ namespace
 
             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
             const uint64_t offset = relativeLbn * kCdSectorSize;
-            return readHostRange(entry.hostPath, offset, dst, byteCount);
+            const bool ok = readHostRange(entry.hostPath, offset, dst, byteCount);
+            if (ok)
+                ps2x_disc_file_patch(entry.hostPath, offset, dst, byteCount);
+            return ok;
         }
 
         const std::filesystem::path cdImage = getCdImagePath();

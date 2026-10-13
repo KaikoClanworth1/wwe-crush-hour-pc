@@ -55,3 +55,47 @@ that compute texture ids must use the same seed.
 Drawn with GDI into a DIB (Impact title, Arial rows; dark steel panel, the game's highlight blue), premultiplied
 BGRA, re-rendered only when something changed, and drawn by the host after the frame (and the FPS counter) with a
 premultiplied blend, centred, scaled with the window height (1080p = 900 px wide).
+
+## Restored cut content
+
+Built-in mods with hooks from `port/tools/patch_cutcontent.py`.
+
+### Ladder arena
+
+The disc holds a finished arena the game never offers: `BUNDLES\LEVELS\K-Z\LADDER.BND/.BNT` (`levels\ladder`: BSP,
+physics, ramp and door props with animations, intro cameras, pickups and weapons, AI road / path maps, `init.lua`),
+its sound bank `AUDIO\BANKS\K-Z\LADDER.VBI/.VBK`, the shell's match list entry `MATCH LADDER` (Ladder Match,
+`LEVEL=ladder`, `GAMEPLAY=ladder`, all players) and the game code for it (`RefereeLadder`, `BrainLadder`,
+`CELadder`, `VICTORY_LADDER`). The shell's asset list puts `ladder` among the finished assets. Only the arena
+chooser lacks it: the chooser's names come from the shell script (`LEVELS1..3`, 13 names) matched against
+`LevelSelection[14][17]` (0x3DD570), whose 14th slot is empty.
+
+The chooser's tables are sized for 14 arenas (Shell + 0x113E: level per chooser slot, + 0xFBC: tile texture per
+slot, + 0x114C: count). With the mod on:
+
+- `LevelSelection[13]` = "ladder" (the name `OnLevelSelection_Tag` / `OnSetGameLevel_Tag` copy into Shell + 0x110C
+  and `gLevelInitData`); the level loads by that name (bundle `LADDER`, `levels\ladder\`).
+- chooser slot 13 is appended (`ps2x_levelsel_pick`, after the script's three `InitLevelSelect` calls); its tile
+  texture is the Survivor Series tile's (with a reference of its own: `Shell::Shutdown` destroys every slot's
+  texture). The script wraps `LEVEL_SELECT` at `LEVEL_MAX` = 13, so the hooks keep a virtual selection: a step
+  right (+1, or 12 -> 0) or left of the script's value moves it one of 14 slots; `OnSetGameLevel_Tag` with the
+  value last shown picks that slot. A new chooser (`OnInitLevelSelect_Tag` with count 0) resets it.
+- unlocked: `WWFOptions + 0x24` bit 13 is set for the test in `OnLevelSelection_Tag` (`ps2x_levelsel_unlock`),
+  the options themselves are not changed.
+- tile: `port/tools/make_ladder_tile.py` builds it from the game's tiles (common frame and logo, a screenshot of
+  the arena, the label "Ladder" from the game's own letters); the backend paints it over the Survivor Series
+  texture while the chooser shows slot 13 (`ps2x_ladder_tile_state`; 512x256 textures are keyed by it).
+- load screen: `InBetween_set_level_texture("ladder")` would load `LOAD_LAD.BNT`, which does not exist; the hook
+  gives it the generic one (`gen`, texture "loading").
+- match types: the match-type chooser lists matches whose `LEVEL` is the picked level or `ALL`: Ladder Match,
+  Free for All, Tag Team and Demolition Derby.
+
+### Faarooq
+
+`BUNDLES\VEHICLES\A-J\FAROOQ.BND` is a complete vehicle (`farooq_car.dff` with `Ron_Simmons` driving, weapons,
+effects, tuning, `taunt_face`, `FarooqCommentaryNames` with five Jim Ross name calls that are on the disc in
+`IOPDATA\COMM_JR`), but Faarooq has no `EWrestler` entry, no shell wheel / belt bundle and no intro, victory or
+taunt videos. With the mod on, `VehicleLoader::LoadVehicle` (all vehicle loads: match start, Royal Rumble /
+Battle Royal entrants) gets "farooq" for "bradshaw" (his APA partner; `PS2X_FAAROOQ_FOR=<name>` picks another
+superstar for tests), and the superstars' display name "Bradshaw" (0x3EBCF8) reads "Faarooq". The shell's wheel
+still shows Bradshaw's car, and his videos play.

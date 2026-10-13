@@ -1,7 +1,13 @@
-﻿WWE Crush Hour - native PC port (work in progress)
-===================================================
+﻿WWE Crush Hour - native PC port   alpha 0.0.1
+=============================================
 
-Start the game:  double-click "Play WWE Crush Hour.bat"
+This is an early alpha. It contains NO game files: you need your own copy of
+WWE Crush Hour for PlayStation 2 (USA, SLUS-20385) as an .iso image or disc.
+
+Install:  double-click "Install WWE Crush Hour.bat" and pick your .iso (or cancel and pick the
+          disc drive / a folder with the disc's files). The game data (about 1.1 GB) is copied
+          into the GameFiles folder. Windows 10/11 mounts the .iso by itself.
+Play:     double-click "Play WWE Crush Hour.bat"
 
 Status
 ------
@@ -29,7 +35,8 @@ Status
   the pause menu and Options. Cars no longer drop through the floor in Hell in a Cell / Hardcore.
 - Mod menu: on the main menu press RIGHT on "options" to reach the "m" plank and press A (or F2 /
   BACK + RB anywhere, also in a match). Mods turn on and off live: the game's own cheats (Unlimited
-  Turbo, Power Hungry, Unlock Everything) and PCSX2 cheat files (.pnach) put in GameFiles\Mods
+  Turbo, Power Hungry, Unlock Everything), "Faarooq" (the finished but unused Faarooq car, driven
+  when you pick Bradshaw - experimental) and PCSX2 cheat files (.pnach) put in GameFiles\Mods
   (see the README there).
 - If the picture ever stops moving, close and restart.
 - The first time you boot, the memory card screen asks for a button press (A / X key).

@@ -12,7 +12,9 @@ namespace ps2host
 }
 #include "xbox_button_icons.inc"
 #include "mod_button.inc"
+#include "ladder_tile.inc"
 extern "C" int ps2x_modmenu_button_state(); // mod_menu.cpp: the main menu's M plank, 0 normal / 1 highlighted
+extern "C" int ps2x_ladder_tile_state();    // mod_menu.cpp: 1 while the arena chooser shows the ladder arena
 #include "runtime/gs/ps2_gif_arbiter.h"
 extern thread_local GifPathId g_gifCurrentPath;
 
@@ -1460,6 +1462,8 @@ struct GSD3D11Backend::Impl
         }
         if (tw == 512u && th == 512u)
             key ^= 0x4D6F644D656E75ull * static_cast<uint64_t>(2 + ps2x_modmenu_button_state()); // the M plank's variant
+        else if (tw == 512u && th == 256u)
+            key ^= 0x4C6164646572ull * static_cast<uint64_t>(2 + ps2x_ladder_tile_state()); // the ladder arena's tile
         RasterTex &rt = rasterTex[raster];
         const bool verify = rasterTexMode() == 2;
         if (rt.srv && rt.key == key && !(verify && !rt.verified))
@@ -1644,6 +1648,8 @@ struct GSD3D11Backend::Impl
         key = fnv1a(k2, sizeof(k2), key);
         if (tw == 512u && th == 512u)
             key ^= 0x4D6F644D656E75ull * static_cast<uint64_t>(2 + ps2x_modmenu_button_state()); // the M plank's variant
+        else if (tw == 512u && th == 256u)
+            key ^= 0x4C6164646572ull * static_cast<uint64_t>(2 + ps2x_ladder_tile_state()); // the ladder arena's tile
         if (isIndexed(t.psm))
         {
             const uint32_t k3[] = {t.cpsm, t.csa, t.csm};
@@ -2346,6 +2352,8 @@ struct GSD3D11Backend::Impl
     //    Options panel get the Xbox 360 glyphs of WWE SmackDown vs Raw 2011 (port/tools/make_xbox_icons.py).
     //  - The mod menu's "m" plank on the main menu sign, right of "options", normal or highlighted
     //    (port/tools/make_mod_button.py, mod_menu.cpp; PS2X_MODMENU=0: none).
+    //  - The restored ladder arena's tile in the arena chooser, over the Survivor Series tile while the chooser shows
+    //    the ladder arena (port/tools/make_ladder_tile.py, mod_menu.cpp).
     // PS2X_ICON_LOG=<dir> writes every other texture of those sizes there once (icon_<w>x<h>_<hash>.rgba: input for
     // the tools).
     void applyTexturePatches(std::vector<uint32_t> &pixels, uint32_t tw, uint32_t th)
@@ -2373,6 +2381,15 @@ struct GSD3D11Backend::Impl
                 if (s_icons)
                     for (uint32_t y = 0; y < p.h; ++y)
                         std::memcpy(&pixels[(p.y + y) * 512u + p.x], p.texels + y * p.w, p.w * 4u);
+            }
+            if (h == kLadderTile.texture)
+            {
+                known = true;
+                if (ps2x_ladder_tile_state() == 1)
+                    for (uint32_t y = 0; y < kLadderTile.h; ++y)
+                        for (uint32_t x = 0; x < kLadderTile.w; ++x)
+                            pixels[(kLadderTile.y + y) * 512u + kLadderTile.x + x] =
+                                kLadderTile.palette[kLadderTile.indices[y * kLadderTile.w + x]];
             }
         }
         else
