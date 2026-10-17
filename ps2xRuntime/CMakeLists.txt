@@ -423,13 +423,15 @@ if(PS2X_NATIVE_HOST)
     # the joystick / gamepad / haptic parts are built; without it the host reads XInput pads.
     option(PS2X_USE_SDL3 "Read game controllers through SDL3 (else XInput only)" ON)
     if(PS2X_USE_SDL3)
-        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-        set(SDL_STATIC ON CACHE BOOL "" FORCE)
-        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-        set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
-        set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+        # Normal variables, not cache entries: SDL2 (fetched by ps2xStudio) reads options of the same names, and
+        # forced cache values here turned its video subsystem off. SDL3's option() calls honour these (CMP0077).
+        set(SDL_SHARED OFF)
+        set(SDL_STATIC ON)
+        set(SDL_TEST_LIBRARY OFF)
+        set(SDL_EXAMPLES OFF)
+        set(SDL_INSTALL OFF)
         foreach(PS2X_SDL_SUBSYSTEM AUDIO VIDEO GPU RENDER CAMERA DIALOG POWER)
-            set(SDL_${PS2X_SDL_SUBSYSTEM} OFF CACHE BOOL "" FORCE)
+            set(SDL_${PS2X_SDL_SUBSYSTEM} OFF)
         endforeach()
         FetchContent_Declare(SDL3
             GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
