@@ -3,6 +3,16 @@
 #include <iostream>
 #include <algorithm>
 
+// Studio builds against imgui's docking branch head, which dropped the pre-1.90.9 / 1.91.4 colour names.
+#if IMGUI_VERSION_NUM < 19090
+#define ImGuiCol_TabSelected ImGuiCol_TabActive
+#define ImGuiCol_TabDimmed ImGuiCol_TabUnfocused
+#define ImGuiCol_TabDimmedSelected ImGuiCol_TabUnfocusedActive
+#endif
+#if IMGUI_VERSION_NUM < 19140
+#define ImGuiCol_NavCursor ImGuiCol_NavHighlight
+#endif
+
 namespace StyleManager {
 
 void SetupFonts(AppSettings& settings) {
@@ -82,18 +92,13 @@ void ApplyDarkTheme() {
     colors[ImGuiCol_FrameBgActive]          = ImVec4(0.24f, 0.24f, 0.25f, 1.00f);
     colors[ImGuiCol_Tab]                    = ImVec4(0.08f, 0.08f, 0.08f, 1.00f);
     colors[ImGuiCol_TabHovered]             = bgPanel;
-    colors[ImGuiCol_TabActive]              = bgPanel;
-#if IMGUI_VERSION_NUM >= 19090 // TabUnfocused / TabUnfocusedActive were renamed (imgui 1.90.9), later removed
+    colors[ImGuiCol_TabSelected]            = bgPanel;
     colors[ImGuiCol_TabDimmed]              = ImVec4(0.08f, 0.08f, 0.08f, 1.00f);
     colors[ImGuiCol_TabDimmedSelected]      = bgPanel;
-#else
-    colors[ImGuiCol_TabUnfocused]           = ImVec4(0.08f, 0.08f, 0.08f, 1.00f);
-    colors[ImGuiCol_TabUnfocusedActive]     = bgPanel;
-#endif
     colors[ImGuiCol_DockingPreview]         = accentMain;
     colors[ImGuiCol_DockingEmptyBg]         = bgBase;
     colors[ImGuiCol_TextSelectedBg]         = ImVec4(0.00f, 0.48f, 0.80f, 0.40f);
-    colors[ImGuiCol_NavHighlight]           = accentMain;
+    colors[ImGuiCol_NavCursor]              = accentMain;
 }
 
 void ApplyLightTheme() {
@@ -138,18 +143,13 @@ void ApplyLightTheme() {
     colors[ImGuiCol_FrameBgActive]          = ImVec4(0.26f, 0.59f, 0.98f, 0.67f);
     colors[ImGuiCol_Tab]                    = ImVec4(0.76f, 0.80f, 0.84f, 0.93f);
     colors[ImGuiCol_TabHovered]             = ImVec4(0.26f, 0.59f, 0.98f, 0.80f);
-    colors[ImGuiCol_TabActive]              = ImVec4(0.60f, 0.73f, 0.88f, 1.00f);
-#if IMGUI_VERSION_NUM >= 19090 // TabUnfocused / TabUnfocusedActive were renamed (imgui 1.90.9), later removed
+    colors[ImGuiCol_TabSelected]            = ImVec4(0.60f, 0.73f, 0.88f, 1.00f);
     colors[ImGuiCol_TabDimmed]              = ImVec4(0.92f, 0.93f, 0.94f, 0.98f);
     colors[ImGuiCol_TabDimmedSelected]      = ImVec4(0.74f, 0.82f, 0.91f, 1.00f);
-#else
-    colors[ImGuiCol_TabUnfocused]           = ImVec4(0.92f, 0.93f, 0.94f, 0.98f);
-    colors[ImGuiCol_TabUnfocusedActive]     = ImVec4(0.74f, 0.82f, 0.91f, 1.00f);
-#endif
     colors[ImGuiCol_DockingPreview]         = accentMain;
     colors[ImGuiCol_DockingEmptyBg]         = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
     colors[ImGuiCol_TextSelectedBg]         = ImVec4(0.26f, 0.59f, 0.98f, 0.35f);
-    colors[ImGuiCol_NavHighlight]           = accentMain;
+    colors[ImGuiCol_NavCursor]              = accentMain;
 }
 
 void ApplyCustomTheme(AppSettings& settings) {
