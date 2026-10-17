@@ -426,6 +426,7 @@ private:
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
+    uint64_t m_unaccountedCycles = 0; // EE cycles not yet fed to the timers / IOP clock (accountCycles)
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};

@@ -16,6 +16,14 @@ option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" O
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" OFF)
 option(PS2X_ENABLE_DEBUG_UI "Build the desktop runtime debug UI" ON)
+option(PS2X_ENABLE_DIAG "Compile developer diagnostics into the runtime hot paths (branch ring, call trace, autoinput; see include/ps2_diag.h)" ON)
+option(PS2X_SHIPPING "Player build: no developer diagnostics, verbose logs or RPC traces" OFF)
+if(PS2X_SHIPPING)
+    set(PS2X_ENABLE_DIAG OFF CACHE BOOL "" FORCE)
+    set(PS2X_ENABLE_RUNTIME_LOGS OFF CACHE BOOL "" FORCE)
+    set(PS2X_ENABLE_AGRESSIVE_LOGS OFF CACHE BOOL "" FORCE)
+    set(PS2X_ENABLE_IOP_RPC_TRACE OFF CACHE BOOL "" FORCE)
+endif()
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -413,6 +421,8 @@ if(PS2X_NATIVE_HOST)
 
     # Private so the (huge) recompiled runner target is not rebuilt when host code changes.
     target_compile_definitions(ps2_runtime PRIVATE PS2X_NATIVE_HOST=1 NOMINMAX WIN32_LEAN_AND_MEAN)
+else()
+    target_sources(ps2_runtime PRIVATE src/lib/host/portable_host.cpp)
 endif()
 
 # Statically recompiled VU1 microcode (tools/vu1_recomp.py -> <game dir>/../vu1/vu1_native.cpp).
@@ -424,6 +434,10 @@ if(PS2X_GAME_DIR AND EXISTS "${PS2X_VU1_NATIVE_SRC}")
         set_source_files_properties("${PS2X_VU1_NATIVE_SRC}" PROPERTIES COMPILE_OPTIONS "/d2OptimizeHugeFunctions")
     endif()
     target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_VU1_NATIVE=1)
+endif()
+
+if(NOT PS2X_ENABLE_DIAG)
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_DISABLE_DIAG=1)
 endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)

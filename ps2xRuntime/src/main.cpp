@@ -214,19 +214,14 @@ int main(int argc, char *argv[])
         std::string elfName = pathObj.filename().string();
         std::string normalizedId = normalizeGameId(elfName);
 
-        std::string windowTitle = "PS2-Recomp | ";
-        const char *gameName = getGameName(normalizedId);
-
+        // A known game gets a plain window title (the player sees it on the taskbar); anything else says what it is.
+        std::string windowTitle = "PS2-Recomp | " + elfName;
 #if !defined(PLATFORM_VITA)
-        if (gameName)
+        if (const char *gameName = getGameName(normalizedId))
         {
-            windowTitle += std::string(gameName) + " | " + elfName;
+            windowTitle = gameName;
         }
-        else
 #endif
-        {
-            windowTitle += elfName;
-        }
 
         PS2Runtime runtime;
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)

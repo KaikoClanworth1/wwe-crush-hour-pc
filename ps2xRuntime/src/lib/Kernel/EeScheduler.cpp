@@ -3,6 +3,7 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "ps2_diag.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -100,8 +101,12 @@ namespace
     uint32_t g_schedRingPos = 0;
     void schedRecord(char evt, int thread, int kind, uint32_t invPc, const R5900Context &base)
     {
+#if PS2X_DIAG
         const R5900Context *cp = &base;
         g_schedRing[g_schedRingPos++ & 4095u] = {evt, thread, kind, invPc, base.pc, GPR_U32(cp, 29), GPR_U32(cp, 31)};
+#else
+        (void)evt, (void)thread, (void)kind, (void)invPc, (void)base;
+#endif
     }
     void schedDump()
     {
@@ -375,11 +380,13 @@ void EeScheduler::run()
                         0u, context);
             (void)cp;
         }
+#if PS2X_DIAG
         {
             extern void ps2RecordBranch(uint32_t source, uint32_t target, uint32_t ra, uint32_t sp);
             const R5900Context *cp = &context;
             ps2RecordBranch(0xEEEEEEEEu, context.pc, GPR_U32(cp, 31), GPR_U32(cp, 29));
         }
+#endif
 
         if (checkpointDue(kGuestDispatchCycles))
         {
@@ -501,12 +508,11 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     // A checkpoint runs at every guest call and loop back-edge. EE timers and the IOP clock both batch
     // internally (>= 1024 / 8192 EE cycles), so feed them in batches here as well: most checkpoints are
     // then two adds and a compare instead of four nested calls (~8% of the EE thread in a match).
-    static uint64_t s_unaccounted = 0u;
-    s_unaccounted += elapsed;
-    if (s_unaccounted >= 1024u)
+    m_unaccountedCycles += elapsed;
+    if (m_unaccountedCycles >= 1024u)
     {
-        const uint64_t batch = s_unaccounted;
-        s_unaccounted = 0u;
+        const uint64_t batch = m_unaccountedCycles;
+        m_unaccountedCycles = 0u;
         m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(batch);
         m_runtime.advanceIopEeCycles(batch);
     }

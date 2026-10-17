@@ -350,6 +350,21 @@ namespace
         return readReferencePSMCT32Pixel(vram, frameBaseToBlock(fbp), fbw, x, y);
     }
 
+    // Reads a CT32 pixel from the runtime GS VRAM in the draw buffer named by the dbuff env's
+    // draw01 FRAME_1 register (the buffer sceGsSwapDBuffDc(which=0) draws into and clears).
+    uint32_t readDBuffDcDraw0Pixel(PS2Runtime &runtime, const std::vector<uint8_t> &rdram,
+                                   uint32_t envAddr, uint32_t x, uint32_t y)
+    {
+        constexpr uint32_t kDraw01Frame1Offset = 0x60u;
+        uint64_t frame1 = 0u;
+        std::memcpy(&frame1, rdram.data() + envAddr + kDraw01Frame1Offset, sizeof(frame1));
+        const uint32_t fbp = static_cast<uint32_t>(frame1 & 0x1FFull);
+        const uint32_t fbw = static_cast<uint32_t>((frame1 >> 16) & 0x3Full);
+        const uint8_t *gsVram = runtime.memory().getGSVRAM();
+        const std::vector<uint8_t> vram(gsVram, gsVram + PS2_GS_VRAM_SIZE);
+        return readReferenceFramePSMCT32Pixel(vram, fbp, fbw, x, y);
+    }
+
     void expectGuestHeapReusable(TestCase &t, PS2Runtime &runtime, const char *message)
     {
         const uint32_t expectedBase = runtime.guestHeapBase();
@@ -644,16 +659,15 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 5, 0u);
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
 
-            uint32_t clearedPixel = 0u;
-            std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
+            // Fork follows libgraph: draw env 0 targets buffer 1 (FRAME_1.FBP = zbp/2), not VRAM 0, and
+            // VRAM is block-swizzled, so read through the draw env's FRAME_1 rather than a linear offset.
+            const uint32_t clearedPixel = readDBuffDcDraw0Pixel(runtime, rdram, kEnvAddr, 0u, 0u);
             t.Equals(clearedPixel, kClearColor,
                      "sceGsSwapDBuffDc should execute the seeded clear packet against the active draw buffer");
 
             constexpr uint32_t kMidX = 320u;
             constexpr uint32_t kMidY = 200u;
-            const uint32_t kMidOffset = ((kMidY * 640u) + kMidX) * 4u;
-            uint32_t clearedMidPixel = 0u;
-            std::memcpy(&clearedMidPixel, runtime.memory().getGSVRAM() + kMidOffset, sizeof(clearedMidPixel));
+            const uint32_t clearedMidPixel = readDBuffDcDraw0Pixel(runtime, rdram, kEnvAddr, kMidX, kMidY);
             t.Equals(clearedMidPixel, kClearColor,
                      "sceGsSwapDBuffDc should clear the interior of the active draw buffer, not just the first pixel");
         });
@@ -699,8 +713,8 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 5, 0u);
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
 
-            uint32_t clearedPixel = 0u;
-            std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
+            // Fork follows libgraph: draw env 0 targets buffer 1, so read via its FRAME_1 (swizzled CT32).
+            const uint32_t clearedPixel = readDBuffDcDraw0Pixel(runtime, rdram, kEnvAddr, 0u, 0u);
             t.Equals(clearedPixel, kClearColor,
                      "sceGsSwapDBuffDc should honor a clear packet seeded from register-based trailing args");
         });
@@ -4139,7 +4153,10 @@ void register_ps2_gs_tests()
                      "VSync callback should receive a positive tick value");
             t.Equals(g_gsSyncCallbackGp.load(std::memory_order_acquire), kGsCallbackGp,
                      "callback invocation should preserve the registered GP");
-            t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) >= 0x01F00000u,
+            // Fork carves callback stacks from the unused EE kernel range 0x20000-0x80000 (ps2_runtime.cpp
+            // callbackStacksHigh): stacks below 0x1FF0000 overlapped the game's thread stacks.
+            t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) >= 0x00020000u &&
+                         g_gsSyncCallbackSp.load(std::memory_order_acquire) < 0x00080000u,
                      "callback invocation should use the reserved async stack pool");
             t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) != kGsCallbackCallerSp,
                      "callback invocation must not reuse the caller stack");

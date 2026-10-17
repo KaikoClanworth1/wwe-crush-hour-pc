@@ -22,6 +22,13 @@ void reset_ps2_test_function_table();
 
 int main()
 {
+    // The GS worker thread (ps2_runtime.cpp) is a process-wide singleton bound to the first runtime's GS;
+    // tests create and destroy many runtimes, so process GIF packets inline as the game did before it.
+#if defined(_WIN32)
+    _putenv_s("PS2X_GS_THREAD", "0");
+#else
+    setenv("PS2X_GS_THREAD", "0", 1);
+#endif
     MiniTest::BeforeEach(reset_ps2_test_function_table);
 
     register_code_generator_tests();

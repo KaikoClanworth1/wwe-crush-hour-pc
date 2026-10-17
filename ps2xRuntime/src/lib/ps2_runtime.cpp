@@ -13,6 +13,8 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#include "host/win32_host.h"
+#include "ps2_diag.h"
 #include <cstdlib>
 #if defined(PS2X_NATIVE_HOST)
 #include "runtime/gs/gs_d3d11_backend.h"
@@ -210,6 +212,7 @@ bool ps2GsThreadDeferFlip(std::function<void()> fn)
         g_gsThread.jobs.emplace_back();
     }
     g_gsThread.cv.notify_one();
+#if PS2X_DIAG
     if (s_hitchLog)
     {
         extern void ps2HitchSamplerStart();
@@ -233,6 +236,7 @@ bool ps2GsThreadDeferFlip(std::function<void()> fn)
             std::fflush(stdout);
         }
     }
+#endif
     return true;
 }
 
@@ -1636,7 +1640,7 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                                        GuestBranchKind kind,
                                        const char *debugName)
 {
-#if defined(PS2X_NATIVE_HOST)
+#if PS2X_DIAG
     {
         extern void ps2DumpBranchRing();
         ps2DumpBranchRing();
@@ -1793,9 +1797,11 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+// Host time of the last flip (PS2X_HITCH_LOG); read by the host profiler (PS2X_PROFILE_STALL).
+std::atomic<double> g_hitchLastFlip{0.0};
 // Time of the first call of PS2X_TRACE_ANCHOR_PC (-1 until then); see dispatchGuestBranch.
 std::atomic<double> g_ps2xTraceAnchorAt{-1.0};
-#if defined(PS2X_NATIVE_HOST)
+#if PS2X_DIAG
 namespace ps2host
 {
     extern uint32_t g_autoAnchorPc;
@@ -1815,7 +1821,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
-#if defined(PS2X_NATIVE_HOST)
+#if PS2X_DIAG
     {
         extern void ps2RecordBranch(uint32_t source, uint32_t target, uint32_t ra, uint32_t sp);
         extern uint8_t *g_dbgRdram;
@@ -1891,7 +1897,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-#if defined(PS2X_NATIVE_HOST)
+#if PS2X_DIAG
     {
         // PS2X_CALL_TRACE=<substr>[,<substr>...]: log guest calls whose symbol matches (a0-a3, and
         // argv strings for (this, argc, argv) handlers such as the shell's On*_Tag callbacks).
@@ -1989,7 +1995,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         ctx->pc = fallthroughPc;
     }
 
-#if defined(PS2X_NATIVE_HOST)
+#if PS2X_DIAG
     {
         // PS2X_SPCHECK=1: a call that returns normally must leave sp as it found it.
         static const bool s_spCheck = std::getenv("PS2X_SPCHECK") != nullptr;
@@ -2704,7 +2710,7 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 // Debug aid: PS2X_EE_WATCH=<hex vaddr> logs guest stores (special-address path) that cover it.
 // Frame limiter threshold used by the patched ps2_wait_for_vsync (tools/patch_60fps.py): number of
 // VSyncs a game frame waits for. 1 = 60 fps when TargetFPS >= 60 (PS2X_FPS30=1 restores 30 fps).
-#if defined(PS2X_NATIVE_HOST)
+#if PS2X_DIAG
 // Last guest control transfers (calls via dispatchGuestBranch; scheduler dispatches have source
 // 0xEEEEEEEE), dumped when a branch lands on an unknown address.
 namespace
@@ -2720,7 +2726,6 @@ namespace
     std::atomic<uint32_t> g_hitchPos{0};
 }
 const EeScheduler *g_hitchScheduler = nullptr;
-std::atomic<double> g_hitchLastFlip{0.0};
 
 // A stall in progress (no flip for 100 ms): what every guest thread waits on.
 static void ps2HitchDumpThreads(double stallMs)
@@ -3384,8 +3389,10 @@ void PS2Runtime::run()
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
 #if defined(PS2X_NATIVE_HOST)
         {
+#if PS2X_DIAG
             extern const EeScheduler *g_hitchScheduler;
             g_hitchScheduler = m_eeScheduler.get();
+#endif
             {
                 // PS2X_P3_TRACE_AT=<sec>[,<events>]: arm the PATH3 trace (ps2_memory.cpp) once the clock passes <sec>.
                 static const char *s_p3At = std::getenv("PS2X_P3_TRACE_AT");

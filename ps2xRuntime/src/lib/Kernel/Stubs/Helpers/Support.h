@@ -1,12 +1,22 @@
 #include <algorithm>
 #include <cctype>
 #include "runtime/host_file_cache.h"
+#include "ps2_runtime_macros.h"
 
 // mod_menu.cpp: same-size fixes applied to disc file data as it is read (restored cut content).
 void ps2x_disc_file_patch(const std::filesystem::path &hostPath, uint64_t offset, uint8_t *dst, size_t byteCount);
 
 namespace
 {
+    inline int ps2x_fseek64(std::FILE *file, long long offset, int origin)
+    {
+#if defined(_WIN32)
+        return _fseeki64(file, offset, origin);
+#else
+        return fseeko(file, static_cast<off_t>(offset), origin);
+#endif
+    }
+
     constexpr uint32_t kCdSectorSize = 2048;
     constexpr uint32_t kCdPseudoLbnStart = 0x00100000;
 
@@ -475,7 +485,7 @@ namespace
         }
         slot->lastUse = ++s_useCounter;
 
-        if (_fseeki64(slot->file, static_cast<long long>(offsetBytes), SEEK_SET) != 0)
+        if (ps2x_fseek64(slot->file, static_cast<long long>(offsetBytes), SEEK_SET) != 0)
         {
             g_lastCdError = -1;
             return false;

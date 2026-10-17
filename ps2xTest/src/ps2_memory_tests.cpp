@@ -936,13 +936,18 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.isPath3Masked(), "PATH3 mask should be enabled");
 
             mem.submitGifPacket(GifPathId::Path3, packetA.data(), static_cast<uint32_t>(packetA.size()));
-            mem.submitGifPacket(GifPathId::Path3, packetB.data(), static_cast<uint32_t>(packetB.size()));
             t.Equals(captured.size(), static_cast<size_t>(0u), "masked PATH3 packets should be queued, not dropped/emitted");
+            // Fork (PS2X_P3_KICK_DRAIN, default on): a new masked GIF kick first releases packets still queued
+            // from the previous kick, since the channel cannot restart before its old chain has transferred.
+            mem.submitGifPacket(GifPathId::Path3, packetB.data(), static_cast<uint32_t>(packetB.size()));
+            t.Equals(captured.size(), static_cast<size_t>(1u),
+                     "a second masked PATH3 kick should release the packet queued by the previous kick and queue its own");
 
             const uint32_t clearMask = makeVifCmd(0x06u, 0u, 0x0000u);
             mem.processVIF1Data(reinterpret_cast<const uint8_t *>(&clearMask), sizeof(clearMask));
 
-            t.Equals(captured.size(), static_cast<size_t>(2u), "unmask should flush queued PATH3 packets");
+            // Fork releases exactly one queued packet per MSKPATH3 unmask (native_rendering_handoff.md section 6).
+            t.Equals(captured.size(), static_cast<size_t>(2u), "unmask should release the remaining queued PATH3 packet");
             bool firstOk = true;
             bool secondOk = true;
             for (uint32_t i = 0; i < 16u; ++i)
@@ -956,7 +961,9 @@ void register_ps2_memory_tests()
             t.IsTrue(secondOk, "second queued PATH3 packet should flush in-order");
         });
 
-        tc.Run("GIF arbiter prioritizes PATH1 then PATH2 then PATH3", [](TestCase &t)
+        // Fork drains in submission (guest kick) order; path-priority re-sorting moved PATH1 draws ahead of
+        // earlier PATH3 texture uploads (ps2_gif_arbiter.cpp; PS2X_GIF_PRIORITY_ORDER restores the old order).
+        tc.Run("GIF arbiter drains PATH1/PATH2/PATH3 packets in submission order", [](TestCase &t)
         {
             std::vector<uint8_t> order;
             GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
@@ -975,9 +982,9 @@ void register_ps2_memory_tests()
             arbiter.drain();
 
             t.Equals(order.size(), static_cast<size_t>(3u), "all queued packets should be drained");
-            t.Equals(order[0], static_cast<uint8_t>(0x11u), "PATH1 should be drained first");
-            t.Equals(order[1], static_cast<uint8_t>(0x22u), "PATH2 should be drained second");
-            t.Equals(order[2], static_cast<uint8_t>(0x33u), "PATH3 should be drained third");
+            t.Equals(order[0], static_cast<uint8_t>(0x33u), "PATH3 (submitted first) should be drained first");
+            t.Equals(order[1], static_cast<uint8_t>(0x22u), "PATH2 (submitted second) should be drained second");
+            t.Equals(order[2], static_cast<uint8_t>(0x11u), "PATH1 (submitted last) should be drained last");
         });
 
         tc.Run("VIF DIRECTHL stalls behind queued PATH3 IMAGE packets", [](TestCase &t)
