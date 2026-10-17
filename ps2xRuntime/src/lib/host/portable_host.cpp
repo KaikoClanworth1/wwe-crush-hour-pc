@@ -19,6 +19,10 @@ namespace ps2host
 
     const HostConfig &config() { return g_config; }
 
+    std::filesystem::path configPath() { return {}; }
+    int getSetting(Setting) { return 0; }
+    void setSetting(Setting, int) {}
+
     std::filesystem::path saveDirectory()
     {
         const char *dir = std::getenv("PS2X_SAVE_DIR");

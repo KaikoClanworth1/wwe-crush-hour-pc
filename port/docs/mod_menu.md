@@ -12,6 +12,14 @@
 - While the plank or the menu has the input, player 1's pad (and the keyboard) reports nothing to the game;
   buttons held through such a change stay masked until released (no stray "Return" on the main menu).
 
+## Settings page
+
+LB / RB switch the panel between MODS and SETTINGS. The settings page changes the host settings live and writes them
+back to `ps2x_settings.ini` (`ps2host::setSetting`): master / effects / commentary / movie volume (LEFT / RIGHT in
+steps of 10, A steps up and wraps), fullscreen, VSync, the FPS counter, and the frame rate (30 / 60) and widescreen,
+which apply on the next start. The settings file is found in the working directory, then next to the executable
+and in its `GameFiles` folder; `Mods/` is the folder next to it.
+
 ## Main menu state
 
 `Shell::Update` (0x1d7bd0) calls `ps2x_modmenu_shell(rdram, this)` first: Shell + 0x109C is the active menu (0 =

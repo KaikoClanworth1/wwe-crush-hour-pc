@@ -65,7 +65,27 @@ namespace ps2host
     };
 
     const HostConfig &config();
+    // Loads the settings file. A relative name is looked up in the working directory, then next to the executable
+    // and in its GameFiles folder, so the game also starts without a launcher setting the working directory.
     bool loadConfig(const char *iniPath);
+    // The settings file in use (or where it will be written when none was found); its folder also holds Mods.
+    std::filesystem::path configPath();
+
+    // Settings page (mod menu): read / change a setting live and write it back to the settings file.
+    enum class Setting
+    {
+        ShowFps,
+        VSync,
+        Fullscreen,
+        TargetFps,  // applies on restart
+        Widescreen, // applies on restart
+        MasterVolume,
+        EffectsVolume,
+        CommentaryVolume,
+        MovieVolume,
+    };
+    int getSetting(Setting setting);
+    void setSetting(Setting setting, int value);
 
     // Folder that holds the player's memory card folders (mc0, mc1): PS2X_SAVE_DIR, else [Saves] Folder, else the
     // platform's save location (Windows: Saved Games\WWE Crush Hour). Empty = no host default (saves stay next

@@ -57,7 +57,7 @@ Keyboard (acts as player 1):
   Alt+Enter     toggle fullscreen   F1           FPS counter on/off
   F2            mod menu (BACK + RB on a controller)
 
-Settings  (GameFiles\ps2x_settings.ini)
+Settings  (GameFiles\ps2x_settings.ini, or in game: mod menu, LB / RB to the SETTINGS page)
 --------
   Width / Height   window size (default 1920x1080; up to 3840x2160)
   Fullscreen=1     start in borderless fullscreen at the monitor's resolution (4K on a 4K screen)

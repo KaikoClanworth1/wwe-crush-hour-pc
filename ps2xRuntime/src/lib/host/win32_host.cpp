@@ -153,6 +153,7 @@ namespace ps2host
 
         // FPS counter: on-screen box (F1 toggles, ShowFPS in [Display]) and the window title.
         bool g_showFps = true;
+        std::filesystem::path g_configPath; // settings file in use (loadConfig)
         std::wstring g_baseTitle;
         std::atomic<int> g_titleFps{-1}, g_titleGameFps{-1};
         int g_shownTitleFps = -2, g_shownTitleGameFps = -2;
@@ -194,6 +195,29 @@ float4 ps_main(VsOut i) : SV_Target
             return w;
         }
 
+        constexpr UINT kMsgSetFullscreen = WM_APP + 1; // wParam: fullscreen on/off (setSetting)
+
+        void applyFullscreen(HWND hwnd, bool fullscreen)
+        {
+            g_config.fullscreen = fullscreen;
+            LONG style = fullscreen ? (WS_POPUP | WS_VISIBLE) : (WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+            if (fullscreen)
+            {
+                MONITORINFO mi{sizeof(mi)};
+                GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+                SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                             mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                             SWP_FRAMECHANGED);
+            }
+            else
+            {
+                RECT r{0, 0, (LONG)g_config.width, (LONG)g_config.height};
+                AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+                SetWindowPos(hwnd, HWND_TOP, 64, 64, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED);
+            }
+        }
+
         LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             switch (msg)
@@ -204,6 +228,9 @@ float4 ps_main(VsOut i) : SV_Target
             case WM_DESTROY:
                 g_quit.store(true);
                 PostQuitMessage(0);
+                return 0;
+            case kMsgSetFullscreen:
+                applyFullscreen(hwnd, wp != 0);
                 return 0;
             case WM_KEYDOWN:
             case WM_SYSKEYDOWN:
@@ -217,23 +244,7 @@ float4 ps_main(VsOut i) : SV_Target
                 if (wp == VK_RETURN && (lp & (1 << 29)))
                 {
                     // Alt+Enter toggles borderless fullscreen.
-                    g_config.fullscreen = !g_config.fullscreen;
-                    LONG style = g_config.fullscreen ? (WS_POPUP | WS_VISIBLE) : (WS_OVERLAPPEDWINDOW | WS_VISIBLE);
-                    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
-                    if (g_config.fullscreen)
-                    {
-                        MONITORINFO mi{sizeof(mi)};
-                        GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-                        SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-                                     mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-                                     SWP_FRAMECHANGED);
-                    }
-                    else
-                    {
-                        RECT r{0, 0, (LONG)g_config.width, (LONG)g_config.height};
-                        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-                        SetWindowPos(hwnd, HWND_TOP, 64, 64, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED);
-                    }
+                    applyFullscreen(hwnd, !g_config.fullscreen);
                     return 0;
                 }
                 break;
@@ -690,14 +701,124 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         return result;
     }
 
-    bool loadConfig(const char *iniPath)
+    std::filesystem::path configPath() { return g_configPath; }
+
+    namespace
     {
-        if (!iniPath || GetFileAttributesA(iniPath) == INVALID_FILE_ATTRIBUTES)
+        void writeSetting(const wchar_t *section, const wchar_t *key, int value)
+        {
+            if (g_configPath.empty())
+                return;
+            WritePrivateProfileStringW(section, key, std::to_wstring(value).c_str(), g_configPath.c_str());
+        }
+    }
+
+    int getSetting(Setting setting)
+    {
+        switch (setting)
+        {
+        case Setting::ShowFps: return g_showFps ? 1 : 0;
+        case Setting::VSync: return g_config.vsync ? 1 : 0;
+        case Setting::Fullscreen: return g_config.fullscreen ? 1 : 0;
+        case Setting::TargetFps: return static_cast<int>(g_config.targetFps);
+        case Setting::Widescreen: return g_config.widescreen ? 1 : 0;
+        case Setting::MasterVolume: return static_cast<int>(g_config.masterVolume);
+        case Setting::EffectsVolume: return static_cast<int>(g_config.effectsVolume);
+        case Setting::CommentaryVolume: return static_cast<int>(g_config.commentaryVolume);
+        case Setting::MovieVolume: return static_cast<int>(g_config.movieVolume);
+        }
+        return 0;
+    }
+
+    void setSetting(Setting setting, int value)
+    {
+        const uint32_t volume = static_cast<uint32_t>(std::clamp(value, 0, 100));
+        switch (setting)
+        {
+        case Setting::ShowFps:
+            g_showFps = value != 0;
+            writeSetting(L"Display", L"ShowFPS", value != 0);
+            break;
+        case Setting::VSync:
+            g_config.vsync = value != 0;
+            writeSetting(L"Display", L"VSync", value != 0);
+            break;
+        case Setting::Fullscreen:
+            // From the input thread: the window belongs to the message thread, so post the change there.
+            if (g_hwnd && (value != 0) != g_config.fullscreen)
+                PostMessageW(g_hwnd, kMsgSetFullscreen, value != 0, 0);
+            writeSetting(L"Display", L"Fullscreen", value != 0);
+            break;
+        case Setting::TargetFps:
+            g_config.targetFps = value >= 60 ? 60u : 30u;
+            writeSetting(L"Display", L"TargetFPS", static_cast<int>(g_config.targetFps));
+            break;
+        case Setting::Widescreen:
+            g_config.widescreen = value != 0;
+            writeSetting(L"Display", L"Widescreen", value != 0);
+            break;
+        case Setting::MasterVolume:
+        {
+            g_config.masterVolume = volume;
+            std::lock_guard lock(g_audioMutex);
+            const char *mute = std::getenv("PS2X_MUTE");
+            if (g_master && !(mute && *mute && *mute != '0'))
+                g_master->SetVolume(static_cast<float>(volume) / 100.0f);
+            writeSetting(L"Audio", L"MasterVolume", static_cast<int>(volume));
+            break;
+        }
+        case Setting::EffectsVolume:
+            g_config.effectsVolume = volume;
+            writeSetting(L"Audio", L"EffectsVolume", static_cast<int>(volume));
+            break;
+        case Setting::CommentaryVolume:
+            g_config.commentaryVolume = volume;
+            writeSetting(L"Audio", L"CommentaryVolume", static_cast<int>(volume));
+            break;
+        case Setting::MovieVolume:
+            g_config.movieVolume = volume;
+            writeSetting(L"Audio", L"MovieVolume", static_cast<int>(volume));
+            break;
+        }
+    }
+
+    bool loadConfig(const char *iniName)
+    {
+        if (!iniName)
             return false;
-        // GetPrivateProfile* looks a relative file name up in the Windows directory, not the working directory.
-        char fullPath[MAX_PATH];
-        if (GetFullPathNameA(iniPath, MAX_PATH, fullPath, nullptr) != 0)
-            iniPath = fullPath;
+        // The working directory (the old launcher cd'd into GameFiles), then next to the executable.
+        std::vector<std::filesystem::path> candidates;
+        std::error_code ec;
+        const std::filesystem::path name(iniName);
+        candidates.push_back(std::filesystem::absolute(name, ec));
+        if (name.is_relative())
+        {
+            wchar_t exe[MAX_PATH];
+            const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            if (n > 0 && n < MAX_PATH)
+            {
+                const std::filesystem::path exeDir = std::filesystem::path(exe).parent_path();
+                candidates.push_back(exeDir / "GameFiles" / name);
+                candidates.push_back(exeDir / name);
+            }
+        }
+        g_configPath.clear();
+        for (const auto &candidate : candidates)
+            if (std::filesystem::is_regular_file(candidate, ec))
+            {
+                g_configPath = candidate;
+                break;
+            }
+        if (g_configPath.empty())
+        {
+            // None yet: the settings page writes one where the game files are (or the working directory).
+            g_configPath = candidates.size() > 1 && std::filesystem::is_directory(candidates[1].parent_path(), ec)
+                               ? candidates[1]
+                               : candidates[0];
+            return false;
+        }
+        const std::string pathA = g_configPath.string(); // GetPrivateProfile*A: needs an absolute path
+        const char *iniPath = pathA.c_str();
         g_config.width = GetPrivateProfileIntA("Display", "Width", g_config.width, iniPath);
         g_config.height = GetPrivateProfileIntA("Display", "Height", g_config.height, iniPath);
         g_config.fullscreen = GetPrivateProfileIntA("Display", "Fullscreen", g_config.fullscreen, iniPath) != 0;

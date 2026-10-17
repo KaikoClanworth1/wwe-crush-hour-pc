@@ -293,7 +293,12 @@ namespace
         flush();
     }
 
-    std::filesystem::path modsDir() { return std::filesystem::path("Mods"); }
+    // Next to the settings file (GameFiles), wherever the game was started from.
+    std::filesystem::path modsDir()
+    {
+        const std::filesystem::path ini = ps2host::configPath();
+        return ini.empty() ? std::filesystem::path("Mods") : ini.parent_path() / "Mods";
+    }
 
     std::set<std::string> readEnabled()
     {
@@ -544,6 +549,59 @@ namespace
     std::atomic<bool> g_openFromPlank{false};
     std::atomic<uint32_t> g_dirty{1};     // panel needs a redraw
     int g_cursor = 0, g_scroll = 0;       // host thread
+    int g_page = 0;                       // 0 = mods, 1 = settings (LB / RB switch)
+    int g_setCursor = 0;
+
+    // ------------------------------------------------------------------------------------------------ settings page
+    struct SettingItem
+    {
+        ps2host::Setting id;
+        const char *name, *desc;
+        enum Kind { kOnOff, kFps, kVolume } kind;
+    };
+    constexpr SettingItem kSettings[] = {
+        {ps2host::Setting::MasterVolume, "Master volume", "Scales all game audio.", SettingItem::kVolume},
+        {ps2host::Setting::EffectsVolume, "Effects volume", "Engines, crashes, weapons and the crowd.", SettingItem::kVolume},
+        {ps2host::Setting::CommentaryVolume, "Commentary volume", "The commentator.", SettingItem::kVolume},
+        {ps2host::Setting::MovieVolume, "Movie volume", "Intro and entrance movies.", SettingItem::kVolume},
+        {ps2host::Setting::Fullscreen, "Fullscreen", "Borderless fullscreen on the current monitor (Alt+Enter).", SettingItem::kOnOff},
+        {ps2host::Setting::VSync, "VSync", "Wait for the display refresh (no tearing).", SettingItem::kOnOff},
+        {ps2host::Setting::ShowFps, "FPS counter", "Frames shown / game frames per second in the corner (F1).", SettingItem::kOnOff},
+        {ps2host::Setting::TargetFps, "Frame rate", "60 fps, or 30 for the original pacing. Applies on the next start.", SettingItem::kFps},
+        {ps2host::Setting::Widescreen, "Widescreen", "16:9 3D view with the HUD kept in proportion. Applies on the next start.", SettingItem::kOnOff},
+    };
+    constexpr int kSettingCount = static_cast<int>(sizeof(kSettings) / sizeof(kSettings[0]));
+
+    std::string settingValue(const SettingItem &item)
+    {
+        const int v = ps2host::getSetting(item.id);
+        switch (item.kind)
+        {
+        case SettingItem::kOnOff: return v ? "ON" : "OFF";
+        case SettingItem::kFps: return v >= 60 ? "60" : "30";
+        case SettingItem::kVolume: return std::to_string(v) + "%";
+        }
+        return {};
+    }
+
+    // LEFT / RIGHT step a value (volumes by 10); A steps forward and wraps.
+    void adjustSetting(const SettingItem &item, int dir, bool wrap)
+    {
+        const int v = ps2host::getSetting(item.id);
+        switch (item.kind)
+        {
+        case SettingItem::kOnOff: ps2host::setSetting(item.id, v ? 0 : 1); break;
+        case SettingItem::kFps: ps2host::setSetting(item.id, v >= 60 ? 30 : 60); break;
+        case SettingItem::kVolume:
+        {
+            int next = v + dir * 10;
+            if (wrap && next > 100)
+                next = 0;
+            ps2host::setSetting(item.id, std::clamp(next, 0, 100));
+            break;
+        }
+        }
+    }
     uint16_t g_prevButtons = 0, g_suppress = 0;
     double g_repeatAt = 0.0;
     uint16_t g_repeatButton = 0;
@@ -571,6 +629,7 @@ namespace
     {
         std::string name, desc, source;
         bool on = false, missing = false;
+        std::string value; // settings page: shown in the badge instead of ON / OFF
     };
 
     std::wstring widen(const std::string &s)
@@ -583,8 +642,8 @@ namespace
         return w;
     }
 
-    void renderPanel(uint32_t outH, const std::vector<Row> &rows, int cursor, int scroll, std::vector<uint32_t> &px,
-                     uint32_t &W, uint32_t &H)
+    void renderPanel(uint32_t outH, int page, const std::vector<Row> &rows, int cursor, int scroll,
+                     std::vector<uint32_t> &px, uint32_t &W, uint32_t &H)
     {
         const float s = std::clamp(static_cast<float>(outH) / 1080.0f, 0.6f, 3.0f);
         auto S = [&](float v) { return static_cast<int>(v * s + 0.5f); };
@@ -651,13 +710,23 @@ namespace
         HFONT fSmall = font(L"Arial", S(18), FW_NORMAL, true);
         HFONT fBtn = font(L"Arial", S(20), FW_BOLD);
 
-        text(fTitle, L"MODS", RECT{S(36), S(18), S(500), S(90)}, RGB(154, 162, 255), DT_LEFT | DT_TOP | DT_SINGLELINE);
-        int onCount = 0;
-        for (const Row &r : rows)
-            onCount += r.on ? 1 : 0;
-        wchar_t cnt[64];
-        std::swprintf(cnt, 64, L"%d of %d on", onCount, static_cast<int>(rows.size()));
-        text(fSmall, cnt, RECT{S(400), S(46), static_cast<int>(W) - S(36), S(80)}, RGB(150, 152, 165), DT_RIGHT | DT_TOP | DT_SINGLELINE);
+        // Two tabs: the active one in the title colour, the other dimmed (LB / RB switch).
+        text(fTitle, L"MODS", RECT{S(36), S(18), S(260), S(90)}, page == 0 ? RGB(154, 162, 255) : RGB(70, 74, 96),
+             DT_LEFT | DT_TOP | DT_SINGLELINE);
+        text(fTitle, L"SETTINGS", RECT{S(210), S(18), S(560), S(90)}, page == 1 ? RGB(154, 162, 255) : RGB(70, 74, 96),
+             DT_LEFT | DT_TOP | DT_SINGLELINE);
+        if (page == 0)
+        {
+            int onCount = 0;
+            for (const Row &r : rows)
+                onCount += r.on ? 1 : 0;
+            wchar_t cnt[64];
+            std::swprintf(cnt, 64, L"%d of %d on", onCount, static_cast<int>(rows.size()));
+            text(fSmall, cnt, RECT{S(560), S(46), static_cast<int>(W) - S(36), S(80)}, RGB(150, 152, 165), DT_RIGHT | DT_TOP | DT_SINGLELINE);
+        }
+        else
+            text(fSmall, L"saved to ps2x_settings.ini", RECT{S(560), S(46), static_cast<int>(W) - S(36), S(80)},
+                 RGB(150, 152, 165), DT_RIGHT | DT_TOP | DT_SINGLELINE);
         fill(S(30), S(94), static_cast<int>(W) - S(30), S(96), RGB(70, 92, 210));
 
         const int kVisible = visible;
@@ -672,10 +741,11 @@ namespace
             const std::wstring name = widen(r.name) + (r.missing ? L"  (file removed)" : L"");
             text(fRow, name, RECT{S(44), y, static_cast<int>(W) - S(150), y + rowH},
                  sel ? RGB(236, 238, 255) : RGB(205, 207, 215), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            const int bx1 = static_cast<int>(W) - S(44), bx0 = bx1 - S(78);
+            const int bx1 = static_cast<int>(W) - S(44), bx0 = bx1 - S(r.value.empty() ? 78.0f : 96.0f);
             rrect(bx0, y + S(10), bx1, y + rowH - S(10), S(10), r.on ? RGB(40, 165, 85) : RGB(52, 54, 64),
                   r.on ? RGB(90, 215, 130) : RGB(80, 82, 94), S(2));
-            text(fBadge, r.on ? L"ON" : L"OFF", RECT{bx0, y + S(10), bx1, y + rowH - S(10)},
+            const std::wstring badge = r.value.empty() ? std::wstring(r.on ? L"ON" : L"OFF") : widen(r.value);
+            text(fBadge, badge, RECT{bx0, y + S(10), bx1, y + rowH - S(10)},
                  r.on ? RGB(255, 255, 255) : RGB(150, 152, 165), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         if (scroll > 0)
@@ -714,10 +784,10 @@ namespace
             return x + S(38) + S(static_cast<float>(wcslen(label)) * 12.0f) + S(30);
         };
         int bx = S(40);
-        bx = btn(bx, RGB(60, 170, 60), L"A", L"Toggle");
+        bx = btn(bx, RGB(60, 170, 60), L"A", page == 0 ? L"Toggle" : L"Change");
         bx = btn(bx, RGB(200, 40, 40), L"B", L"Back");
-        text(fSmall, L"Add mods: .pnach files in the Mods folder", RECT{bx, fy, static_cast<int>(W) - S(36), fy + S(30)},
-             RGB(120, 122, 136), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        text(fSmall, page == 0 ? L"LB / RB: settings   Add mods: .pnach files in the Mods folder" : L"LB / RB: mods   LEFT / RIGHT: change",
+             RECT{bx, fy, static_cast<int>(W) - S(36), fy + S(30)}, RGB(120, 122, 136), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 
         for (HFONT f : {fTitle, fRow, fBadge, fDesc, fSmall, fBtn})
             DeleteObject(f);
@@ -1106,7 +1176,14 @@ namespace modmenu
         if (g_open.load())
         {
             std::lock_guard<std::mutex> lock(g_mx);
-            const int n = static_cast<int>(g_mods.size());
+            if (!hotkey && (pressed & (kBtnL1 | kBtnR1)))
+            {
+                g_page ^= 1;
+                g_dirty.fetch_add(1);
+                takeInput();
+                return;
+            }
+            const int n = g_page == 0 ? static_cast<int>(g_mods.size()) : kSettingCount;
             // Held UP / DOWN repeat after 0.4 s, every 0.09 s.
             uint16_t nav = pressed & (kBtnUp | kBtnDown);
             const uint16_t held = b & (kBtnUp | kBtnDown);
@@ -1120,7 +1197,21 @@ namespace modmenu
                 nav = held;
                 g_repeatAt = nowSec() + 0.09;
             }
-            if (n > 0)
+            if (g_page == 1)
+            {
+                if (nav & kBtnUp)
+                    g_setCursor = (g_setCursor + n - 1) % n;
+                if (nav & kBtnDown)
+                    g_setCursor = (g_setCursor + 1) % n;
+                const SettingItem &item = kSettings[g_setCursor];
+                if (pressed & kBtnLeft)
+                    adjustSetting(item, -1, false);
+                else if (pressed & kBtnRight)
+                    adjustSetting(item, 1, false);
+                else if (pressed & kBtnCross)
+                    adjustSetting(item, 1, true);
+            }
+            else if (n > 0)
             {
                 if (nav & kBtnUp)
                     g_cursor = (g_cursor + n - 1) % n;
@@ -1213,16 +1304,32 @@ namespace modmenu
         if (gen != g_panel.gen || outH != g_panel.outH)
         {
             std::vector<Row> rows;
-            int cursor, scroll;
+            int cursor, scroll, page;
             {
                 std::lock_guard<std::mutex> lock(g_mx);
-                for (const Mod &m : g_mods)
-                    rows.push_back({m.name, m.description, m.source, m.enabled, m.missing});
-                g_cursor = std::clamp(g_cursor, 0, std::max(0, static_cast<int>(rows.size()) - 1));
-                cursor = g_cursor;
-                scroll = g_scroll;
+                page = g_page;
+                if (page == 0)
+                {
+                    for (const Mod &m : g_mods)
+                        rows.push_back({m.name, m.description, m.source, m.enabled, m.missing, {}});
+                    g_cursor = std::clamp(g_cursor, 0, std::max(0, static_cast<int>(rows.size()) - 1));
+                    cursor = g_cursor;
+                    scroll = g_scroll;
+                }
+                else
+                {
+                    const std::string source = "Settings: " + ps2host::configPath().filename().string();
+                    for (const SettingItem &item : kSettings)
+                    {
+                        const int v = ps2host::getSetting(item.id);
+                        const bool lit = item.kind == SettingItem::kVolume ? v > 0 : (item.kind == SettingItem::kFps ? v >= 60 : v != 0);
+                        rows.push_back({item.name, item.desc, source, lit, false, settingValue(item)});
+                    }
+                    cursor = g_setCursor;
+                    scroll = std::clamp(g_setCursor - 7, 0, std::max(0, kSettingCount - 8));
+                }
             }
-            renderPanel(outH, rows, cursor, scroll, g_panel.px, g_panel.w, g_panel.h);
+            renderPanel(outH, page, rows, cursor, scroll, g_panel.px, g_panel.w, g_panel.h);
             g_panel.gen = gen;
             g_panel.outH = outH;
             changed = true;
