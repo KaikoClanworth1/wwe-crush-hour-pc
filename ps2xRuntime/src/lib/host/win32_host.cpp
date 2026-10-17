@@ -14,6 +14,7 @@
 #include <dxgi1_3.h>
 #include <xaudio2.h>
 #include <Xinput.h>
+#include <shlobj.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -37,6 +38,8 @@ extern std::atomic<double> g_hitchLastFlip; // ps2_runtime.cpp (PS2X_HITCH_LOG):
 #pragma comment(lib, "xaudio2.lib")
 #pragma comment(lib, "xinput.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -673,6 +676,20 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
 
     const HostConfig &config() { return g_config; }
 
+    std::filesystem::path saveDirectory()
+    {
+        if (const wchar_t *dir = _wgetenv(L"PS2X_SAVE_DIR"); dir && *dir)
+            return dir;
+        if (!g_config.saveFolder.empty())
+            return g_config.saveFolder;
+        PWSTR savedGames = nullptr;
+        std::filesystem::path result;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_SavedGames, KF_FLAG_CREATE, nullptr, &savedGames)))
+            result = std::filesystem::path(savedGames) / L"WWE Crush Hour";
+        CoTaskMemFree(savedGames);
+        return result;
+    }
+
     bool loadConfig(const char *iniPath)
     {
         if (!iniPath || GetFileAttributesA(iniPath) == INVALID_FILE_ATTRIBUTES)
@@ -693,6 +710,12 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         g_config.effectsVolume = GetPrivateProfileIntA("Audio", "EffectsVolume", g_config.effectsVolume, iniPath);
         g_config.commentaryVolume = GetPrivateProfileIntA("Audio", "CommentaryVolume", g_config.commentaryVolume, iniPath);
         g_config.movieVolume = GetPrivateProfileIntA("Audio", "MovieVolume", g_config.movieVolume, iniPath);
+        {
+            wchar_t widePath[MAX_PATH], folder[MAX_PATH];
+            if (MultiByteToWideChar(CP_ACP, 0, iniPath, -1, widePath, MAX_PATH) != 0 &&
+                GetPrivateProfileStringW(L"Saves", L"Folder", L"", folder, MAX_PATH, widePath) > 0)
+                g_config.saveFolder = folder;
+        }
         // InternalScale=N: the GS is rendered at N x the PS2 resolution (640x448 -> 1920x1344 at 3), 1..6;
         // 0 = from the output size (init). The GS backend reads PS2X_GS_SCALE when it starts (an explicit
         // PS2X_GS_SCALE wins).

@@ -5,6 +5,7 @@
 #include "host/win32_host.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <cstddef>
 #include <filesystem>
 
@@ -17,6 +18,12 @@ namespace ps2host
     }
 
     const HostConfig &config() { return g_config; }
+
+    std::filesystem::path saveDirectory()
+    {
+        const char *dir = std::getenv("PS2X_SAVE_DIR");
+        return (dir && *dir) ? std::filesystem::path(dir) : std::filesystem::path();
+    }
     bool loadConfig(const char *) { return false; }
 
     bool isReady() { return false; }

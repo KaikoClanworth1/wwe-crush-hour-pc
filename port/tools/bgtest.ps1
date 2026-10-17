@@ -22,6 +22,8 @@ New-Item -ItemType Directory -Force $out | Out-Null
 Get-ChildItem env: | Where-Object { $_.Name -like "PS2X_*" } | ForEach-Object { Remove-Item "env:$($_.Name)" }
 $env:PS2X_BACKGROUND = "1"
 $env:PS2X_MUTE = "1"
+# Test runs keep using the dev tree's memory cards (GameFiles\mc0), not the player's Saved Games folder.
+$env:PS2X_SAVE_DIR = "$root\GameFiles"
 $env:PS2X_SCREENSHOT_DIR = "$out\shots"
 $env:PS2X_SCREENSHOT_SEC = "$ShotSec"
 $env:PS2X_AUTOINPUT = $AutoInput

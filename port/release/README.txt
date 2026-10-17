@@ -71,4 +71,10 @@ Settings  (GameFiles\ps2x_settings.ini)
   InternalScale=0  render resolution: 0 = automatic from the window / screen size (1080p -> 3x,
                    1440p -> 4x, 4K -> 6x the PS2's 640x448); 1..6 = fixed (1 = original sharpness)
 
-Saves are stored in GameFiles\mc0\.
+  [Audio] MasterVolume / EffectsVolume / CommentaryVolume / MovieVolume   0..100 (percent)
+  [Saves] Folder   where saves are kept (default: Saved Games\WWE Crush Hour)
+
+Saves are stored in %USERPROFILE%\Saved Games\WWE Crush Hour\mc0\ (backed up by OneDrive / cloud sync
+like other games). Saves from an older version in GameFiles\mc0\ are copied there on the first start;
+the old folder is left as it was. Saving writes a copy and swaps it in, so a crash mid-save keeps the
+previous save.

@@ -79,7 +79,65 @@ namespace ps2_stubs
             FILE *file = nullptr;
             int32_t port = 0;
             std::filesystem::path hostPath;
+            // Write handles edit a copy (hostPath + kMcTempSuffix) that replaces the file on close, so a crash or
+            // power loss mid-save leaves the previous save intact instead of a half-written one.
+            std::filesystem::path tempPath;
         };
+
+        constexpr const char *kMcTempSuffix = ".ps2xtmp";
+
+        bool isMcTempFile(const std::filesystem::path &path)
+        {
+            const std::string name = path.filename().string();
+            const size_t n = std::char_traits<char>::length(kMcTempSuffix);
+            return name.size() > n && name.compare(name.size() - n, n, kMcTempSuffix) == 0;
+        }
+
+        FILE *openHostFile(const std::filesystem::path &path, const char *mode)
+        {
+#if defined(_WIN32)
+            // Wide path: the user's profile folder can contain characters outside the ANSI code page.
+            const std::wstring wideMode(mode, mode + std::char_traits<char>::length(mode));
+            return _wfopen(path.c_str(), wideMode.c_str());
+#else
+            return std::fopen(path.c_str(), mode);
+#endif
+        }
+
+        // Closes a handle; a write handle's copy then replaces the real file. Returns false if either failed.
+        bool closeMcOpenFile(McOpenFile &openFile)
+        {
+            bool ok = true;
+            if (openFile.file)
+            {
+                ok = std::fflush(openFile.file) == 0;
+                ok = std::fclose(openFile.file) == 0 && ok;
+                openFile.file = nullptr;
+            }
+            if (!openFile.tempPath.empty())
+            {
+                std::error_code ec;
+                if (ok)
+                    std::filesystem::rename(openFile.tempPath, openFile.hostPath, ec); // replaces the old file
+                if (!ok || ec)
+                {
+                    std::filesystem::remove(openFile.tempPath, ec);
+                    ok = false;
+                }
+                openFile.tempPath.clear();
+            }
+            return ok;
+        }
+
+        // Copies left behind by a crash: the real files are intact, the copies only get in the way (a save
+        // folder holding one is not empty and could not be deleted).
+        void removeMcTempFiles(const std::filesystem::path &dir)
+        {
+            std::error_code ec;
+            for (const auto &entry : std::filesystem::directory_iterator(dir, ec))
+                if (isMcTempFile(entry.path()))
+                    std::filesystem::remove(entry.path(), ec);
+        }
 
         struct McPortState
         {
@@ -375,13 +433,7 @@ namespace ps2_stubs
         void closeMcFilesLocked()
         {
             for (auto &[fd, openFile] : g_mcFiles)
-            {
-                if (openFile.file)
-                {
-                    std::fclose(openFile.file);
-                    openFile.file = nullptr;
-                }
-            }
+                closeMcOpenFile(openFile);
             g_mcFiles.clear();
         }
 
@@ -391,10 +443,7 @@ namespace ps2_stubs
             {
                 if (it->second.port == port)
                 {
-                    if (it->second.file)
-                    {
-                        std::fclose(it->second.file);
-                    }
+                    closeMcOpenFile(it->second);
                     it = g_mcFiles.erase(it);
                 }
                 else
@@ -404,7 +453,8 @@ namespace ps2_stubs
             }
         }
 
-        int32_t allocateMcFdLocked(FILE *file, int32_t port, const std::filesystem::path &hostPath)
+        int32_t allocateMcFdLocked(FILE *file, int32_t port, const std::filesystem::path &hostPath,
+                                   const std::filesystem::path &tempPath)
         {
             if (!file)
             {
@@ -428,15 +478,18 @@ namespace ps2_stubs
                     continue;
                 }
 
-                g_mcFiles.emplace(fd, McOpenFile{file, port, hostPath});
+                g_mcFiles.emplace(fd, McOpenFile{file, port, hostPath, tempPath});
                 return fd;
             }
 
             return kMcResultUpLimitHandle;
         }
 
-        FILE *openMcHostFile(const std::filesystem::path &hostPath, uint32_t flags)
+        // Opens a memory card file; for write access the returned handle is on a copy (tempPath, empty for
+        // read-only handles) that closeMcOpenFile moves over hostPath.
+        FILE *openMcHostFile(const std::filesystem::path &hostPath, uint32_t flags, std::filesystem::path &tempPath)
         {
+            tempPath.clear();
             const uint32_t access = flags & PS2_FIO_O_RDWR;
             const bool create = (flags & PS2_FIO_O_CREAT) != 0u;
             // libmc accepts a bare SCE_CREAT (no access bits) and opens the new file read/write.
@@ -480,7 +533,27 @@ namespace ps2_stubs
                 }
             }
 
-            return std::fopen(hostPath.string().c_str(), mode);
+            if (!write)
+                return openHostFile(hostPath, mode);
+            tempPath = hostPath;
+            tempPath += kMcTempSuffix;
+            const bool keepsContents = mode[0] == 'a' || mode[0] == 'r'; // append / update in place
+            if (keepsContents && exists)
+            {
+                std::filesystem::copy_file(hostPath, tempPath, std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec)
+                {
+                    tempPath.clear();
+                    return nullptr;
+                }
+            }
+            FILE *file = openHostFile(tempPath, mode);
+            if (!file)
+            {
+                std::filesystem::remove(tempPath, ec);
+                tempPath.clear();
+            }
+            return file;
         }
     }
 
@@ -576,7 +649,7 @@ namespace ps2_stubs
             auto it = g_mcFiles.find(fd);
             if (it != g_mcFiles.end())
             {
-                if (!it->second.file || std::fclose(it->second.file) == 0)
+                if (closeMcOpenFile(it->second))
                 {
                     result = kMcResultSucceed;
                 }
@@ -612,6 +685,8 @@ namespace ps2_stubs
                         std::error_code ec;
                         if (std::filesystem::exists(hostPath, ec) && !ec)
                         {
+                            if (std::filesystem::is_directory(hostPath, ec))
+                                removeMcTempFiles(hostPath);
                             if (std::filesystem::is_directory(hostPath, ec) &&
                                 !std::filesystem::is_empty(hostPath, ec))
                             {
@@ -792,6 +867,10 @@ namespace ps2_stubs
                             if (ec)
                             {
                                 break;
+                            }
+                            if (isMcTempFile(entry.path()))
+                            {
+                                continue; // an open write handle's copy, or one left by a crash
                             }
                             dirEntries.push_back(entry);
                         }
@@ -1028,17 +1107,21 @@ namespace ps2_stubs
                     }
                     else
                     {
-                        FILE *file = openMcHostFile(hostPath, flags);
+                        std::filesystem::path tempPath;
+                        FILE *file = openMcHostFile(hostPath, flags, tempPath);
                         if (!file)
                         {
                             result = exists ? kMcResultDeniedPermit : kMcResultNoEntry;
                         }
                         else
                         {
-                            result = allocateMcFdLocked(file, port, hostPath);
+                            result = allocateMcFdLocked(file, port, hostPath, tempPath);
                             if (result < 0)
                             {
                                 std::fclose(file);
+                                std::error_code removeEc;
+                                if (!tempPath.empty())
+                                    std::filesystem::remove(tempPath, removeEc);
                             }
                         }
                     }

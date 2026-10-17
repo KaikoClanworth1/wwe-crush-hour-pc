@@ -543,6 +543,56 @@ void register_ps2_runtime_io_tests()
             t.IsTrue(std::filesystem::exists(hostPath), "sceMcOpen/sceMcWrite should create the host file under mcRoot");
         });
 
+        tc.Run("sceMc writes replace the save file only on close", [](TestCase &t)
+        {
+            TestContext test;
+
+            const uint32_t fileAddr = GUEST_STRING_AREA_START + 0x500;
+            const uint32_t writeBufAddr = GUEST_BUFFER_AREA_START + 0x300;
+            const std::filesystem::path hostPath = test.paths.mcRoot / "atomic.bin";
+            const std::filesystem::path tempPath = test.paths.mcRoot / "atomic.bin.ps2xtmp";
+            std::filesystem::create_directories(test.paths.mcRoot);
+            {
+                std::ofstream old(hostPath, std::ios::binary);
+                old << "old save";
+            }
+            writeGuestString(test.rdram.data(), fileAddr, "/atomic.bin");
+            const std::string payload = "new";
+            std::memcpy(test.rdram.data() + writeBufAddr, payload.data(), payload.size());
+
+            int32_t cmd = 0;
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, fileAddr);
+            setRegU32(test.ctx, 7, PS2_FIO_O_RDWR); // update in place: keeps the bytes it does not overwrite
+            ps2_stubs::sceMcOpen(test.rdram.data(), &test.ctx, nullptr);
+            const int32_t fd = syncMc(test.rdram, &cmd);
+            t.IsTrue(fd > 0, "sceMcOpen should open the existing save for update");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            setRegU32(test.ctx, 5, writeBufAddr);
+            setRegU32(test.ctx, 6, static_cast<uint32_t>(payload.size()));
+            ps2_stubs::sceMcWrite(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), static_cast<int32_t>(payload.size()), "sceMcWrite should write the payload");
+
+            auto readHost = [](const std::filesystem::path &path)
+            {
+                std::ifstream in(path, std::ios::binary);
+                return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            };
+            t.Equals(readHost(hostPath), std::string("old save"), "the save file should be untouched until close");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            ps2_stubs::sceMcClose(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcClose should finish successfully");
+
+            t.Equals(readHost(hostPath), std::string("new save"), "close should replace the save with the edited copy");
+            t.IsFalse(std::filesystem::exists(tempPath), "no temporary copy should remain after close");
+        });
+
         tc.Run("sceMcGetDir includes dot entries and file metadata", [](TestCase &t)
         {
             TestContext test;

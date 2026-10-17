@@ -251,7 +251,7 @@ if(PS2X_IS_VITA)
         pthread
     )
 elseif(PS2X_NATIVE_HOST)
-    target_link_libraries(ps2_host_backend INTERFACE d3d11 dxgi d3dcompiler xaudio2 xinput winmm)
+    target_link_libraries(ps2_host_backend INTERFACE d3d11 dxgi d3dcompiler xaudio2 xinput winmm shell32 ole32)
 else()
     target_link_libraries(ps2_host_backend INTERFACE raylib)
 

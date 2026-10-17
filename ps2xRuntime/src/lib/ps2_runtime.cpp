@@ -1498,6 +1498,32 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
     runtimeIoPaths() = normalized;
 }
 
+namespace
+{
+    // The player's memory cards: the host's save folder (Saved Games on Windows) when it has one, else next to
+    // the ELF as on a PS2 dump. Moving to the host folder copies saves made next to the ELF (the originals stay).
+    std::filesystem::path defaultMemoryCardRoot(const std::filesystem::path &elfDirectory)
+    {
+        const std::filesystem::path saveDir = ps2host::saveDirectory();
+        if (saveDir.empty())
+            return elfDirectory / "mc0";
+        std::error_code ec;
+        for (const char *card : {"mc0", "mc1"})
+        {
+            const std::filesystem::path legacy = elfDirectory / card;
+            const std::filesystem::path target = saveDir / card;
+            if (std::filesystem::exists(target, ec) || !std::filesystem::is_directory(legacy, ec) ||
+                std::filesystem::equivalent(legacy.parent_path(), saveDir, ec))
+                continue;
+            std::filesystem::create_directories(saveDir, ec);
+            std::filesystem::copy(legacy, target, std::filesystem::copy_options::recursive, ec);
+            std::printf("[saves] copied %s to %s%s\n", legacy.string().c_str(), target.string().c_str(),
+                        ec ? " (failed)" : "");
+        }
+        return saveDir / "mc0";
+    }
+}
+
 void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
 {
     IoPaths paths = runtimeIoPaths();
@@ -1511,7 +1537,7 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
     {
         paths.hostRoot = paths.elfDirectory;
         paths.cdRoot = paths.elfDirectory;
-        paths.mcRoot = paths.elfDirectory / "mc0";
+        paths.mcRoot = defaultMemoryCardRoot(paths.elfDirectory);
     }
 
     setIoPaths(paths);

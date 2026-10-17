@@ -4,6 +4,7 @@
 // keyboard, and XAudio2 audio. Replaces the raylib host on Windows builds.
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <mutex>
 
@@ -30,6 +31,8 @@ namespace ps2host
         uint32_t effectsVolume = 100;    // sound effects (SENG events)
         uint32_t commentaryVolume = 100; // SENG streams (commentary)
         uint32_t movieVolume = 100;      // PSS movie audio
+        // [Saves] Folder: where the memory card folders (mc0, mc1) live; empty = the platform default.
+        std::filesystem::path saveFolder;
     };
 
     // PS2 DualShock 2 buttons in libpad bit order (active-high here; callers invert).
@@ -63,6 +66,11 @@ namespace ps2host
 
     const HostConfig &config();
     bool loadConfig(const char *iniPath);
+
+    // Folder that holds the player's memory card folders (mc0, mc1): PS2X_SAVE_DIR, else [Saves] Folder, else the
+    // platform's save location (Windows: Saved Games\WWE Crush Hour). Empty = no host default (saves stay next
+    // to the game files).
+    std::filesystem::path saveDirectory();
 
     bool init(const char *title);
     void shutdown();
