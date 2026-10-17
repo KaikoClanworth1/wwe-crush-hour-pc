@@ -4,6 +4,7 @@
 // keyboard, and XAudio2 audio. Replaces the raylib host on Windows builds.
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 
 struct ID3D11Device;
@@ -24,6 +25,11 @@ namespace ps2host
         uint32_t targetFps = 60;
         bool keepAspect = true; // 4:3 pillarbox for the PS2 framebuffer
         bool widescreen = false;
+        // [Audio] volumes, 0..100 (percent).
+        uint32_t masterVolume = 100;
+        uint32_t effectsVolume = 100;    // sound effects (SENG events)
+        uint32_t commentaryVolume = 100; // SENG streams (commentary)
+        uint32_t movieVolume = 100;      // PSS movie audio
     };
 
     // PS2 DualShock 2 buttons in libpad bit order (active-high here; callers invert).
@@ -90,9 +96,20 @@ namespace ps2host
     void setVibration(int index, uint8_t smallMotor, uint8_t largeMotor);
 
     // Audio -------------------------------------------------------------
+    // Hold audioMutex() around any use of xaudio() / masteringVoice() and of source voices created from them:
+    // the host tears the engine down and rebuilds it under this lock when the audio device is lost (unplugged)
+    // and when a device appears after the game started without one.
     IXAudio2 *xaudio();
     IXAudio2MasteringVoice *masteringVoice();
     bool audioReady();
+    std::recursive_mutex &audioMutex();
+    // Registers a callback run (under audioMutex) just before the engine is destroyed: destroy every source
+    // voice created from it. Voices are recreated against the new engine on next use.
+    void addAudioResetListener(std::function<void()> onReset);
+    // Volume (0..1) of an [Audio] channel from config(); the master volume is applied on the mastering voice.
+    float effectsGain();
+    float commentaryGain();
+    float movieGain();
 
     // Timing ------------------------------------------------------------
     double timeSeconds();

@@ -58,6 +58,7 @@ namespace ps2_syscalls
             return;
         }
 
+#if !defined(PS2X_NATIVE_HOST) // the native host has its own sound engine (no VAG sniffing)
         {
             std::lock_guard<std::mutex> lock(g_vagAccumMutex);
             auto it = g_vagAccum.find(ps2Fd);
@@ -85,6 +86,7 @@ namespace ps2_syscalls
                 g_vagAccum.erase(it);
             }
         }
+#endif
 
         setReturnS32(ctx, 0);
     }
@@ -126,6 +128,7 @@ namespace ps2_syscalls
             ps2TraceGuestRangeWrite(rdram, bufAddr, static_cast<uint32_t>(bytesRead), "fioRead", ctx);
         }
 
+#if !defined(PS2X_NATIVE_HOST) // the native host has its own sound engine (no VAG sniffing)
         {
             std::lock_guard<std::mutex> lock(g_vagAccumMutex);
             auto it = g_vagAccum.find(ps2Fd);
@@ -154,6 +157,7 @@ namespace ps2_syscalls
                 }
             }
         }
+#endif
 
         setReturnS32(ctx, (int32_t)bytesRead);
     }

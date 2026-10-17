@@ -18,6 +18,7 @@ std::atomic<double> g_ps2xBank1LoadedAt{-1.0};
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -130,6 +131,8 @@ namespace ps2native
             std::vector<Sample> samples;
         };
 
+        double nowSeconds() { return ps2host::timeSeconds(); }
+
         struct Voice
         {
             IXAudio2SourceVoice *src = nullptr;
@@ -137,7 +140,17 @@ namespace ps2native
             bool started = false;
             bool running = false;
             bool loop = false;
+            // No audio device: a silent stand-in that ends after the sample's duration, so the game still sees
+            // one-shot sounds and commentary lines finish (it waits on those states).
+            bool silent = false;
+            double length = 0.0;    // seconds at the original rate
+            double remaining = 0.0; // seconds left while stopped (pitch 0)
+            double endTime = 0.0;
+            const int16_t *pcm = nullptr; // the buffer the voice plays (pool purges by range)
+            size_t count = 0;
         };
+
+        bool hasVoice(const Voice &v) { return v.src != nullptr || v.silent; }
 
         struct Event
         {
@@ -169,11 +182,14 @@ namespace ps2native
             uint32_t rate = 22050;
             float gain = 1.0f;
             std::vector<int16_t> pcm;
+            std::future<std::vector<int16_t>> decoding; // STREAM_PLAY reads + decodes off the EE thread
             Voice voice;
             bool paused = false;
         };
 
-        void destroyVoice(Voice &v)
+        // Destroys the XAudio2 voice now (DestroyVoice waits until the audio thread no longer uses it), so the
+        // PCM it played can be freed right after.
+        void destroyVoiceNow(Voice &v)
         {
             if (v.src)
             {
@@ -183,6 +199,105 @@ namespace ps2native
             }
             v = {};
         }
+
+        // Mono PCM16 source voices, reused per sample rate instead of created and destroyed for every sound.
+        // A released voice is stopped and flushed, then waits in `draining` until XAudio2 has dropped its buffers.
+        class VoicePool
+        {
+        public:
+            IXAudio2SourceVoice *acquire(IXAudio2 *xa, uint32_t rate)
+            {
+                auto it = m_free.find(rate);
+                if (it != m_free.end() && !it->second.empty())
+                {
+                    IXAudio2SourceVoice *v = it->second.back();
+                    it->second.pop_back();
+                    return v;
+                }
+                WAVEFORMATEX wf{};
+                wf.wFormatTag = WAVE_FORMAT_PCM;
+                wf.nChannels = 1;
+                wf.nSamplesPerSec = rate;
+                wf.wBitsPerSample = 16;
+                wf.nBlockAlign = 2;
+                wf.nAvgBytesPerSec = rate * 2;
+                IXAudio2SourceVoice *v = nullptr;
+                if (FAILED(xa->CreateSourceVoice(&v, &wf, 0, 8.0f)))
+                    return nullptr;
+                return v;
+            }
+
+            void release(Voice &v)
+            {
+                if (v.src)
+                {
+                    v.src->Stop();
+                    v.src->FlushSourceBuffers();
+                    m_draining.push_back({v.src, v.rate, v.pcm, v.pcm + v.count});
+                }
+                v = {};
+            }
+
+            // Once per batch: drained voices become reusable.
+            void service()
+            {
+                for (size_t i = 0; i < m_draining.size();)
+                {
+                    XAUDIO2_VOICE_STATE st{};
+                    m_draining[i].src->GetState(&st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+                    if (st.BuffersQueued != 0)
+                    {
+                        ++i;
+                        continue;
+                    }
+                    auto &list = m_free[m_draining[i].rate];
+                    if (list.size() < kMaxFreePerRate)
+                        list.push_back(m_draining[i].src);
+                    else
+                        m_draining[i].src->DestroyVoice();
+                    m_draining[i] = m_draining.back();
+                    m_draining.pop_back();
+                }
+            }
+
+            // Before PCM in [begin, end) is freed: no draining voice may still read it.
+            void purge(const int16_t *begin, const int16_t *end)
+            {
+                for (size_t i = 0; i < m_draining.size();)
+                {
+                    if (m_draining[i].begin < end && begin < m_draining[i].end)
+                    {
+                        m_draining[i].src->DestroyVoice();
+                        m_draining[i] = m_draining.back();
+                        m_draining.pop_back();
+                    }
+                    else
+                        ++i;
+                }
+            }
+
+            void clear()
+            {
+                for (auto &d : m_draining)
+                    d.src->DestroyVoice();
+                m_draining.clear();
+                for (auto &[rate, list] : m_free)
+                    for (IXAudio2SourceVoice *v : list)
+                        v->DestroyVoice();
+                m_free.clear();
+            }
+
+        private:
+            static constexpr size_t kMaxFreePerRate = 24;
+            struct Draining
+            {
+                IXAudio2SourceVoice *src;
+                uint32_t rate;
+                const int16_t *begin, *end;
+            };
+            std::unordered_map<uint32_t, std::vector<IXAudio2SourceVoice *>> m_free;
+            std::vector<Draining> m_draining;
+        };
     }
 
     struct NativeSeng::Impl
@@ -196,6 +311,33 @@ namespace ps2native
         bool stereo = true;
         std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> cdTableByName; // name -> (lsn,size)
         uint64_t batches = 0;
+        VoicePool pool;
+
+        void destroyVoice(Voice &v) { pool.release(v); }
+
+        // The host is about to destroy the XAudio2 engine (device lost): every voice goes. Looping sounds come
+        // back on the next batch (their events are still active); one-shots and streams are reported finished.
+        void onAudioReset()
+        {
+            for (Event &e : events)
+            {
+                if (!hasVoice(e.voice))
+                    continue;
+                const bool loop = e.voice.loop;
+                destroyVoiceNow(e.voice);
+                if (!loop && e.status == kEventActive)
+                    setEventStatus(e, kEventInactive);
+            }
+            for (Stream &st : streams)
+            {
+                if (hasVoice(st.voice))
+                {
+                    destroyVoiceNow(st.voice);
+                    st.state = kStreamOff;
+                }
+            }
+            pool.clear();
+        }
 
         void ensureSizes()
         {
@@ -219,6 +361,8 @@ namespace ps2native
                 if (e.bank == id)
                     destroyVoice(e.voice);
             Bank &bank = banks[id];
+            for (const Sample &smp : bank.samples)
+                pool.purge(smp.pcm.data(), smp.pcm.data() + smp.pcm.size());
             bank.samples.clear();
 
             std::string d = upper(dir);
@@ -284,20 +428,24 @@ namespace ps2native
         // ------------------------------------------------------------ voices
         bool createVoice(Voice &v, const int16_t *pcm, size_t count, uint32_t rate, bool loop)
         {
+            if (count == 0)
+                return false;
+            v.rate = rate;
+            v.loop = loop;
+            v.pcm = pcm;
+            v.count = count;
+            v.length = static_cast<double>(count) / static_cast<double>(rate);
             IXAudio2 *xa = ps2host::xaudio();
-            if (!xa || count == 0)
-                return false;
-            WAVEFORMATEX wf{};
-            wf.wFormatTag = WAVE_FORMAT_PCM;
-            wf.nChannels = 1;
-            wf.nSamplesPerSec = rate;
-            wf.wBitsPerSample = 16;
-            wf.nBlockAlign = 2;
-            wf.nAvgBytesPerSec = rate * 2;
-            if (FAILED(xa->CreateSourceVoice(&v.src, &wf, 0, 8.0f)))
+            if (!xa)
             {
-                v.src = nullptr;
-                return false;
+                v.silent = true;
+                return true;
+            }
+            v.src = pool.acquire(xa, rate);
+            if (!v.src)
+            {
+                v.silent = true;
+                return true;
             }
             XAUDIO2_BUFFER buf{};
             buf.AudioBytes = static_cast<UINT32>(count * 2u);
@@ -306,13 +454,13 @@ namespace ps2native
             if (loop)
                 buf.LoopCount = XAUDIO2_LOOP_INFINITE;
             v.src->SubmitSourceBuffer(&buf);
-            v.rate = rate;
-            v.loop = loop;
             return true;
         }
 
         static bool voiceFinished(const Voice &v)
         {
+            if (v.silent)
+                return v.started && !v.loop && v.running && nowSeconds() >= v.endTime;
             if (!v.src || !v.started || v.loop)
                 return false;
             XAUDIO2_VOICE_STATE st{};
@@ -322,6 +470,24 @@ namespace ps2native
 
         void applyMix(Voice &v, float left, float right, uint32_t pitch)
         {
+            if (v.silent)
+            {
+                if (pitch == 0u)
+                {
+                    if (v.running)
+                        v.remaining = std::max(0.0, v.endTime - nowSeconds());
+                    v.running = false;
+                    return;
+                }
+                if (!v.running)
+                {
+                    const double ratio = std::clamp(static_cast<double>(pitch) * 48000.0 / 4096.0 / v.rate, 1.0 / 1024.0, 8.0);
+                    v.endTime = nowSeconds() + (v.started ? v.remaining : v.length / ratio);
+                    v.running = true;
+                    v.started = true;
+                }
+                return;
+            }
             if (!v.src)
                 return;
             const float matrix[2] = {std::clamp(left, 0.0f, 1.0f), std::clamp(right, 0.0f, 1.0f)};
@@ -404,32 +570,43 @@ namespace ps2native
             if (id >= streams.size())
                 return;
             Stream &s = streams[id];
-            destroyVoice(s.voice);
+            if (s.decoding.valid())
+                s.decoding.wait(); // a line still decoding is replaced: let it finish, then drop it
+            destroyVoiceNow(s.voice); // its PCM is replaced below
             s.pcm.clear();
-            std::filesystem::path file;
-            std::vector<uint8_t> data;
-            if (resolveStreamFile(rdram, lsn, size, file) && readFile(file, data))
-            {
-                if (size && size < data.size())
-                    data.resize(size);
-                decodeVag(data.data(), data.size(), s.pcm);
-            }
             s.rate = rate > 0 ? static_cast<uint32_t>(rate) : 22050u;
-            s.state = kStreamPreload;
             s.paused = (s.flags & 0x08u) != 0u;
-            if (!s.pcm.empty())
-                createVoice(s.voice, s.pcm.data(), s.pcm.size(), s.rate, false);
-            else
+            std::filesystem::path file;
+            if (!resolveStreamFile(rdram, lsn, size, file))
+            {
                 s.state = kStreamOff;
+                return;
+            }
+            // The whole line is read and decoded on a worker (a commentary file is up to a few hundred KB of
+            // ADPCM); the stream reports PRELOAD until endBatch finds it ready, as the IOP's preload did.
+            s.state = kStreamPreload;
+            s.decoding = std::async(std::launch::async, [file, size]()
+                                    {
+                                        std::vector<int16_t> pcm;
+                                        std::vector<uint8_t> data;
+                                        if (readFile(file, data))
+                                        {
+                                            if (size && size < data.size())
+                                                data.resize(size);
+                                            decodeVag(data.data(), data.size(), pcm);
+                                        }
+                                        return pcm;
+                                    });
         }
 
         // ------------------------------------------------------------ END_BATCH
         void endBatch(uint8_t *recv, uint32_t recvSize)
         {
+            pool.service();
             // 1) natural ends of one-shot voices
             for (Event &e : events)
             {
-                if (e.voice.src && !(e.flags & 1u) && voiceFinished(e.voice))
+                if (hasVoice(e.voice) && !(e.flags & 1u) && voiceFinished(e.voice))
                 {
                     destroyVoice(e.voice);
                     if (e.status == kEventActive)
@@ -443,21 +620,21 @@ namespace ps2native
                 const bool groupActive = e.group < groups.size() && groups[e.group].status == kGroupActive;
                 if (e.status == kEventActive && groupActive)
                 {
-                    if (e.retrigger && e.voice.src)
+                    if (e.retrigger && hasVoice(e.voice))
                         destroyVoice(e.voice);
                     e.retrigger = false;
-                    if (!e.voice.src && e.bank < banks.size() && e.sample < banks[e.bank].samples.size())
+                    if (!hasVoice(e.voice) && e.bank < banks.size() && e.sample < banks[e.bank].samples.size())
                     {
                         const Sample &smp = banks[e.bank].samples[e.sample];
                         createVoice(e.voice, smp.pcm.data(), smp.pcm.size(), smp.rate, (e.flags & 1u) && smp.loop);
                     }
                 }
-                else if (e.voice.src)
+                else if (hasVoice(e.voice))
                 {
                     destroyVoice(e.voice);
                 }
                 // 3) mix
-                if (e.voice.src)
+                if (hasVoice(e.voice))
                 {
                     const Group &g = groups[e.group];
                     float l, r;
@@ -477,22 +654,34 @@ namespace ps2native
                         r = 0.0f;
                     if (!stereo)
                         l = r = (l + r) * 0.5f;
+                    const float gain = ps2host::effectsGain();
+                    l *= gain;
+                    r *= gain;
                     applyMix(e.voice, l, r, (static_cast<uint32_t>(g.pitchRatio) * e.pitch) >> 8);
                 }
             }
             // 4) streams
             for (Stream &s : streams)
             {
-                if (!s.voice.src)
+                if (s.decoding.valid() && s.decoding.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+                {
+                    s.pcm = s.decoding.get();
+                    if (s.state != kStreamPreload) // stopped while it decoded
+                        s.pcm.clear();
+                    else if (s.pcm.empty() || !createVoice(s.voice, s.pcm.data(), s.pcm.size(), s.rate, false))
+                        s.state = kStreamOff;
+                }
+                if (!hasVoice(s.voice))
                     continue;
                 if (s.voice.started && voiceFinished(s.voice))
                 {
-                    destroyVoice(s.voice);
+                    destroyVoiceNow(s.voice);
                     s.state = kStreamOff;
                     continue;
                 }
                 const uint32_t pitch = s.paused ? 0u : (s.rate * 4096u) / 48000u;
-                applyMix(s.voice, s.gain, s.gain, pitch);
+                const float gain = s.gain * ps2host::commentaryGain();
+                applyMix(s.voice, gain, gain, pitch);
                 if (s.voice.running && s.state == kStreamPreload)
                     s.state = kStreamPlaying;
             }
@@ -664,7 +853,7 @@ namespace ps2native
                     const uint16_t sid = u16(p + 2);
                     if (sid >= streams.size())
                         streams.resize(sid + 1u);
-                    destroyVoice(streams[sid].voice);
+                    destroyVoiceNow(streams[sid].voice); // the Stream (and its PCM) is replaced
                     streams[sid] = Stream{};
                     streams[sid].flags = u16(p + 8);
                     streams[sid].state = kStreamOff;
@@ -676,7 +865,7 @@ namespace ps2native
                     if (u16(p + 2) < streams.size())
                     {
                         Stream &s = streams[u16(p + 2)];
-                        destroyVoice(s.voice);
+                        destroyVoiceNow(s.voice); // streamPlay frees its PCM later
                         s.state = kStreamOff;
                     }
                     p += 8;
@@ -712,7 +901,7 @@ namespace ps2native
                     for (Event &e : events)
                         destroyVoice(e.voice);
                     for (Stream &s : streams)
-                        destroyVoice(s.voice);
+                        destroyVoiceNow(s.voice);
                     events.assign(maxEvents, Event{});
                     groups.assign(maxEvents, Group{});
                     for (Stream &s : streams)
@@ -744,21 +933,31 @@ namespace ps2native
         }
     };
 
-    NativeSeng::NativeSeng() : m_impl(std::make_unique<Impl>()) {}
+    NativeSeng::NativeSeng() : m_impl(std::make_unique<Impl>())
+    {
+        ps2host::addAudioResetListener([impl = m_impl.get()]()
+                                       {
+                                           std::lock_guard lock(impl->mutex);
+                                           impl->onAudioReset();
+                                       });
+    }
     NativeSeng::~NativeSeng() = default;
 
     bool NativeSeng::enabled()
     {
+        // Also without an audio device: the engine then runs silent (timed stand-in voices), which keeps the
+        // game's sound state machine going and the IOP interpreter out of the picture.
         static const bool s_enabled = []() {
             const char *v = std::getenv("PS2X_IOP_SENG");
             return !(v && *v == '1'); // PS2X_IOP_SENG=1 falls back to running SENG.IRX on the IOP interpreter
         }();
-        return s_enabled && ps2host::audioReady();
+        return s_enabled;
     }
 
     void NativeSeng::handleBatch(uint8_t *rdram, uint32_t sendAddr, uint32_t sendSize, uint32_t recvAddr, uint32_t recvSize)
     {
-        std::lock_guard lock(m_impl->mutex);
+        // Host audio lock first (engine rebuilds take it, then this engine's mutex via the reset listener).
+        std::scoped_lock lock(ps2host::audioMutex(), m_impl->mutex);
         const uint32_t s = sendAddr & 0x01FFFFFFu;
         const uint32_t r = recvAddr & 0x01FFFFFFu;
         if (s + sendSize > PS2_RAM_SIZE)
@@ -769,11 +968,12 @@ namespace ps2native
 
     void NativeSeng::reset()
     {
-        std::lock_guard lock(m_impl->mutex);
+        std::scoped_lock lock(ps2host::audioMutex(), m_impl->mutex);
         for (Event &e : m_impl->events)
-            destroyVoice(e.voice);
+            destroyVoiceNow(e.voice);
         for (Stream &st : m_impl->streams)
-            destroyVoice(st.voice);
+            destroyVoiceNow(st.voice);
+        m_impl->pool.clear();
         m_impl->events.clear();
         m_impl->groups.clear();
         m_impl->streams.clear();

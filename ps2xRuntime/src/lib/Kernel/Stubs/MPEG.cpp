@@ -1217,9 +1217,50 @@ namespace ps2_stubs
             a.building.clear();
         }
 
+        // Host audio lock first, as everywhere (the host rebuilds a lost engine under it).
+        using PssAudioLock = std::scoped_lock<std::recursive_mutex, std::mutex>;
+
+        bool createPssVoiceLocked(PssAudioStream &a)
+        {
+            IXAudio2 *xa = ps2host::xaudio();
+            if (!xa)
+                return false;
+            WAVEFORMATEX wf{};
+            wf.wFormatTag = WAVE_FORMAT_PCM;
+            wf.nChannels = static_cast<WORD>(a.channels);
+            wf.nSamplesPerSec = a.rate;
+            wf.wBitsPerSample = 16;
+            wf.nBlockAlign = static_cast<WORD>(2u * a.channels);
+            wf.nAvgBytesPerSec = a.rate * wf.nBlockAlign;
+            if (FAILED(xa->CreateSourceVoice(&a.voice, &wf)))
+            {
+                a.voice = nullptr;
+                return false;
+            }
+            a.voice->SetVolume(ps2host::movieGain());
+            a.started = false;
+            return true;
+        }
+
+        // The host is about to destroy the engine (device lost): drop the voices, keep each stream's format so
+        // feedPssAudio can reopen a voice on the new engine and carry on with the movie.
+        void registerPssAudioReset()
+        {
+            static std::once_flag s_once;
+            std::call_once(s_once, []()
+                           {
+                               ps2host::addAudioResetListener([]()
+                                                              {
+                                                                  std::lock_guard<std::mutex> lock(g_pssAudioMutex);
+                                                                  for (auto &[addr, a] : g_pssAudio)
+                                                                      destroyPssAudioLocked(a);
+                                                              });
+                           });
+        }
+
         void stopPssAudio(uint32_t mpegAddr)
         {
-            std::lock_guard<std::mutex> lock(g_pssAudioMutex);
+            PssAudioLock lock(ps2host::audioMutex(), g_pssAudioMutex);
             auto it = g_pssAudio.find(mpegAddr);
             if (it != g_pssAudio.end())
             {
@@ -1230,7 +1271,7 @@ namespace ps2_stubs
 
         void stopAllPssAudio()
         {
-            std::lock_guard<std::mutex> lock(g_pssAudioMutex);
+            PssAudioLock lock(ps2host::audioMutex(), g_pssAudioMutex);
             for (auto &[addr, a] : g_pssAudio)
                 destroyPssAudioLocked(a);
             g_pssAudio.clear();
@@ -1238,9 +1279,12 @@ namespace ps2_stubs
 
         void feedPssAudio(uint32_t mpegAddr, const uint8_t *payload, size_t size)
         {
-            if (!ps2host::audioReady() || size <= 4u)
+            if (size <= 4u)
                 return;
-            std::lock_guard<std::mutex> lock(g_pssAudioMutex);
+            registerPssAudioReset();
+            PssAudioLock lock(ps2host::audioMutex(), g_pssAudioMutex);
+            if (!ps2host::audioReady())
+                return;
             PssAudioStream &a = g_pssAudio[mpegAddr];
             a.pending.insert(a.pending.end(), payload + 4, payload + size);
             if (!a.headerParsed)
@@ -1265,16 +1309,9 @@ namespace ps2_stubs
                 a.headerParsed = true;
                 if (!a.pcm)
                     return; // ADPCM movie audio: not used by this game
-                WAVEFORMATEX wf{};
-                wf.wFormatTag = WAVE_FORMAT_PCM;
-                wf.nChannels = static_cast<WORD>(a.channels);
-                wf.nSamplesPerSec = a.rate;
-                wf.wBitsPerSample = 16;
-                wf.nBlockAlign = static_cast<WORD>(2u * a.channels);
-                wf.nAvgBytesPerSec = a.rate * wf.nBlockAlign;
-                if (FAILED(ps2host::xaudio()->CreateSourceVoice(&a.voice, &wf)))
-                    a.voice = nullptr;
             }
+            if (a.pcm && !a.voice)
+                createPssVoiceLocked(a); // first packet, or the engine was rebuilt mid-movie
             if (!a.pcm || !a.voice)
                 return;
             // De-interleave into ~40 ms buffers. One XAudio2 buffer per 512-byte interleave block (~5 ms)

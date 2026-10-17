@@ -124,6 +124,19 @@ namespace ps2host
 
         ComPtr<IXAudio2> g_xaudio;
         IXAudio2MasteringVoice *g_master = nullptr;
+        std::recursive_mutex g_audioMutex;
+        std::vector<std::function<void()>> g_audioResetListeners;
+        std::atomic<bool> g_audioLost{false}; // XAudio2 critical error (device removed); rebuilt in pumpMessages
+        double g_nextAudioRetry = 0.0;          // no device: look for one again at this time
+
+        // XAudio2 reports a lost device (headset unplugged, driver reset) as a critical error on its own thread;
+        // the engine is unusable from then on and has to be recreated.
+        struct AudioEngineCallback final : IXAudio2EngineCallback
+        {
+            void STDMETHODCALLTYPE OnProcessingPassStart() override {}
+            void STDMETHODCALLTYPE OnProcessingPassEnd() override {}
+            void STDMETHODCALLTYPE OnCriticalError(HRESULT) override { g_audioLost.store(true); }
+        } g_audioEngineCallback;
 
         std::mutex g_inputMutex;
         PadState g_pads[kMaxPads];
@@ -676,6 +689,10 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         g_config.keepAspect = GetPrivateProfileIntA("Display", "KeepAspect", g_config.keepAspect, iniPath) != 0;
         g_config.widescreen = GetPrivateProfileIntA("Display", "Widescreen", g_config.widescreen, iniPath) != 0;
         g_showFps = GetPrivateProfileIntA("Display", "ShowFPS", g_showFps ? 1 : 0, iniPath) != 0;
+        g_config.masterVolume = GetPrivateProfileIntA("Audio", "MasterVolume", g_config.masterVolume, iniPath);
+        g_config.effectsVolume = GetPrivateProfileIntA("Audio", "EffectsVolume", g_config.effectsVolume, iniPath);
+        g_config.commentaryVolume = GetPrivateProfileIntA("Audio", "CommentaryVolume", g_config.commentaryVolume, iniPath);
+        g_config.movieVolume = GetPrivateProfileIntA("Audio", "MovieVolume", g_config.movieVolume, iniPath);
         // InternalScale=N: the GS is rendered at N x the PS2 resolution (640x448 -> 1920x1344 at 3), 1..6;
         // 0 = from the output size (init). The GS backend reads PS2X_GS_SCALE when it starts (an explicit
         // PS2X_GS_SCALE wins).
@@ -685,6 +702,64 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         if (const char *ws = std::getenv("PS2X_WIDESCREEN")) // test override
             g_config.widescreen = *ws != '0';
         return true;
+    }
+
+    namespace
+    {
+        // Caller holds g_audioMutex (or runs before any voice exists).
+        bool createAudioEngine()
+        {
+            if (FAILED(XAudio2Create(&g_xaudio, 0, XAUDIO2_DEFAULT_PROCESSOR)))
+            {
+                g_xaudio.Reset();
+                return false;
+            }
+            if (FAILED(g_xaudio->CreateMasteringVoice(&g_master, 2, 48000)))
+            {
+                g_master = nullptr;
+                g_xaudio.Reset();
+                return false;
+            }
+            g_xaudio->RegisterForCallbacks(&g_audioEngineCallback);
+            float master = static_cast<float>(std::min(g_config.masterVolume, 100u)) / 100.0f;
+            if (const char *mute = std::getenv("PS2X_MUTE"); mute && *mute && *mute != '0')
+                master = 0.0f; // silent automated test runs
+            g_master->SetVolume(master);
+            return true;
+        }
+
+        void destroyAudioEngine()
+        {
+            std::lock_guard lock(g_audioMutex);
+            for (const auto &onReset : g_audioResetListeners)
+                onReset();
+            if (g_master)
+            {
+                g_master->DestroyVoice();
+                g_master = nullptr;
+            }
+            if (g_xaudio)
+            {
+                g_xaudio->UnregisterForCallbacks(&g_audioEngineCallback);
+                g_xaudio.Reset();
+            }
+        }
+
+        // Runs on the message thread: rebuild a lost engine at once, retry a missing one every few seconds.
+        void serviceAudio()
+        {
+            const bool lost = g_audioLost.exchange(false);
+            if (!lost && (g_master || nowSeconds() < g_nextAudioRetry))
+                return;
+            std::lock_guard lock(g_audioMutex);
+            if (lost)
+                std::fprintf(stdout, "[host] audio device lost, reopening\n");
+            destroyAudioEngine();
+            if (createAudioEngine())
+                std::fprintf(stdout, "[host] XAudio2 ready\n");
+            else
+                g_nextAudioRetry = nowSeconds() + 3.0;
+        }
     }
 
     bool init(const char *title)
@@ -899,22 +974,10 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         g_device->CreateBuffer(&cbd, nullptr, &g_blitCb);
 
-        // XAudio2 (optional: a missing audio device must not stop the game).
-        if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) || true)
-        {
-            if (SUCCEEDED(XAudio2Create(&g_xaudio, 0, XAUDIO2_DEFAULT_PROCESSOR)))
-            {
-                if (FAILED(g_xaudio->CreateMasteringVoice(&g_master, 2, 48000)))
-                {
-                    g_master = nullptr;
-                    g_xaudio.Reset();
-                }
-                else if (const char *mute = std::getenv("PS2X_MUTE"); mute && *mute && *mute != '0')
-                {
-                    g_master->SetVolume(0.0f); // silent automated test runs
-                }
-            }
-        }
+        // XAudio2 (optional: a missing audio device must not stop the game; the sound engine then runs silent
+        // and pumpMessages keeps looking for a device).
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        createAudioEngine();
 
         if (!g_background)
         {
@@ -931,12 +994,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
     {
         if (!g_ready)
             return;
-        if (g_master)
-        {
-            g_master->DestroyVoice();
-            g_master = nullptr;
-        }
-        g_xaudio.Reset();
+        destroyAudioEngine();
         g_uploadSrv.Reset();
         g_uploadTex.Reset();
         g_backRtv.Reset();
@@ -966,6 +1024,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             DispatchMessageW(&msg);
         }
         pollInput();
+        serviceAudio();
         const int fps = g_titleFps.load(), gameFps = g_titleGameFps.load();
         if (g_hwnd && fps >= 0 && (fps != g_shownTitleFps || gameFps != g_shownTitleGameFps))
         {
@@ -1166,6 +1225,17 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
     IXAudio2 *xaudio() { return g_xaudio.Get(); }
     IXAudio2MasteringVoice *masteringVoice() { return g_master; }
     bool audioReady() { return g_master != nullptr; }
+    std::recursive_mutex &audioMutex() { return g_audioMutex; }
+
+    void addAudioResetListener(std::function<void()> onReset)
+    {
+        std::lock_guard lock(g_audioMutex);
+        g_audioResetListeners.push_back(std::move(onReset));
+    }
+
+    float effectsGain() { return static_cast<float>(std::min(g_config.effectsVolume, 100u)) / 100.0f; }
+    float commentaryGain() { return static_cast<float>(std::min(g_config.commentaryVolume, 100u)) / 100.0f; }
+    float movieGain() { return static_cast<float>(std::min(g_config.movieVolume, 100u)) / 100.0f; }
 
     double timeSeconds() { return nowSeconds(); }
     double lastFrameMs() { return g_lastFrameMs; }
