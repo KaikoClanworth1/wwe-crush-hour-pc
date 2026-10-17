@@ -417,7 +417,28 @@ add_library(ps2_runtime STATIC
 )
 
 if(PS2X_NATIVE_HOST)
-    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/host/mod_menu.cpp src/lib/gs/gs_d3d11_backend.cpp src/lib/audio/native_seng.cpp)
+    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/host/gamepad_input.cpp src/lib/host/mod_menu.cpp src/lib/gs/gs_d3d11_backend.cpp src/lib/audio/native_seng.cpp)
+
+    # Game controllers through SDL3 (DualSense / DualShock 4, Switch, Steam Deck, generic HID; hot-plug). Only
+    # the joystick / gamepad / haptic parts are built; without it the host reads XInput pads.
+    option(PS2X_USE_SDL3 "Read game controllers through SDL3 (else XInput only)" ON)
+    if(PS2X_USE_SDL3)
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+        foreach(PS2X_SDL_SUBSYSTEM AUDIO VIDEO GPU RENDER CAMERA DIALOG POWER)
+            set(SDL_${PS2X_SDL_SUBSYSTEM} OFF CACHE BOOL "" FORCE)
+        endforeach()
+        FetchContent_Declare(SDL3
+            GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+            GIT_TAG release-3.2.28
+            GIT_SHALLOW TRUE)
+        FetchContent_MakeAvailable(SDL3)
+        target_link_libraries(ps2_runtime PRIVATE SDL3::SDL3-static)
+        target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_SDL3=1)
+    endif()
 
     # Private so the (huge) recompiled runner target is not rebuilt when host code changes.
     target_compile_definitions(ps2_runtime PRIVATE PS2X_NATIVE_HOST=1 NOMINMAX WIN32_LEAN_AND_MEAN)

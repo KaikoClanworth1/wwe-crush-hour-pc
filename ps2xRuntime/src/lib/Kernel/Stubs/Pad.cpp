@@ -41,6 +41,8 @@ namespace ps2_stubs
             uint8_t ry = kPadAnalogCenter;
             uint8_t lx = kPadAnalogCenter;
             uint8_t ly = kPadAnalogCenter;
+            uint8_t l2Pressure = 0; // analog triggers (0 = use the digital button)
+            uint8_t r2Pressure = 0;
         };
 
         struct PadPortState
@@ -104,13 +106,14 @@ namespace ps2_stubs
                 return;
             }
             state.buttons = static_cast<uint16_t>(~pad.buttons);
-            if (allowAnalog || true)
-            {
-                state.lx = pad.lx;
-                state.ly = pad.ly;
-                state.rx = pad.rx;
-                state.ry = pad.ry;
-            }
+            // The sticks are reported even before the game switches the pad to analog mode (its menus read them).
+            (void)allowAnalog;
+            state.lx = pad.lx;
+            state.ly = pad.ly;
+            state.rx = pad.rx;
+            state.ry = pad.ry;
+            state.l2Pressure = pad.l2;
+            state.r2Pressure = pad.r2;
         }
 
         bool hostPadConnected(int port, int slot)
@@ -167,7 +170,14 @@ namespace ps2_stubs
             {
                 return 0u;
             }
-            return ((state.buttons & mask) == 0u) ? 0xFFu : 0u;
+            if ((state.buttons & mask) != 0u)
+                return 0u; // not pressed
+            // Analog triggers report how far they are pulled; everything else is fully pressed.
+            if (mask == kPadBtnL2 && state.l2Pressure != 0u)
+                return state.l2Pressure;
+            if (mask == kPadBtnR2 && state.r2Pressure != 0u)
+                return state.r2Pressure;
+            return 0xFFu;
         }
 
         void fillPadStatus(uint8_t *data, const PadInputState &state, const PadPortState &portState)

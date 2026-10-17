@@ -2,6 +2,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "Stubs/Pad.h"
+#include "host/input_mapping.h"
 
 #include <vector>
 #include <cstdint>
@@ -68,6 +69,46 @@ void register_pad_input_tests()
 {
     MiniTest::Case("PadInput", [](TestCase &tc)
                    {
+        tc.Run("radial deadzone centres small deflections and keeps full range", [](TestCase &t)
+               {
+            using ps2host::input::radialStick;
+            const auto centre = radialStick(3000, -3000, 0.15f); // ~13 % deflection
+            t.Equals(static_cast<int>(centre.x), 0x80, "inside the deadzone x is centred");
+            t.Equals(static_cast<int>(centre.y), 0x80, "inside the deadzone y is centred");
+            const auto right = radialStick(32767, 0, 0.15f);
+            t.Equals(static_cast<int>(right.x), 255, "full right deflection reaches 255");
+            t.Equals(static_cast<int>(right.y), 0x80, "a pure x deflection leaves y centred");
+            const auto up = radialStick(0, -32768, 0.15f);
+            t.Equals(static_cast<int>(up.y), 0, "full up deflection reaches 0");
+            const auto edge = radialStick(5500, 0, 0.15f); // just past the deadzone edge
+            t.IsTrue(edge.x > 0x80 && edge.x < 0x88, "just outside the deadzone the output starts near the centre");
+            const auto diagonal = radialStick(20000, 20000, 0.15f);
+            t.Equals(static_cast<int>(diagonal.x), static_cast<int>(diagonal.y), "a diagonal keeps equal axes");
+        });
+
+        tc.Run("triggers map to DualShock pressure", [](TestCase &t)
+               {
+            using ps2host::input::triggerPressure;
+            t.Equals(static_cast<int>(triggerPressure(0)), 0, "released trigger has no pressure");
+            t.Equals(static_cast<int>(triggerPressure(32767)), 255, "fully pulled trigger is full pressure");
+            t.Equals(static_cast<int>(triggerPressure(16384)), 127, "half pulled trigger is half pressure");
+        });
+
+        tc.Run("key binding names parse to virtual-key codes", [](TestCase &t)
+               {
+            using ps2host::input::keyCode;
+            using ps2host::input::parseKeyList;
+            t.Equals(keyCode("x"), static_cast<int>('X'), "letters are their upper-case ASCII code");
+            t.Equals(keyCode("7"), static_cast<int>('7'), "digits are their ASCII code");
+            t.Equals(keyCode("F5"), 0x74, "function keys map to VK_F1 + n - 1");
+            t.Equals(keyCode(" space "), 0x20, "named keys ignore case and surrounding spaces");
+            t.Equals(keyCode("NoSuchKey"), 0, "unknown names map to 0");
+            const std::vector<int> keys = parseKeyList("X, Space, Bogus, Numpad2");
+            t.Equals(keys.size(), static_cast<size_t>(3u), "unknown keys are dropped from a list");
+            t.Equals(keys[1], 0x20, "list order is kept");
+            t.IsTrue(parseKeyList("").empty(), "an empty binding binds nothing");
+        });
+
         tc.Run("scePadRead uses override state", [](TestCase &t)
                {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);

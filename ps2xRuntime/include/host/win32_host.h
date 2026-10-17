@@ -33,6 +33,8 @@ namespace ps2host
         uint32_t movieVolume = 100;      // PSS movie audio
         // [Timing] WallClockTimers: EE timers follow host time instead of synthetic guest cycles.
         bool wallClockTimers = false;
+        // [Controls] Deadzone: radial stick deadzone in percent of full deflection.
+        uint32_t deadzonePercent = 15;
         // [Saves] Folder: where the memory card folders (mc0, mc1) live; empty = the platform default.
         std::filesystem::path saveFolder;
     };
@@ -64,6 +66,7 @@ namespace ps2host
         uint16_t buttons = 0; // active-high PadButton mask
         uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
         uint8_t l2 = 0, r2 = 0; // analog trigger pressure
+        bool menu = false;      // guide / touchpad button: opens the mod menu
     };
 
     const HostConfig &config();

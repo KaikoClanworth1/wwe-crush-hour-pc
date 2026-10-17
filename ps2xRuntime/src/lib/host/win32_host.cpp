@@ -1,4 +1,6 @@
 #include "host/win32_host.h"
+#include "host/gamepad_input.h"
+#include "host/input_mapping.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -28,6 +30,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <array>
 #include <unordered_map>
 
 extern std::atomic<double> g_hitchLastFlip; // ps2_runtime.cpp (PS2X_HITCH_LOG): host time of the last flip
@@ -142,6 +145,28 @@ namespace ps2host
         } g_audioEngineCallback;
 
         std::mutex g_inputMutex;
+        // [Controls] keyboard bindings: keys per PS2 button, indexed by the button's bit (input::kButtonNames).
+        std::array<std::vector<int>, 16> g_keyBindings;
+        bool g_keyBindingsLoaded = false;
+
+        void loadKeyBindings(const char *iniPath)
+        {
+            for (size_t bit = 0; bit < g_keyBindings.size(); ++bit)
+            {
+                const char *button = input::kButtonNames[bit].name;
+                const char *fallback = "";
+                for (const auto &[name, keys] : input::kDefaultKeys)
+                    if (std::string_view(name) == button)
+                        fallback = keys;
+                char value[128] = {};
+                if (iniPath)
+                    GetPrivateProfileStringA("Controls", button, fallback, value, sizeof(value), iniPath);
+                else
+                    std::snprintf(value, sizeof(value), "%s", fallback);
+                g_keyBindings[bit] = input::parseKeyList(value);
+            }
+            g_keyBindingsLoaded = true;
+        }
         PadState g_pads[kMaxPads];
         bool g_keys[256]{};
 
@@ -682,20 +707,6 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             frameLimit();
         }
 
-        uint8_t axisToByte(SHORT v, bool invert)
-        {
-            int iv = invert ? -static_cast<int>(v) - 1 : static_cast<int>(v);
-            int b = (iv + 32768) >> 8;
-            return static_cast<uint8_t>(std::clamp(b, 0, 255));
-        }
-
-        uint8_t applyDeadzone(uint8_t v)
-        {
-            int d = static_cast<int>(v) - 128;
-            if (std::abs(d) < 24)
-                return 0x80;
-            return v;
-        }
     }
 
     const HostConfig &config() { return g_config; }
@@ -841,6 +852,8 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         g_config.widescreen = GetPrivateProfileIntA("Display", "Widescreen", g_config.widescreen, iniPath) != 0;
         g_showFps = GetPrivateProfileIntA("Display", "ShowFPS", g_showFps ? 1 : 0, iniPath) != 0;
         g_config.wallClockTimers = GetPrivateProfileIntA("Timing", "WallClockTimers", g_config.wallClockTimers, iniPath) != 0;
+        g_config.deadzonePercent = std::min(90u, static_cast<uint32_t>(GetPrivateProfileIntA("Controls", "Deadzone", g_config.deadzonePercent, iniPath)));
+        loadKeyBindings(iniPath);
         g_config.masterVolume = GetPrivateProfileIntA("Audio", "MasterVolume", g_config.masterVolume, iniPath);
         g_config.effectsVolume = GetPrivateProfileIntA("Audio", "EffectsVolume", g_config.effectsVolume, iniPath);
         g_config.commentaryVolume = GetPrivateProfileIntA("Audio", "CommentaryVolume", g_config.commentaryVolume, iniPath);
@@ -1150,6 +1163,10 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         createAudioEngine();
 
+        if (!g_keyBindingsLoaded)
+            loadKeyBindings(nullptr); // no settings file: the default keyboard layout
+        input::init(static_cast<float>(g_config.deadzonePercent) / 100.0f);
+
         if (!g_background)
         {
             ShowWindow(g_hwnd, SW_SHOW);
@@ -1165,6 +1182,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
     {
         if (!g_ready)
             return;
+        input::shutdown();
         destroyAudioEngine();
         g_uploadSrv.Reset();
         g_uploadTex.Reset();
@@ -1258,44 +1276,11 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
     void pollInput()
     {
         PadState pads[kMaxPads];
-        // Hidden test runs (PS2X_BACKGROUND) and PS2X_NO_XINPUT=1 ignore real controllers: XInput is global, so a
-        // pad the user plays something else with would otherwise drive the test too.
-        static const bool s_noXinput = std::getenv("PS2X_BACKGROUND") != nullptr || std::getenv("PS2X_NO_XINPUT") != nullptr;
-        for (int i = 0; i < kMaxPads && !s_noXinput; ++i)
-        {
-            XINPUT_STATE xs{};
-            if (XInputGetState(static_cast<DWORD>(i), &xs) != ERROR_SUCCESS)
-                continue;
-            PadState &p = pads[i];
-            p.connected = true;
-            const WORD b = xs.Gamepad.wButtons;
-            auto set = [&](WORD xb, uint16_t pb)
-            { if (b & xb) p.buttons |= pb; };
-            set(XINPUT_GAMEPAD_DPAD_UP, kBtnUp);
-            set(XINPUT_GAMEPAD_DPAD_DOWN, kBtnDown);
-            set(XINPUT_GAMEPAD_DPAD_LEFT, kBtnLeft);
-            set(XINPUT_GAMEPAD_DPAD_RIGHT, kBtnRight);
-            set(XINPUT_GAMEPAD_A, kBtnCross);
-            set(XINPUT_GAMEPAD_B, kBtnCircle);
-            set(XINPUT_GAMEPAD_X, kBtnSquare);
-            set(XINPUT_GAMEPAD_Y, kBtnTriangle);
-            set(XINPUT_GAMEPAD_LEFT_SHOULDER, kBtnL1);
-            set(XINPUT_GAMEPAD_RIGHT_SHOULDER, kBtnR1);
-            set(XINPUT_GAMEPAD_LEFT_THUMB, kBtnL3);
-            set(XINPUT_GAMEPAD_RIGHT_THUMB, kBtnR3);
-            set(XINPUT_GAMEPAD_START, kBtnStart);
-            set(XINPUT_GAMEPAD_BACK, kBtnSelect);
-            p.l2 = xs.Gamepad.bLeftTrigger;
-            p.r2 = xs.Gamepad.bRightTrigger;
-            if (p.l2 > 40)
-                p.buttons |= kBtnL2;
-            if (p.r2 > 40)
-                p.buttons |= kBtnR2;
-            p.lx = applyDeadzone(axisToByte(xs.Gamepad.sThumbLX, false));
-            p.ly = applyDeadzone(axisToByte(xs.Gamepad.sThumbLY, true));
-            p.rx = applyDeadzone(axisToByte(xs.Gamepad.sThumbRX, false));
-            p.ry = applyDeadzone(axisToByte(xs.Gamepad.sThumbRY, true));
-        }
+        // Hidden test runs (PS2X_BACKGROUND) and PS2X_NO_XINPUT=1 ignore real controllers: controller input is
+        // global, so a pad the user plays something else with would otherwise drive the test too.
+        static const bool s_noControllers = std::getenv("PS2X_BACKGROUND") != nullptr || std::getenv("PS2X_NO_XINPUT") != nullptr;
+        if (!s_noControllers)
+            input::poll(pads, nowSeconds());
 
         if (!g_autoPress.empty())
         {
@@ -1319,27 +1304,18 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             }
         }
         std::lock_guard lock(g_inputMutex);
-        // Keyboard drives player 1 (merged with XInput pad 0).
+        // Keyboard drives player 1 (merged with controller 1), with the [Controls] bindings.
         PadState &k = pads[0];
-        auto key = [&](int vk, uint16_t pb)
-        { if (g_keys[vk]) { k.buttons |= pb; k.connected = true; } };
-        key(VK_UP, kBtnUp);
-        key(VK_DOWN, kBtnDown);
-        key(VK_LEFT, kBtnLeft);
-        key(VK_RIGHT, kBtnRight);
-        key('X', kBtnCross);
-        key(VK_SPACE, kBtnCross);
-        key('C', kBtnCircle);
-        key(VK_BACK, kBtnCircle);
-        key('Z', kBtnSquare);
-        key('V', kBtnTriangle);
-        key('Q', kBtnL1);
-        key('E', kBtnR1);
-        key('1', kBtnL2);
-        key('3', kBtnR2);
-        key(VK_RETURN, kBtnStart);
-        key(VK_RSHIFT, kBtnSelect);
-        key(VK_TAB, kBtnSelect);
+        for (size_t bit = 0; bit < g_keyBindings.size(); ++bit)
+            for (const int vk : g_keyBindings[bit])
+                if (vk > 0 && vk < 256 && g_keys[vk])
+                {
+                    k.buttons |= static_cast<uint16_t>(1u << bit);
+                    if (bit == 8)
+                        k.l2 = 0xFF; // a key is a fully pressed trigger
+                    else if (bit == 9)
+                        k.r2 = 0xFF;
+                }
         float ax = 0, ay = 0;
         if (g_keys['D']) ax += 1;
         if (g_keys['A']) ax -= 1;
@@ -1352,8 +1328,12 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         }
         // Keyboard player is always considered present so the game has a pad on port 0.
         k.connected = true;
-        // The mod menu (F2, BACK + RB, or the main menu's m plank) takes player 1's input while it is up.
-        modmenu::filterInput(pads, kMaxPads, g_keys[VK_F2]);
+        // The mod menu (F2, the guide button, BACK + RB, or the main menu's m plank) takes player 1's input while
+        // it is up.
+        bool menuKey = g_keys[VK_F2];
+        for (const PadState &p : pads)
+            menuKey |= p.menu;
+        modmenu::filterInput(pads, kMaxPads, menuKey);
         for (int i = 0; i < kMaxPads; ++i)
             g_pads[i] = pads[i];
     }
@@ -1387,10 +1367,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
     {
         if (index < 0 || index >= kMaxPads)
             return;
-        XINPUT_VIBRATION v{};
-        v.wLeftMotorSpeed = static_cast<WORD>(largeMotor * 257);
-        v.wRightMotorSpeed = static_cast<WORD>(smallMotor ? 0xFFFF : 0);
-        XInputSetState(static_cast<DWORD>(index), &v);
+        input::rumble(index, smallMotor, largeMotor);
     }
 
     IXAudio2 *xaudio() { return g_xaudio.Get(); }
