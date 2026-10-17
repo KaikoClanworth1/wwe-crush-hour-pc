@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <map>
 #include <cctype>
 #include "runtime/host_file_cache.h"
 #include "ps2_runtime_macros.h"
@@ -29,6 +30,9 @@ namespace
     };
 
     std::unordered_map<std::string, CdFileEntry> g_cdFilesByKey;
+    // The same entries by first sector (element pointers in an unordered_map stay valid as it grows): every
+    // sector read resolves its file with one ordered lookup instead of a scan over all registered files.
+    std::map<uint32_t, const CdFileEntry *> g_cdFilesByLbn;
     std::unordered_map<std::string, std::filesystem::path> g_cdLeafIndex;
     std::unordered_map<std::string, std::filesystem::path> g_cdLoosePathIndex;
     std::filesystem::path g_cdLeafIndexRoot;
@@ -407,7 +411,8 @@ namespace
         entry.sectors = sectorsForBytes(sizeBytes);
 
         g_nextPseudoLbn += entry.sectors + 1;
-        g_cdFilesByKey.emplace(key, entry);
+        const auto inserted = g_cdFilesByKey.emplace(key, entry).first;
+        g_cdFilesByLbn[entry.baseLbn] = &inserted->second;
         entryOut = entry;
         g_lastCdError = 0;
         return true;
@@ -495,16 +500,21 @@ namespace
         return true;
     }
 
+    // The registered file whose sectors contain lbn, or nullptr.
+    const CdFileEntry *cdFileForLbn(uint32_t lbn)
+    {
+        auto it = g_cdFilesByLbn.upper_bound(lbn);
+        if (it == g_cdFilesByLbn.begin())
+            return nullptr;
+        const CdFileEntry *entry = std::prev(it)->second;
+        return lbn < entry->baseLbn + entry->sectors ? entry : nullptr;
+    }
+
     bool readCdSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
     {
-        for (const auto &[key, entry] : g_cdFilesByKey)
+        if (const CdFileEntry *found = cdFileForLbn(lbn))
         {
-            const uint32_t endLbn = entry.baseLbn + entry.sectors;
-            if (lbn < entry.baseLbn || lbn >= endLbn)
-            {
-                continue;
-            }
-
+            const CdFileEntry &entry = *found;
             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
             const uint64_t offset = relativeLbn * kCdSectorSize;
             const bool ok = readHostRange(entry.hostPath, offset, dst, byteCount);
@@ -541,13 +551,9 @@ namespace
 
     bool isResolvableCdLbn(uint32_t lbn)
     {
-        for (const auto &[key, entry] : g_cdFilesByKey)
+        if (cdFileForLbn(lbn))
         {
-            const uint32_t endLbn = entry.baseLbn + entry.sectors;
-            if (lbn >= entry.baseLbn && lbn < endLbn)
-            {
-                return true;
-            }
+            return true;
         }
 
         uint64_t totalSectors = 0;
@@ -561,16 +567,10 @@ namespace
 
     bool findRegisteredCdFileForLbn(uint32_t lbn, CdFileEntry &entryOut)
     {
-        for (const auto &[key, entry] : g_cdFilesByKey)
-        {
-            const uint32_t endLbn = entry.baseLbn + entry.sectors;
-            if (lbn >= entry.baseLbn && lbn < endLbn)
-            {
-                entryOut = entry;
-                return true;
-            }
-        }
-        return false;
+        const CdFileEntry *entry = cdFileForLbn(lbn);
+        if (entry)
+            entryOut = *entry;
+        return entry != nullptr;
     }
 
     uint32_t cdStreamingEndLbnForStart(uint32_t lbn)

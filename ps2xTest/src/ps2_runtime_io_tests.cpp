@@ -757,6 +757,51 @@ void register_ps2_runtime_io_tests()
                      "sceCdSearchFile should assign a pseudo LSN for the resolved host file");
         });
 
+        tc.Run("sceCdRead finds the file holding a pseudo LSN among several", [](TestCase &t)
+        {
+            TestContext test;
+            constexpr uint32_t kSectorSize = 2048u;
+            const char *names[] = {"A.BIN", "B.BIN", "C.BIN"};
+            for (int f = 0; f < 3; ++f)
+            {
+                // Three sectors per file; every sector starts with "<file letter><sector index>".
+                std::ofstream out(test.paths.cdRoot / names[f], std::ios::binary);
+                for (int sector = 0; sector < 3; ++sector)
+                {
+                    std::vector<char> data(kSectorSize, 0);
+                    data[0] = static_cast<char>('A' + f);
+                    data[1] = static_cast<char>('0' + sector);
+                    out.write(data.data(), static_cast<std::streamsize>(data.size()));
+                }
+            }
+            uint32_t lsn[3] = {};
+            for (int f = 0; f < 3; ++f)
+            {
+                constexpr uint32_t fileAddr = GUEST_BUFFER_AREA_START + 0x1A00;
+                constexpr uint32_t pathAddr = GUEST_STRING_AREA_START + 0xA00;
+                writeGuestString(test.rdram.data(), pathAddr, (std::string("\\") + names[f] + ";1").c_str());
+                clearContext(test.ctx);
+                setRegU32(test.ctx, 4, fileAddr);
+                setRegU32(test.ctx, 5, pathAddr);
+                ps2_stubs::sceCdSearchFile(test.rdram.data(), &test.ctx, nullptr);
+                t.Equals(getRegS32(&test.ctx, 2), 1, "each file should be found");
+                lsn[f] = readGuestU32(test.rdram.data(), fileAddr + 0);
+            }
+
+            constexpr uint32_t bufAddr = GUEST_BUFFER_AREA_START + 0x2000;
+            for (int f = 2; f >= 0; --f)
+            {
+                clearContext(test.ctx);
+                setRegU32(test.ctx, 4, lsn[f] + 2u); // third sector of the file
+                setRegU32(test.ctx, 5, 1u);
+                setRegU32(test.ctx, 6, bufAddr);
+                ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, nullptr);
+                t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead of a registered file should succeed");
+                t.Equals(static_cast<int>(test.rdram[bufAddr]), 'A' + f, "the sector should come from the right file");
+                t.Equals(static_cast<int>(test.rdram[bufAddr + 1]), static_cast<int>('2'), "and from the right sector");
+            }
+        });
+
         tc.Run("sceCdRead reads from explicit cdImage path", [](TestCase &t)
         {
             TestContext test;
