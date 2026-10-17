@@ -26,6 +26,10 @@ namespace ps2host
         uint32_t targetFps = 60; // 30, 60, or higher (120 / 144 / ...); 0 = the display's refresh rate
         bool keepAspect = true; // 4:3 pillarbox for the PS2 framebuffer
         bool widescreen = false;
+        // [Display] TextureFiltering: 0 = as on the PS2 (no mipmaps), 1 = mipmaps (trilinear),
+        // 2 / 4 / 8 / 16 = mipmaps + that much anisotropic filtering.
+        uint32_t textureFiltering = 16;
+        bool dumpTextures = false; // [Display] DumpTextures: write decoded textures to Textures/dump
         // [Audio] volumes, 0..100 (percent).
         uint32_t masterVolume = 100;
         uint32_t effectsVolume = 100;    // sound effects (SENG events)
@@ -84,6 +88,7 @@ namespace ps2host
         Fullscreen,
         TargetFps,  // applies on restart: 30, 60, 120, 144, 165, 240, 0 = display refresh
         Widescreen, // applies on restart
+        TextureFiltering, // applies on restart: 0 (PS2), 1 (mipmaps), 2 / 4 / 8 / 16 (anisotropic)
         MasterVolume,
         EffectsVolume,
         CommentaryVolume,

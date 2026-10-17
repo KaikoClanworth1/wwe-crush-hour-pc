@@ -251,7 +251,7 @@ if(PS2X_IS_VITA)
         pthread
     )
 elseif(PS2X_NATIVE_HOST)
-    target_link_libraries(ps2_host_backend INTERFACE d3d11 dxgi d3dcompiler xaudio2 xinput winmm shell32 ole32)
+    target_link_libraries(ps2_host_backend INTERFACE d3d11 dxgi d3dcompiler xaudio2 xinput winmm shell32 ole32 windowscodecs)
 else()
     target_link_libraries(ps2_host_backend INTERFACE raylib)
 
@@ -417,7 +417,7 @@ add_library(ps2_runtime STATIC
 )
 
 if(PS2X_NATIVE_HOST)
-    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/host/gamepad_input.cpp src/lib/host/mod_menu.cpp src/lib/gs/gs_d3d11_backend.cpp src/lib/audio/native_seng.cpp)
+    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/host/gamepad_input.cpp src/lib/host/mod_menu.cpp src/lib/gs/gs_d3d11_backend.cpp src/lib/gs/texture_pack.cpp src/lib/audio/native_seng.cpp)
 
     # Game controllers through SDL3 (DualSense / DualShock 4, Switch, Steam Deck, generic HID; hot-plug). Only
     # the joystick / gamepad / haptic parts are built; without it the host reads XInput pads.

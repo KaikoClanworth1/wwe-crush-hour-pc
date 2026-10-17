@@ -557,7 +557,7 @@ namespace
     {
         ps2host::Setting id;
         const char *name, *desc;
-        enum Kind { kOnOff, kFps, kVolume } kind;
+        enum Kind { kOnOff, kFps, kVolume, kFiltering } kind;
     };
     constexpr SettingItem kSettings[] = {
         {ps2host::Setting::MasterVolume, "Master volume", "Scales all game audio.", SettingItem::kVolume},
@@ -568,6 +568,7 @@ namespace
         {ps2host::Setting::VSync, "VSync", "Wait for the display refresh (no tearing).", SettingItem::kOnOff},
         {ps2host::Setting::ShowFps, "FPS counter", "Frames shown / game frames per second in the corner (F1).", SettingItem::kOnOff},
         {ps2host::Setting::TargetFps, "Frame rate", "30 (original pacing), 60, high refresh (120 / 144 / 165 / 240) or DISPLAY (the monitor's rate). Applies on the next start.", SettingItem::kFps},
+        {ps2host::Setting::TextureFiltering, "Texture filtering", "PS2 (none), mipmaps, or mipmaps with 2x-16x anisotropic filtering: sharp, stable textures at a distance. Applies on the next start.", SettingItem::kFiltering},
         {ps2host::Setting::Widescreen, "Widescreen", "16:9 3D view with the HUD kept in proportion. Applies on the next start.", SettingItem::kOnOff},
     };
     constexpr int kSettingCount = static_cast<int>(sizeof(kSettings) / sizeof(kSettings[0]));
@@ -580,6 +581,7 @@ namespace
         case SettingItem::kOnOff: return v ? "ON" : "OFF";
         case SettingItem::kFps: return v == 0 ? "DISPLAY" : std::to_string(v);
         case SettingItem::kVolume: return std::to_string(v) + "%";
+        case SettingItem::kFiltering: return v == 0 ? "PS2" : (v == 1 ? "MIPMAPS" : std::to_string(v) + "X");
         }
         return {};
     }
@@ -601,6 +603,17 @@ namespace
                 ++i;
             i = i == n ? 1 : (i + (dir < 0 ? n - 1 : 1)) % n;
             ps2host::setSetting(item.id, kRates[i]);
+            break;
+        }
+        case SettingItem::kFiltering:
+        {
+            static constexpr int kModes[] = {0, 1, 2, 4, 8, 16};
+            constexpr int n = static_cast<int>(sizeof(kModes) / sizeof(kModes[0]));
+            int i = 0;
+            while (i < n && kModes[i] != v)
+                ++i;
+            i = i == n ? n - 1 : (i + (dir < 0 ? n - 1 : 1)) % n;
+            ps2host::setSetting(item.id, kModes[i]);
             break;
         }
         case SettingItem::kVolume:

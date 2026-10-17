@@ -72,6 +72,9 @@ Settings  (GameFiles\ps2x_settings.ini, or in game: mod menu, LB / RB to the SET
   InternalScale=0  render resolution: 0 = automatic from the window / screen size (1080p -> 3x,
                    1440p -> 4x, 4K -> 6x the PS2's 640x448); 1..6 = fixed (1 = original sharpness)
 
+  TextureFiltering=16  mipmaps + 16x anisotropic filtering (0 = PS2 look, 1 = mipmaps only)
+  Texture packs: put PNG / DDS files named <texture id>.png in GameFiles\Textures (any resolution).
+                   DumpTextures=1 writes the game's textures with their ids to GameFiles\Textures\dump.
   [Audio] MasterVolume / EffectsVolume / CommentaryVolume / MovieVolume   0..100 (percent)
   [Saves] Folder   where saves are kept (default: Saved Games\WWE Crush Hour)
 

@@ -746,6 +746,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         case Setting::Fullscreen: return g_config.fullscreen ? 1 : 0;
         case Setting::TargetFps: return static_cast<int>(g_config.targetFps);
         case Setting::Widescreen: return g_config.widescreen ? 1 : 0;
+        case Setting::TextureFiltering: return static_cast<int>(g_config.textureFiltering);
         case Setting::MasterVolume: return static_cast<int>(g_config.masterVolume);
         case Setting::EffectsVolume: return static_cast<int>(g_config.effectsVolume);
         case Setting::CommentaryVolume: return static_cast<int>(g_config.commentaryVolume);
@@ -780,6 +781,10 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         case Setting::Widescreen:
             g_config.widescreen = value != 0;
             writeSetting(L"Display", L"Widescreen", value != 0);
+            break;
+        case Setting::TextureFiltering:
+            g_config.textureFiltering = static_cast<uint32_t>(std::clamp(value, 0, 16));
+            writeSetting(L"Display", L"TextureFiltering", static_cast<int>(g_config.textureFiltering));
             break;
         case Setting::MasterVolume:
         {
@@ -850,6 +855,8 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         g_config.targetFps = GetPrivateProfileIntA("Display", "TargetFPS", g_config.targetFps, iniPath);
         g_config.keepAspect = GetPrivateProfileIntA("Display", "KeepAspect", g_config.keepAspect, iniPath) != 0;
         g_config.widescreen = GetPrivateProfileIntA("Display", "Widescreen", g_config.widescreen, iniPath) != 0;
+        g_config.textureFiltering = std::min(16u, static_cast<uint32_t>(GetPrivateProfileIntA("Display", "TextureFiltering", g_config.textureFiltering, iniPath)));
+        g_config.dumpTextures = GetPrivateProfileIntA("Display", "DumpTextures", g_config.dumpTextures, iniPath) != 0;
         g_showFps = GetPrivateProfileIntA("Display", "ShowFPS", g_showFps ? 1 : 0, iniPath) != 0;
         g_config.wallClockTimers = GetPrivateProfileIntA("Timing", "WallClockTimers", g_config.wallClockTimers, iniPath) != 0;
         g_config.deadzonePercent = std::min(90u, static_cast<uint32_t>(GetPrivateProfileIntA("Controls", "Deadzone", g_config.deadzonePercent, iniPath)));

@@ -6,6 +6,8 @@
 #include "runtime/gs/ps2_gs_psmt4.h"
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "host/win32_host.h"
+#include "runtime/gs/texture_mips.h"
+#include "runtime/gs/texture_pack.h"
 namespace ps2host
 {
     void setPresentWide(bool wide); // win32_host.cpp: Widescreen=1 frame shown 16:9 (else 4:3 with bars)
@@ -293,15 +295,17 @@ PsOut ps_main(PsIn i)
 {
     float4 c = i.col;   // GS units 0..255, fog in w of tc? (fog packed in col? no: tc.w)
     float fog = i.tc.w;
+    // Mip level / anisotropy from the texel coordinate before the GS wrap modes (no derivative spikes at seams);
+    // textures without mipmaps always sample level 0. Taken outside the branch below (gradients in flow control).
+    float2 texel = (p2.x != 0.0) ? i.tc.xy : (i.tc.xy / i.tc.z) * texDims.xy;
+    const float2 uvGrad = texel / texDims.zw;
+    const float2 dx = ddx(uvGrad), dy = ddy(uvGrad);
     if (p0.z != 0.0)
     {
-        float2 texel;
-        if (p2.x != 0.0) texel = i.tc.xy;
-        else texel = (i.tc.xy / i.tc.z) * texDims.xy;
         texel.x = wrapCoord(texel.x, texDims.x, p3.x, region.x, region.y);
         texel.y = wrapCoord(texel.y, texDims.y, p3.y, region.z, region.w);
         float2 uv = (texel + p3.zw) / texDims.zw;
-        float4 t = gsTex.SampleLevel(gsSamp, uv, 0);
+        float4 t = gsTex.SampleGrad(gsSamp, uv, dx, dy);
         t.rgb *= 255.0;
         t.a *= p2.z;
         float tfx = p0.x;
@@ -477,6 +481,10 @@ struct GSD3D11Backend::Impl
         unsigned char cbData[256]{};
     } bound;
     ComPtr<ID3D11SamplerState> samplers[4]; // [linear][repeat]
+    ComPtr<ID3D11SamplerState> anisoSamplers[2]; // [repeat]: linear draws of mipmapped textures (TextureFiltering >= 2)
+    uint32_t textureFiltering = 0;              // [Display] TextureFiltering
+    bool boundTexHasMips = false;               // set by rasterTexture: the texture it returned has a mip chain
+    bool drawTexHasMips = false;                // the current draw samples such a texture
     ComPtr<ID3D11SamplerState> pointClamp, linearClamp;
     ComPtr<ID3D11RasterizerState> raster;
     std::unordered_map<uint64_t, ComPtr<ID3D11BlendState>> blendStates;
@@ -760,6 +768,19 @@ struct GSD3D11Backend::Impl
             }
         pointClamp = samplers[0];
         linearClamp = samplers[2];
+        textureFiltering = ps2host::config().textureFiltering;
+        if (const char *v = std::getenv("PS2X_TEXTURE_FILTERING"); v && *v)
+            textureFiltering = static_cast<uint32_t>(std::clamp(std::atoi(v), 0, 16));
+        if (textureFiltering >= 2u)
+            for (int rep = 0; rep < 2; ++rep)
+            {
+                D3D11_SAMPLER_DESC sd{};
+                sd.Filter = D3D11_FILTER_ANISOTROPIC;
+                sd.MaxAnisotropy = textureFiltering;
+                sd.AddressU = sd.AddressV = sd.AddressW = rep ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
+                sd.MaxLOD = D3D11_FLOAT32_MAX;
+                dev->CreateSamplerState(&sd, &anisoSamplers[rep]);
+            }
 
         D3D11_RASTERIZER_DESC rd{};
         rd.FillMode = D3D11_FILL_SOLID;
@@ -794,12 +815,12 @@ struct GSD3D11Backend::Impl
     }
 
     bool createTexture(uint32_t w, uint32_t h, UINT bind, ComPtr<ID3D11Texture2D> &tex,
-                       DXGI_FORMAT fmt = DXGI_FORMAT_R8G8B8A8_UNORM)
+                       DXGI_FORMAT fmt = DXGI_FORMAT_R8G8B8A8_UNORM, uint32_t mipLevels = 1)
     {
         D3D11_TEXTURE2D_DESC td{};
         td.Width = std::max<uint32_t>(w, 1u);
         td.Height = std::max<uint32_t>(h, 1u);
-        td.MipLevels = 1;
+        td.MipLevels = std::max<uint32_t>(mipLevels, 1u);
         td.ArraySize = 1;
         td.Format = fmt;
         td.SampleDesc.Count = 1;
@@ -1281,7 +1302,9 @@ struct GSD3D11Backend::Impl
         ComPtr<ID3D11Texture2D> tex;
         ComPtr<ID3D11ShaderResourceView> srv;
         uint64_t key = 0;
-        uint32_t w = 0, h = 0;
+        uint32_t w = 0, h = 0;          // the game texture's size (texel space of the draw)
+        uint32_t texW = 0, texH = 0;    // the D3D texture's size (larger for a replacement)
+        uint32_t levels = 0;            // mip levels of the D3D texture
         uint64_t lastUse = 0;
         bool verified = false;
     };
@@ -1471,6 +1494,7 @@ struct GSD3D11Backend::Impl
             rt.lastUse = frameCounter;
             outW = rt.w;
             outH = rt.h;
+            boundTexHasMips = rt.levels > 1u;
             return rt.srv.Get();
         }
         // Replay the chain into the private GS memory and decode level 0 like decodedTexture does.
@@ -1585,15 +1609,30 @@ struct GSD3D11Backend::Impl
                             t.psm, tw, th, vt.psm, st.textureWidth, st.textureHeight);
             }
         }
-        if (!rt.tex || rt.w != tw || rt.h != th)
+        // Texture pack (Textures/<content id>.png) and dump; the id is taken before the port's own patches.
+        const bool ps2Alpha = ps2gs::alphaReference(rasterPx) == 0x40u;
+        const uint64_t contentId = ps2gs::textureContentId(rasterPx.data(), tw, th);
+        ps2gs::pack::dump(contentId, rasterPx.data(), tw, th, ps2Alpha);
+        const ps2gs::pack::Image *replacement = ps2gs::pack::find(contentId, ps2Alpha);
+        if (!replacement)
+            applyTexturePatches(rasterPx, tw, th);
+        const uint32_t *texPx = replacement ? replacement->px.data() : rasterPx.data();
+        const uint32_t texW = replacement ? replacement->w : tw, texH = replacement ? replacement->h : th;
+        // Mipmaps (TextureFiltering >= 1): built here once per decode, cut-out alpha coverage preserved.
+        const std::vector<ps2gs::MipLevel> mips =
+            textureFiltering > 0u ? ps2gs::buildMipChain(texPx, texW, texH) : std::vector<ps2gs::MipLevel>{};
+        const uint32_t levels = 1u + static_cast<uint32_t>(mips.size());
+        if (!rt.tex || rt.texW != texW || rt.texH != texH || rt.levels != levels)
         {
             rt.tex.Reset();
             rt.srv.Reset();
-            if (!createTexture(tw, th, D3D11_BIND_SHADER_RESOURCE, rt.tex))
+            if (!createTexture(texW, texH, D3D11_BIND_SHADER_RESOURCE, rt.tex, DXGI_FORMAT_R8G8B8A8_UNORM, levels))
                 return nullptr;
             dev->CreateShaderResourceView(rt.tex.Get(), nullptr, &rt.srv);
+            rt.texW = texW;
+            rt.texH = texH;
+            rt.levels = levels;
         }
-        applyTexturePatches(rasterPx, tw, th);
         {
             // PS2X_RASTER_DUMP=<dir>: every native raster texture once per (raster, contents), RGBA (PS2 alpha).
             static const char *s_rasterDump = std::getenv("PS2X_RASTER_DUMP");
@@ -1612,7 +1651,11 @@ struct GSD3D11Backend::Impl
                 }
             }
         }
-        ctx->UpdateSubresource(rt.tex.Get(), 0, nullptr, rasterPx.data(), tw * 4u, 0);
+        ctx->UpdateSubresource(rt.tex.Get(), 0, nullptr, texPx, texW * 4u, 0);
+        for (size_t level = 0; level < mips.size(); ++level)
+            ctx->UpdateSubresource(rt.tex.Get(), static_cast<UINT>(level + 1u), nullptr, mips[level].px.data(),
+                                   mips[level].w * 4u, 0);
+        boundTexHasMips = levels > 1u;
         rt.key = key;
         rt.w = tw;
         rt.h = th;
@@ -2691,6 +2734,7 @@ struct GSD3D11Backend::Impl
 
         // ---- texture
         ID3D11ShaderResourceView *texSrv = nullptr;
+        drawTexHasMips = false;
         bool texFromRt = false;
         float texDims[4] = {1, 1, 1, 1};
         float origin[2] = {0, 0};
@@ -2832,6 +2876,7 @@ struct GSD3D11Backend::Impl
                         texSrv = rs;
                         w = rw;
                         h = rh;
+                        drawTexHasMips = boundTexHasMips;
                     }
                 }
                 if (!texSrv && !nativeState)
@@ -3017,6 +3062,8 @@ struct GSD3D11Backend::Impl
         const bool linear = st.linearFilter;
         const bool repeat = (wms == 0 && wmt == 0);
         ID3D11SamplerState *smp = samplers[(linear ? 2 : 0) + (repeat ? 1 : 0)].Get();
+        if (linear && drawTexHasMips && anisoSamplers[repeat ? 1 : 0])
+            smp = anisoSamplers[repeat ? 1 : 0].Get();
         if (smp != bound.smp)
         {
             ctx->PSSetSamplers(0, 1, &smp);

@@ -1,3 +1,5 @@
+#include "runtime/gs/texture_mips.h"
+#include <cmath>
 #include "MiniTest.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_runtime.h"
@@ -429,6 +431,62 @@ void register_ps2_gs_tests()
 {
     MiniTest::Case("PS2GS", [](TestCase &tc)
     {
+        tc.Run("mip chains halve down to 1x1 with box-filtered texels", [](TestCase &t)
+        {
+            // 4x2: left half opaque white, right half opaque black (PS2 alpha 0x80).
+            std::vector<uint32_t> px(8);
+            for (uint32_t y = 0; y < 2; ++y)
+                for (uint32_t x = 0; x < 4; ++x)
+                    px[y * 4 + x] = x < 2 ? 0x80FFFFFFu : 0x80000000u;
+            const auto levels = ps2gs::buildMipChain(px.data(), 4, 2);
+            t.Equals(levels.size(), static_cast<size_t>(2u), "4x2 has levels 2x1 and 1x1");
+            t.Equals(levels[0].w, 2u, "level 1 is half as wide");
+            t.Equals(levels[0].h, 1u, "level 1 is half as tall");
+            t.Equals(levels[0].px[0], 0x80FFFFFFu, "a white 2x2 block stays white");
+            t.Equals(levels[0].px[1], 0x80000000u, "a black 2x2 block stays black");
+            t.Equals(levels[1].w * levels[1].h, 1u, "the chain ends at 1x1");
+            t.Equals(levels[1].px[0] & 0xFFu, 0x80u, "1x1 averages white and black");
+        });
+
+        tc.Run("cut-out textures keep their alpha-test coverage in every mip level", [](TestCase &t)
+        {
+            // 64x64 foliage-like cut-out: ~25 % of the texels opaque, scattered (pseudo-random), the rest clear.
+            std::vector<uint32_t> px(64 * 64);
+            uint32_t seed = 12345u;
+            size_t opaque = 0;
+            for (uint32_t &c : px)
+            {
+                seed = seed * 1664525u + 1013904223u;
+                const bool on = (seed >> 24) < 64u;
+                opaque += on ? 1u : 0u;
+                c = on ? 0x80406080u : 0x00406080u;
+            }
+            const double base = static_cast<double>(opaque) / static_cast<double>(px.size());
+            t.IsTrue(ps2gs::isCutout(px), "binary alpha is recognised as a cut-out");
+            const auto levels = ps2gs::buildMipChain(px.data(), 64, 64);
+            for (size_t i = 0; i < levels.size() && levels[i].px.size() >= 64u; ++i)
+            {
+                size_t pass = 0;
+                for (uint32_t c : levels[i].px)
+                    pass += (c >> 24) >= 0x40u ? 1u : 0u;
+                const double coverage = static_cast<double>(pass) / static_cast<double>(levels[i].px.size());
+                t.IsTrue(std::abs(coverage - base) < 0.1, "alpha-test coverage stays near level 0's");
+            }
+            std::vector<uint32_t> smooth(16 * 16);
+            for (size_t i = 0; i < smooth.size(); ++i)
+                smooth[i] = (static_cast<uint32_t>(i) & 0x7Fu) << 24;
+            t.IsFalse(ps2gs::isCutout(smooth), "a smooth alpha ramp is not a cut-out");
+        });
+
+        tc.Run("texture content ids depend on pixels and size", [](TestCase &t)
+        {
+            std::vector<uint32_t> a(16, 0x80112233u), b = a;
+            t.Equals(ps2gs::textureContentId(a.data(), 4, 4), ps2gs::textureContentId(b.data(), 4, 4), "same pixels, same id");
+            b[5] ^= 1u;
+            t.IsTrue(ps2gs::textureContentId(a.data(), 4, 4) != ps2gs::textureContentId(b.data(), 4, 4), "one texel changes the id");
+            t.IsTrue(ps2gs::textureContentId(a.data(), 4, 4) != ps2gs::textureContentId(a.data(), 8, 2), "the size is part of the id");
+        });
+
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;
