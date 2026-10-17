@@ -1,13 +1,16 @@
 # In-game mod menu hooks (ps2xRuntime/src/lib/host/mod_menu.cpp). Idempotent.
 #  - Shell::Update (0x1d7bd0) entry: ps2x_modmenu_shell(rdram, this) -- the main menu's state each shell frame.
 #  - ps2_wait_for_vsync (0x1771a0) entry: ps2x_mods_frame(rdram) -- applies the mods once per game frame.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob
 
-root = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output'
+root = OUTPUT
 
 
 def patch(pattern, anchor, hook, decl, tag):
-    files = glob.glob(root + '\\' + pattern)
+    files = glob.glob(os.path.join(root, pattern))
     assert len(files) == 1, pattern
     p = files[0]
     s = open(p, encoding='utf-8').read()

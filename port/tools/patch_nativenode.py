@@ -3,7 +3,10 @@
 # from the RW structures, one marker per mesh appended to RW's open VIF packet -- RenderWare's PS2 pipeline
 # (object setup, instancing, mesh bridges, texture cache, VU1 uploads) does not run at all.
 # PS2X_NRW_NODE=0 keeps RenderWare's pipeline. Idempotent.
-path = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\PS2AllNodeBody_0x2fbf60.cpp'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
+path = out('PS2AllNodeBody_0x2fbf60.cpp')
 s = open(path, encoding='utf-8').read()
 
 if 'patch_nativenode' not in s:
@@ -28,7 +31,7 @@ else:
 
 # RpPDS_G3x_ADL_LightingUpload(ambient, directional): remember the lights PDS G3x objects are lit with, so the
 # native path can light G3x atomics (RenderWare-generic math with these two lights).
-path = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\RpPDS_G3x_ADL_LightingUpload_0x2dd1f0.cpp'
+path = out('RpPDS_G3x_ADL_LightingUpload_0x2dd1f0.cpp')
 s = open(path, encoding='utf-8').read()
 if 'patch_nativenode' not in s:
     entry = '        default: break;\n    }\n\n    ctx->pc = 0x2dd1f0u;\n'

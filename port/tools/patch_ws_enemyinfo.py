@@ -3,8 +3,11 @@
 # 0..1), which follows the 16:9 view window of the 3D camera. The HUD layer is drawn 3/4 as wide about the frame's
 # centre (gs_d3d11_backend.cpp), so once the on-screen checks have passed the position is spread by 4/3 about the
 # centre (ps2x_ws_hud_x in ps2_runtime.cpp): the tag then lands over the car again. Idempotent.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob
-paths = glob.glob(r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\Update__19EnemyInfoHudElementFfffffPCvQ218Pcpl2DScreenConfig12ScreenConfigi_0x241660.cpp')
+paths = glob.glob(out('Update__19EnemyInfoHudElementFfffffPCvQ218Pcpl2DScreenConfig12ScreenConfigi_0x241660.cpp'))
 assert len(paths) == 1
 p = paths[0]
 s = open(p, encoding='utf-8').read()

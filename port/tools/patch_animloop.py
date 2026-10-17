@@ -3,9 +3,12 @@
 # A zero-length animation played backwards with a tiny non-zero step (4.5e-15 here, 0 on the PS2)
 # loops forever -> the game freezes at wrestler select. Guard the loop: if duration <= 0, clamp
 # time to 0 and leave the loop (what a zero step would have produced).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import re
 
-path = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\RtAnimInterpolatorSubAnimTime_0x304e80.cpp'
+path = out('RtAnimInterpolatorSubAnimTime_0x304e80.cpp')
 s = open(path, encoding='utf-8').read()
 
 # Drop earlier debug instrumentation.
@@ -34,7 +37,7 @@ else:
     print('patched')
 
 # Same wrap loop in RtAnimInterpolatorAddAnimTime (forward play): while (time > duration) time -= duration.
-path2 = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\RtAnimInterpolatorAddAnimTime_0x305140.cpp'
+path2 = out('RtAnimInterpolatorAddAnimTime_0x305140.cpp')
 s2 = open(path2, encoding='utf-8').read()
 guard2 = '''label_30523c:
     { // patch_animloop: zero-length animation would never leave the wrap loop

@@ -8,12 +8,15 @@
 # Inputs: the decoded originals in tools/xbox_icons/<name>_<hash>.png (dumped with PS2X_ICON_LOG=<dir>; <hash> is
 # gs_d3d11_backend.cpp's fnv1a over rows 122..159, columns 72..219, which identifies the texture at runtime).
 # Output: PS2Recomp/ps2xRuntime/src/lib/gs/xbox_button_icons.inc (changed rectangles only) and a preview PNG.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob, os, struct
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-ROOT = r'D:\Xbox Games Ports\WWE Crush Hour'
-SVR = r'D:\Xbox Games Ports\WWE Smackdown Vs Raw 2011\Game Files\pad_icons\icons0_256x512.dds'
+# The button glyph sheet of WWE SmackDown vs Raw 2011 (PS2X_SVR2011_ICONS overrides the dev machine's copy).
+SVR = os.environ.get('PS2X_SVR2011_ICONS', r'D:\Xbox Games Ports\WWE Smackdown Vs Raw 2011\Game Files\pad_icons\icons0_256x512.dds')
 SRC_DIR = os.path.join(ROOT, 'tools', 'xbox_icons')
 OUT = os.path.join(ROOT, r'PS2Recomp\ps2xRuntime\src\lib\gs\xbox_button_icons.inc')
 FONT = r'C:\Windows\Fonts\arialbd.ttf'

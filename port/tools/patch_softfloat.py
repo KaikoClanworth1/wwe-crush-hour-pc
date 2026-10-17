@@ -4,9 +4,12 @@
 # host op runs under a clean MXCSR (the EE thread itself runs round-toward-zero + FTZ/DAZ).
 # The recompiled versions built corrupt Havok MOPP trees (HARDCORE floor holes: 331/1258 triangles unreachable).
 # PS2X_SOFTFLOAT_GUEST=1 falls back to the recompiled guest code.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob, os
 
-out = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output'
+out = OUTPUT
 TAG = '// patch_softfloat'
 
 PRE = '''    {{ {tag}

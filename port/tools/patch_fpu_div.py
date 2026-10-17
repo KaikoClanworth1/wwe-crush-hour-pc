@@ -2,6 +2,9 @@
 #  - DIV.S:  x / 0 was copysignf(INFINITY, ...); the EE gives +-FLT_MAX (sign fs ^ ft) -> ps2_fdiv
 #  - VDIV Q: x / 0 was 0                                                           -> ps2_fdiv
 # ps2_fdiv / ps2_fclamp live in ps2_runtime_macros.h (FPU_ADD/SUB/MUL_S and PS2_V* clamp overflow there).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob, re
 
 div = re.compile(r'if \(ctx->f\[(\d+)\] == 0\.0f\) \{ ctx->fcr31 \|= 0x100000; /\* DZ flag \*/ '
@@ -17,7 +20,7 @@ def div_rep(m):
 
 
 files = sites = 0
-for f in glob.glob(r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\*.cpp'):
+for f in glob.glob(out('*.cpp')):
     s = open(f, encoding='utf-8', errors='surrogateescape').read()
     if 'INFINITY' not in s and vdiv not in s:
         continue

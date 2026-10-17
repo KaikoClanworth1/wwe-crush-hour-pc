@@ -4,9 +4,12 @@
 # the raster unlocked, so SkyCameraBeginUpdate refused to render into it (its ext+0x17 "locked" flag
 # stays 0) -> the match-type / arena panels stayed a flat 0xAA grey and the raster was re-uploaded
 # (512 KB) every frame. The sign now fits, so this script only removes the old hack if present.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import re
 
-path = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\CacheLockCameraRaster__14PcplSpriteBankFb_0x265140.cpp'
+path = out('CacheLockCameraRaster__14PcplSpriteBankFb_0x265140.cpp')
 s = open(path, encoding='utf-8').read()
 s2 = re.sub(r'    if \(!std::getenv\("PS2X_CAMLOCK"\)\) SET_GPR_U64\(ctx, 5, 0\); // patch_camlock[^\n]*\n', '', s)
 if s2 != s:

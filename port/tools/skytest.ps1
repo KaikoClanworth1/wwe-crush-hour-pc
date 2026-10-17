@@ -1,7 +1,8 @@
 # Hidden in-match flicker capture: drivetest route to arena N (default 1), screenshots every 0.5 s from
 # the match start, then counts frames where the top band (sky) suddenly goes dark.
 param([int]$Arena = 1, [string]$Extra = "", [int]$Seconds = 190)
-$root = "D:\Xbox Games Ports\WWE Crush Hour"
+# PS2X_PORT_ROOT: the port's working tree (GameFiles, recomp, testrun); see ps2x_paths.py.
+$root = if ($env:PS2X_PORT_ROOT) { $env:PS2X_PORT_ROOT } else { "D:\Xbox Games Ports\WWE Crush Hour" }
 $a = @()
 for ($t = 10; $t -le 45; $t += 5) { $a += "${t}:START" }
 for ($t = 72; $t -le 150; $t += 6) { if ($t -ne 78) { $a += "${t}:CROSS" } }
@@ -9,7 +10,7 @@ for ($i = 0; $i -lt $Arena; $i++) { $a += "{0}:RIGHT" -f (76.0 + $i * 0.7) }
 $a += "{0}:CROSS" -f (76.0 + $Arena * 0.7 + 0.5)
 $x = "PS2X_STATUS=1"
 if ($Extra) { $x = "$x;$Extra" }
-& "$root\tools\bgtest.ps1" -Seconds $Seconds -ShotSec 0.5 -AutoInput ($a -join ",") -Extra $x | Out-Null
+& "$PSScriptRoot\bgtest.ps1" -Seconds $Seconds -ShotSec 0.5 -AutoInput ($a -join ",") -Extra $x | Out-Null
 python -c @"
 import glob
 from PIL import Image, ImageStat

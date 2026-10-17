@@ -1,8 +1,11 @@
 # Patch generated code: EE SQRT.S takes its operand from the ft field (recompiler used fs).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob, re
 pat = re.compile(r'(// 0x([0-9a-f]+): 0x([0-9a-f]+)[^\n]*\n(?:[^\n]*\n){0,2}?\s*ctx->f\[(\d+)\] = FPU_SQRT_S\(ctx->f\[)(\d+)(\]\);)')
 files = changed = 0
-for f in glob.glob('recomp/output/*.cpp'):
+for f in glob.glob(out('*.cpp')):
     s = open(f, encoding='utf-8', errors='surrogateescape').read()
     if 'FPU_SQRT_S(ctx->f[' not in s:
         continue

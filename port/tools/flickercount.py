@@ -1,13 +1,16 @@
 # Counts half-drawn frames in testrun\shots: a shot whose mean brightness dips well below both neighbours
 # (the menu sky / HUD missing). Usage: python tools\flickercount.py [first_index] [montage.png]
 # The montage shows each dip between its neighbours.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob, sys
 from PIL import Image, ImageStat
 
 first = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 out = sys.argv[2] if len(sys.argv) > 2 else None
 fs, lum = [], []
-for f in sorted(glob.glob(r'D:\Xbox Games Ports\WWE Crush Hour\testrun\shots\*.bmp'))[first:]:
+for f in sorted(glob.glob(root('testrun', 'shots', '*.bmp')))[first:]:
     try:
         lum.append(ImageStat.Stat(Image.open(f).convert('L').resize((96, 54))).mean[0])
         fs.append(f)

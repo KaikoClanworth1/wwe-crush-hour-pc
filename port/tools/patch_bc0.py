@@ -1,11 +1,14 @@
 # Generated code: BC0F/BC0T were emitted as never taken ("(false)"). Evaluate the real COP0 DMA
 # condition via ps2x_cpcond0(runtime) (ps2_runtime.cpp). Recompiler fixed as well.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob, re
 
 pat = re.compile(r'(// 0x[0-9a-f]+: 0x([0-9a-f]+)\s+(bc0tl|bc0fl|bc0t|bc0f)\b[^\n]*\n(?:[^\n]*\n){0,3}?[^\n]*const bool branch_taken_0x[0-9a-f]+ = )\(false\);')
 decl = 'extern "C" bool ps2x_cpcond0(PS2Runtime *runtime);'
 files = sites = 0
-for f in glob.glob(r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\*.cpp'):
+for f in glob.glob(out('*.cpp')):
     s = open(f, encoding='utf-8', errors='surrogateescape').read()
     if 'bc0' not in s:
         continue

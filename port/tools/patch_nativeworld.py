@@ -6,12 +6,15 @@
 #   instanced VIF data (unpack + VU1 start). nrw::bridge() may swap that qword for a marker; the native
 #   renderer then draws the mesh when the VIF reaches it. Everything else the bridge emits (texture
 #   upload, GS registers via DIRECT, VU1 constants) is unchanged. Inactive unless PS2X_NATIVE_WORLD=1.
-out = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
+out = OUTPUT
 INC = '#include "runtime/native_rw.h"\n'
 
 
 def patch(fn, anchor, block, tag):
-    p = out + '\\' + fn
+    p = os.path.join(out, fn)
     s = open(p, encoding='utf-8').read()
     if tag in s:
         print(fn, 'already patched')

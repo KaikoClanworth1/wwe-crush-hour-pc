@@ -2,9 +2,12 @@
 # emitted GPR_S32 compares, so branches on genuine 64-bit values went the wrong way -- e.g. libgcc soft-float
 # _fpadd_parts (1.0 - 3.0 = 6.0), which corrupted Havok MOPP trees. Fixed in control_flow_emitter.cpp; this
 # rewrites already generated output in place.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob, os, re
 
-out = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output'
+out = OUTPUT
 pat = re.compile(r'(branch_taken_0x[0-9a-f]+ = \()GPR_S32(\(ctx, \d+\) (?:<|<=|>|>=) 0\))')
 files = sites = 0
 for p in glob.glob(os.path.join(out, '*.cpp')):

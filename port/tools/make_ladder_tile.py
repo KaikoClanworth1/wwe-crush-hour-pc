@@ -11,12 +11,14 @@
 # gs_d3d11_backend.cpp's fnv1a over rows 122..159, columns 72..219.
 # Output: PS2Recomp/ps2xRuntime/src/lib/gs/ladder_tile.inc (palettized rectangle) and tools/xbox_icons/
 # ladder_tile_preview.png.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob, os
 from collections import deque
 import numpy as np
 from PIL import Image, ImageFilter
 
-ROOT = r'D:\Xbox Games Ports\WWE Crush Hour'
 SRC = os.path.join(ROOT, 'tools', 'xbox_icons')
 OUT = os.path.join(ROOT, r'PS2Recomp\ps2xRuntime\src\lib\gs\ladder_tile.inc')
 DONOR = 'survivor_series'

@@ -9,14 +9,17 @@
 #    no level_dm / level_tt / level_dd, only level.wg).
 #  - LevelParseSemantics::Type (0x21b760) entry: a LEVEL block's game type (ps2x_level_type: the ladder level's
 #    block, TYPE "ladder", is read as the match's type).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob
 
-root = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output'
+root = OUTPUT
 TAG = 'patch_cutcontent'
 
 
 def patch(pattern, edits, decls):
-    files = glob.glob(root + '\\' + pattern)
+    files = glob.glob(os.path.join(root, pattern))
     assert len(files) == 1, pattern
     p = files[0]
     s = open(p, encoding='utf-8').read()

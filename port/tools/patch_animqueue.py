@@ -5,7 +5,10 @@
 # megabytes past the array and overwrote the vsync callback pointer (0x4AEDA0 -> 0x3e), crashing in
 # _ps2_vsync_handler. Treat an implausible count as a one-entry queue (the loop ends at once and the
 # queue becomes empty) instead of shifting through RAM.
-path = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\wwfGfxAnimThreadPlayQueuedAnim__FP12WWFGfxObjecti_0x242ba0.cpp'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
+path = out('wwfGfxAnimThreadPlayQueuedAnim__FP12WWFGfxObjecti_0x242ba0.cpp')
 s = open(path, encoding='utf-8').read()
 guard = '''label_242cb8:
     { // patch_animqueue: never shift through memory on a garbage queue count

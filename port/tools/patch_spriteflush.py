@@ -5,7 +5,10 @@
 # overwrite neighbouring heap objects (a player object's vtable -> crash in
 # PowerupMessageHudElement::Update). Take the reset path instead: the sprites are dropped for that
 # frame rather than accumulating.
-path = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\Render__18PcplSpriteRendererFR11RwMatrixTag_0x262590.cpp'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
+path = out('Render__18PcplSpriteRendererFR11RwMatrixTag_0x262590.cpp')
 s = open(path, encoding='utf-8').read()
 old = '''        if (branch_taken_0x2625b8) {
             ctx->pc = 0x262618u;

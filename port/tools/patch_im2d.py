@@ -1,10 +1,13 @@
 # Generated code: RenderWare's Im2D primitives (SkyIm2DRenderPrimitive 0x355250, SkyIm2DRenderIndexedPrimitive
 # 0x356090) first offer the call to the native renderer (nrw::im2d, runtime/native_rw.h). When it is drawn there,
 # RenderWare's Im2D VU1 packet is not built at all. PS2X_NRW_IM2D selects the mode. Idempotent.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 files = [
-    (r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\SkyIm2DRenderPrimitive_0x355250.cpp', 'label_355250:\n',
+    (out('SkyIm2DRenderPrimitive_0x355250.cpp'), 'label_355250:\n',
      'nrw::im2d(rdram, runtime->memory(), GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6), 0u, 0u)'),
-    (r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\SkyIm2DRenderIndexedPrimitive_0x356090.cpp', 'label_356090:\n',
+    (out('SkyIm2DRenderIndexedPrimitive_0x356090.cpp'), 'label_356090:\n',
      'nrw::im2d(rdram, runtime->memory(), GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 8))'),
 ]
 for path, entry, call in files:

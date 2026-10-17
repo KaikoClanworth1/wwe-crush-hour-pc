@@ -6,8 +6,11 @@ param(
     [string]$Extra = "",
     [string]$Exe = ""
 )
-$root = "D:\Xbox Games Ports\WWE Crush Hour"
-$exe = if ($Exe) { $Exe } else { "$root\PS2Recomp\out\build\ps2xRuntime\Release\ps2EntryRunner.exe" }
+# PS2X_PORT_ROOT: the port's working tree (GameFiles, recomp, testrun); see ps2x_paths.py.
+$root = if ($env:PS2X_PORT_ROOT) { $env:PS2X_PORT_ROOT } else { "D:\Xbox Games Ports\WWE Crush Hour" }
+# This checkout (also when run through the dev tree's <root>\tools junction).
+$repo = if (Test-Path "$PSScriptRoot\..\..\ps2xRuntime") { (Resolve-Path "$PSScriptRoot\..\..").Path } else { "$root\PS2Recomp" }
+$exe = if ($Exe) { $Exe } else { "$repo\out\build\ps2xRuntime\Release\ps2EntryRunner.exe" }
 $out = "$root\testrun"
 # Only test builds (ps2EntryRunner*); never the player's WWECrushHour.exe.
 Get-Process ps2EntryRunner* -ErrorAction SilentlyContinue | Stop-Process -Force

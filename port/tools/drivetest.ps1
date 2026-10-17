@@ -1,7 +1,8 @@
 # Hidden collision drive test: the matchbench route into an Exhibition match, then accelerate (Cross held)
 # with optional steering, screenshots every 2 s. Montage -> $Out (compare runs for driving through walls).
 param([string]$Exe = "", [string]$Extra = "", [string]$Out = "", [string]$Steer = "", [int]$Seconds = 230, [int]$Arena = 0, [double]$ShotSec = 2)
-$root = "D:\Xbox Games Ports\WWE Crush Hour"
+# PS2X_PORT_ROOT: the port's working tree (GameFiles, recomp, testrun); see ps2x_paths.py.
+$root = if ($env:PS2X_PORT_ROOT) { $env:PS2X_PORT_ROOT } else { "D:\Xbox Games Ports\WWE Crush Hour" }
 $a = @()
 for ($t = 10; $t -le 60; $t += 5) { $a += "${t}:START" }  # to 60 s: a loaded PC can reach the title after 45 s
 # Menu timing drifts 3-12 s with machine load, so everything after the START presses is anchored to calls of
@@ -18,7 +19,7 @@ if ($Steer) { $a += $Steer }
 $x = "PS2X_STATUS=1"
 $x = "$x;PS2X_AUTOINPUT_ANCHOR=1d7470"
 if ($Extra) { $x = "$x;$Extra" }
-& "$root\tools\bgtest.ps1" -Seconds $Seconds -ShotSec $ShotSec -AutoInput ($a -join ",") -Extra $x -Exe $Exe | Out-Null
+& "$PSScriptRoot\bgtest.ps1" -Seconds $Seconds -ShotSec $ShotSec -AutoInput ($a -join ",") -Extra $x -Exe $Exe | Out-Null
 if ($Out) {
     python -c @"
 from PIL import Image

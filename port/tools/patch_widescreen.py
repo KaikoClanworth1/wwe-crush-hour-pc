@@ -1,6 +1,9 @@
 # Widescreen: RwCameraSetViewWindow (0x330350) calls the host on entry, which widens the view window of the
 # game's screen cameras to 16:9 when Widescreen=1 (ps2x_widescreen_view_window in ps2_runtime.cpp).
-p = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\RwCameraSetViewWindow_0x330350.cpp'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
+p = out('RwCameraSetViewWindow_0x330350.cpp')
 s = open(p, encoding='utf-8').read()
 hook = '    ps2x_widescreen_view_window(rdram, GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 31));\n'
 if hook not in s:

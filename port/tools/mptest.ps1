@@ -2,7 +2,8 @@
 # "CROSS#2"), screenshots every -ShotSec. Anchored like drivetest: "@1+t" = t s after the main menu's first
 # Shell::OnSetOnScreenPrompt_Tag call. -Out writes a montage of the shots from -From on.
 param([string]$Steps = "", [string]$Extra = "", [string]$Out = "", [int]$Seconds = 150, [double]$ShotSec = 1, [int]$From = 40)
-$root = "D:\Xbox Games Ports\WWE Crush Hour"
+# PS2X_PORT_ROOT: the port's working tree (GameFiles, recomp, testrun); see ps2x_paths.py.
+$root = if ($env:PS2X_PORT_ROOT) { $env:PS2X_PORT_ROOT } else { "D:\Xbox Games Ports\WWE Crush Hour" }
 $a = @()
 for ($t = 10; $t -le 80; $t += 5) { $a += "${t}:START" }  # to 80 s: slow boots under load
 # Multiplayer is the 4th item of the main menu.
@@ -10,7 +11,7 @@ $a += "@1+4.0:DOWN"; $a += "@1+4.6:DOWN"; $a += "@1+5.2:DOWN"; $a += "@1+6.0:CRO
 if ($Steps) { $a += $Steps }
 $x = "PS2X_STATUS=1;PS2X_AUTOINPUT_ANCHOR=1d7470"
 if ($Extra) { $x = "$x;$Extra" }
-& "$root\tools\bgtest.ps1" -Seconds $Seconds -ShotSec $ShotSec -AutoInput ($a -join ",") -Extra $x | Out-Null
+& "$PSScriptRoot\bgtest.ps1" -Seconds $Seconds -ShotSec $ShotSec -AutoInput ($a -join ",") -Extra $x | Out-Null
 if ($Out) {
     python -c @"
 from PIL import Image

@@ -1,9 +1,12 @@
 # Builds the runner gently: Idle priority, limited to a few cores (child cl.exe processes inherit both).
 param([int]$Cores = 6, [string]$Target = "ps2EntryRunner")
-$root = "D:\Xbox Games Ports\WWE Crush Hour"
+# PS2X_PORT_ROOT: the port's working tree (GameFiles, recomp, testrun); see ps2x_paths.py.
+$root = if ($env:PS2X_PORT_ROOT) { $env:PS2X_PORT_ROOT } else { "D:\Xbox Games Ports\WWE Crush Hour" }
+# This checkout (also when run through the dev tree's <root>\tools junction).
+$repo = if (Test-Path "$PSScriptRoot\..\..\ps2xRuntime") { (Resolve-Path "$PSScriptRoot\..\..").Path } else { "$root\PS2Recomp" }
 $log = "$root\recomp\build_log.txt"
 $mask = [int64]([math]::Pow(2, $Cores) - 1)
-$p = Start-Process -FilePath "cmake" -ArgumentList "--build `"$root\PS2Recomp\out\build`" --config Release --target $Target -- /m:1 /v:m" `
+$p = Start-Process -FilePath "cmake" -ArgumentList "--build `"$repo\out\build`" --config Release --target $Target -- /m:1 /v:m" `
     -RedirectStandardOutput $log -WindowStyle Hidden -PassThru
 Start-Sleep -Milliseconds 300
 try { $p.PriorityClass = 'Idle'; $p.ProcessorAffinity = [IntPtr]$mask } catch {}

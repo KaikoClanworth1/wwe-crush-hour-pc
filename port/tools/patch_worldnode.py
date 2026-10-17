@@ -2,7 +2,10 @@
 # world to the native RenderWare path (nrw::pcplWorldNode in native_rw.cpp). When it draws every visible sector there
 # (markers in RenderWare's open VIF packet), the node returns TRUE and RenderWare builds no world packets this frame.
 # PS2X_NRW_WORLDNODE selects the mode. Idempotent.
-path = r'D:\Xbox Games Ports\WWE Crush Hour\recomp\output\PCPL_WPipeNodeBody__FP14RxPipelineNodePC19RxPipelineNodeParam_0x2b57f0.cpp'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
+path = out('PCPL_WPipeNodeBody__FP14RxPipelineNodePC19RxPipelineNodeParam_0x2b57f0.cpp')
 s = open(path, encoding='utf-8').read()
 if 'patch_worldnode' in s:
     print('already patched')

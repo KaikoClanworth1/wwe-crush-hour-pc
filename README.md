@@ -34,12 +34,16 @@ The engine is a fork of [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp) (i
 ## Building (outline)
 
 1. Extract `SLUS_203.85` and the disc contents from your own copy of the game into `GameFiles/`.
-2. Run the recompiler with `port/recomp/config.toml` to generate `recomp/output/`, then apply the
-   `port/tools/patch_*.py` scripts to the generated files.
+2. Run the recompiler with `port/recomp/config.toml` to generate `recomp/output/`, then
+   `python port/tools/apply_patches.py` to apply the port's patches to the generated files.
 3. Dump the game's VU1 microcode (`PS2X_VU_DUMP`) and compile it with `port/tools/vu1_recomp.py`.
-4. Configure with CMake (`out/build`) and build the `ps2EntryRunner` target (`port/tools/lowbuild.ps1`).
+4. Configure with CMake (`out/build`, `-DPS2X_GAME_DIR=<recomp/output>`) and build the `ps2EntryRunner` target
+   (`port/tools/lowbuild.ps1`). Player builds add `-DPS2X_SHIPPING=ON` (no developer diagnostics or verbose logs).
 
-The tools currently use the absolute paths of the development machine (`D:\Xbox Games Ports\WWE Crush Hour`).
+The tools find the working tree through `PS2X_PORT_ROOT` (default: the development machine's
+`D:\Xbox Games Ports\WWE Crush Hour`); see [`port/tools/README.md`](port/tools/README.md). Without game files, the
+recompiler, runtime and unit tests still build on Windows and Linux (`ps2x_tests`, run by CI).
+`port/tools/regress.ps1` compares the scripted test runs with a saved baseline.
 
 ## Not included
 

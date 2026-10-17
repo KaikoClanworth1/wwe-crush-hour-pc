@@ -1,10 +1,12 @@
 # Resolve "[crash]   #NN ps2EntryRunner.exe+0xOFFSET" lines (win32_host.cpp crash filter) with the linker map.
 # Usage: python tools\crashsym.py [stdout.txt]
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import REPO, OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import bisect, re, sys
 
-root = r'D:\Xbox Games Ports\WWE Crush Hour'
-mapf = root + r'\PS2Recomp\out\build\ps2xRuntime\Release\ps2EntryRunner.map'
-log = sys.argv[1] if len(sys.argv) > 1 else root + r'\testrun\stdout.txt'
+mapf = os.path.join(REPO, 'out', 'build', 'ps2xRuntime', 'Release', 'ps2EntryRunner.map')
+log = sys.argv[1] if len(sys.argv) > 1 else root('testrun', 'stdout.txt')
 
 base = None
 syms = []

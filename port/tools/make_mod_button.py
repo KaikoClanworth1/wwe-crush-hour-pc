@@ -9,12 +9,14 @@
 # is gs_d3d11_backend.cpp's fnv1a over rows 403..471, columns 112..391, which identifies the texture at runtime).
 # Output: PS2Recomp/ps2xRuntime/src/lib/gs/mod_button.inc (both variants' rectangle) and tools/xbox_icons/
 # mod_button_preview.png.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ps2x_paths import OUTPUT, ROOT, RUNTIME, TOOLS, out, root, runtime  # noqa: E402,F401
 import glob, os
 from collections import deque
 import numpy as np
 from PIL import Image
 
-ROOT = r'D:\Xbox Games Ports\WWE Crush Hour'
 SRC = glob.glob(os.path.join(ROOT, 'tools', 'xbox_icons', 'menu_sign_*.png'))
 assert len(SRC) == 1, SRC
 HASH = os.path.basename(SRC[0])[len('menu_sign_'):-4]
