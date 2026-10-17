@@ -23,7 +23,7 @@ namespace ps2host
         uint32_t height = 1080;
         bool fullscreen = false;
         bool vsync = true;
-        uint32_t targetFps = 60;
+        uint32_t targetFps = 60; // 30, 60, or higher (120 / 144 / ...); 0 = the display's refresh rate
         bool keepAspect = true; // 4:3 pillarbox for the PS2 framebuffer
         bool widescreen = false;
         // [Audio] volumes, 0..100 (percent).
@@ -31,6 +31,8 @@ namespace ps2host
         uint32_t effectsVolume = 100;    // sound effects (SENG events)
         uint32_t commentaryVolume = 100; // SENG streams (commentary)
         uint32_t movieVolume = 100;      // PSS movie audio
+        // [Timing] WallClockTimers: EE timers follow host time instead of synthetic guest cycles.
+        bool wallClockTimers = false;
         // [Saves] Folder: where the memory card folders (mc0, mc1) live; empty = the platform default.
         std::filesystem::path saveFolder;
     };
@@ -77,7 +79,7 @@ namespace ps2host
         ShowFps,
         VSync,
         Fullscreen,
-        TargetFps,  // applies on restart
+        TargetFps,  // applies on restart: 30, 60, 120, 144, 165, 240, 0 = display refresh
         Widescreen, // applies on restart
         MasterVolume,
         EffectsVolume,
@@ -141,6 +143,8 @@ namespace ps2host
 
     // Timing ------------------------------------------------------------
     double timeSeconds();
+    // Refresh rate of the primary display (TargetFPS=0: the game runs at this rate).
+    double displayRefreshHz();
     double lastFrameMs();
 
     // Debug: start sampling the calling thread's instruction pointer (PS2X_PROFILE=<file>).

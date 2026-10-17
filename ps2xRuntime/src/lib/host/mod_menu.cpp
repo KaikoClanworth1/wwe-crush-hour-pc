@@ -567,7 +567,7 @@ namespace
         {ps2host::Setting::Fullscreen, "Fullscreen", "Borderless fullscreen on the current monitor (Alt+Enter).", SettingItem::kOnOff},
         {ps2host::Setting::VSync, "VSync", "Wait for the display refresh (no tearing).", SettingItem::kOnOff},
         {ps2host::Setting::ShowFps, "FPS counter", "Frames shown / game frames per second in the corner (F1).", SettingItem::kOnOff},
-        {ps2host::Setting::TargetFps, "Frame rate", "60 fps, or 30 for the original pacing. Applies on the next start.", SettingItem::kFps},
+        {ps2host::Setting::TargetFps, "Frame rate", "30 (original pacing), 60, high refresh (120 / 144 / 165 / 240) or DISPLAY (the monitor's rate). Applies on the next start.", SettingItem::kFps},
         {ps2host::Setting::Widescreen, "Widescreen", "16:9 3D view with the HUD kept in proportion. Applies on the next start.", SettingItem::kOnOff},
     };
     constexpr int kSettingCount = static_cast<int>(sizeof(kSettings) / sizeof(kSettings[0]));
@@ -578,7 +578,7 @@ namespace
         switch (item.kind)
         {
         case SettingItem::kOnOff: return v ? "ON" : "OFF";
-        case SettingItem::kFps: return v >= 60 ? "60" : "30";
+        case SettingItem::kFps: return v == 0 ? "DISPLAY" : std::to_string(v);
         case SettingItem::kVolume: return std::to_string(v) + "%";
         }
         return {};
@@ -591,7 +591,18 @@ namespace
         switch (item.kind)
         {
         case SettingItem::kOnOff: ps2host::setSetting(item.id, v ? 0 : 1); break;
-        case SettingItem::kFps: ps2host::setSetting(item.id, v >= 60 ? 30 : 60); break;
+        case SettingItem::kFps:
+        {
+            // 30 / 60 / high refresh rates / 0 = the display's refresh rate.
+            static constexpr int kRates[] = {30, 60, 120, 144, 165, 240, 0};
+            constexpr int n = static_cast<int>(sizeof(kRates) / sizeof(kRates[0]));
+            int i = 0;
+            while (i < n && kRates[i] != v)
+                ++i;
+            i = i == n ? 1 : (i + (dir < 0 ? n - 1 : 1)) % n;
+            ps2host::setSetting(item.id, kRates[i]);
+            break;
+        }
         case SettingItem::kVolume:
         {
             int next = v + dir * 10;
@@ -1322,7 +1333,7 @@ namespace modmenu
                     for (const SettingItem &item : kSettings)
                     {
                         const int v = ps2host::getSetting(item.id);
-                        const bool lit = item.kind == SettingItem::kVolume ? v > 0 : (item.kind == SettingItem::kFps ? v >= 60 : v != 0);
+                        const bool lit = item.kind == SettingItem::kVolume ? v > 0 : (item.kind == SettingItem::kFps ? (v == 0 || v >= 60) : v != 0);
                         rows.push_back({item.name, item.desc, source, lit, false, settingValue(item)});
                     }
                     cursor = g_setCursor;

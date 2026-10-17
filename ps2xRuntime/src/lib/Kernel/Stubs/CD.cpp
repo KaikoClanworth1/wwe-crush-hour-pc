@@ -37,7 +37,8 @@ namespace ps2_stubs
 
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
         {
-            return runtime != nullptr ? runtime->eeScheduler().currentVSyncTick() : 0u;
+            // 60 Hz field ticks, independent of the VBLANK rate.
+            return runtime != nullptr ? (runtime->eeScheduler().videoTickQ32() >> 32u) : 0u;
         }
 
         uint32_t dvdStreamSectorsPerSecond(uint8_t spindleControl)

@@ -11,7 +11,7 @@
 #include <tlhelp32.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
-#include <dxgi1_3.h>
+#include <dxgi1_5.h>
 #include <xaudio2.h>
 #include <Xinput.h>
 #include <shlobj.h>
@@ -154,6 +154,16 @@ namespace ps2host
         // FPS counter: on-screen box (F1 toggles, ShowFPS in [Display]) and the window title.
         bool g_showFps = true;
         std::filesystem::path g_configPath; // settings file in use (loadConfig)
+        // Swap chain created with ALLOW_TEARING: with VSync off, presents go out at once (variable refresh /
+        // G-Sync / FreeSync displays follow the game's frame rate instead of tearing at a fixed one).
+        bool g_tearingSupported = false;
+        double g_displayHz = 60.0;
+
+        UINT swapChainFlags()
+        {
+            return DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+                   (g_tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
+        }
         std::wstring g_baseTitle;
         std::atomic<int> g_titleFps{-1}, g_titleGameFps{-1};
         int g_shownTitleFps = -2, g_shownTitleGameFps = -2;
@@ -302,7 +312,7 @@ float4 ps_main(VsOut i) : SV_Target
                 return;
             g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
             g_backRtv.Reset();
-            g_swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
+            g_swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, swapChainFlags());
             createBackBufferView();
         }
 
@@ -658,7 +668,10 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
                 g_nextShot = nowSeconds() + g_shotInterval;
                 saveScreenshot();
             }
-            g_swap->Present(g_config.vsync ? 1 : 0, 0);
+            if (g_config.vsync)
+                g_swap->Present(1, 0);
+            else
+                g_swap->Present(0, g_tearingSupported ? DXGI_PRESENT_ALLOW_TEARING : 0); // borderless / windowed only
         }
 
         // Called outside the D3D lock: waits for the swap chain (vsync) and applies the FPS cap.
@@ -750,7 +763,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             writeSetting(L"Display", L"Fullscreen", value != 0);
             break;
         case Setting::TargetFps:
-            g_config.targetFps = value >= 60 ? 60u : 30u;
+            g_config.targetFps = static_cast<uint32_t>(std::clamp(value, 0, 360));
             writeSetting(L"Display", L"TargetFPS", static_cast<int>(g_config.targetFps));
             break;
         case Setting::Widescreen:
@@ -827,6 +840,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         g_config.keepAspect = GetPrivateProfileIntA("Display", "KeepAspect", g_config.keepAspect, iniPath) != 0;
         g_config.widescreen = GetPrivateProfileIntA("Display", "Widescreen", g_config.widescreen, iniPath) != 0;
         g_showFps = GetPrivateProfileIntA("Display", "ShowFPS", g_showFps ? 1 : 0, iniPath) != 0;
+        g_config.wallClockTimers = GetPrivateProfileIntA("Timing", "WallClockTimers", g_config.wallClockTimers, iniPath) != 0;
         g_config.masterVolume = GetPrivateProfileIntA("Audio", "MasterVolume", g_config.masterVolume, iniPath);
         g_config.effectsVolume = GetPrivateProfileIntA("Audio", "EffectsVolume", g_config.effectsVolume, iniPath);
         g_config.commentaryVolume = GetPrivateProfileIntA("Audio", "CommentaryVolume", g_config.commentaryVolume, iniPath);
@@ -1072,6 +1086,19 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         dxgiDev->GetAdapter(&adapter);
         ComPtr<IDXGIFactory2> factory;
         adapter->GetParent(IID_PPV_ARGS(&factory));
+        {
+            ComPtr<IDXGIFactory5> factory5;
+            BOOL allowTearing = FALSE;
+            if (SUCCEEDED(factory.As(&factory5)) &&
+                SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing))))
+                g_tearingSupported = allowTearing != FALSE;
+        }
+        {
+            DEVMODEW mode{};
+            mode.dmSize = sizeof(mode);
+            if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
+                g_displayHz = static_cast<double>(mode.dmDisplayFrequency);
+        }
 
         RECT rc{};
         GetClientRect(g_hwnd, &rc);
@@ -1083,7 +1110,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         sd.BufferCount = 2;
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        sd.Flags = swapChainFlags();
         hr = factory->CreateSwapChainForHwnd(g_device.Get(), g_hwnd, &sd, nullptr, nullptr, &g_swap);
         if (FAILED(hr))
             return false;
@@ -1376,6 +1403,8 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         std::lock_guard lock(g_audioMutex);
         g_audioResetListeners.push_back(std::move(onReset));
     }
+
+    double displayRefreshHz() { return g_displayHz; }
 
     float effectsGain() { return static_cast<float>(std::min(g_config.effectsVolume, 100u)) / 100.0f; }
     float commentaryGain() { return static_cast<float>(std::min(g_config.commentaryVolume, 100u)) / 100.0f; }

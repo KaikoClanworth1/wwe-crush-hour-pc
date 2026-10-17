@@ -1184,6 +1184,22 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
         m_audioBackend.setAudioReady(ps2host::audioReady());
+        {
+            // High frame rates: the game's frame loop waits for one VBLANK per frame (ps2x_frame_vsync_threshold),
+            // so the VBLANK runs at the target rate; 0 = the display's refresh. PS2X_VBLANK_HZ overrides.
+            const uint32_t fps = ps2host::config().targetFps;
+            double hz = fps == 0u ? ps2host::displayRefreshHz() : static_cast<double>(fps);
+            if (const char *v = std::getenv("PS2X_VBLANK_HZ"); v && *v)
+                hz = std::atof(v);
+            m_eeScheduler->setVBlankRate(std::max(60.0, hz));
+            const char *wall = std::getenv("PS2X_WALLCLOCK_TIMERS");
+            const bool wallClock = wall && *wall ? *wall != '0' : ps2host::config().wallClockTimers;
+            m_eeScheduler->setWallClockTimers(wallClock);
+            if (wallClock)
+                std::cout << "[runtime] EE timers follow host time" << std::endl;
+            if (m_eeScheduler->vblankRate() != 60.0)
+                std::cout << "[runtime] VBLANK at " << m_eeScheduler->vblankRate() << " Hz" << std::endl;
+        }
         if (!std::getenv("PS2X_GS_CPU"))
         {
             m_gs.setRasterBackend(std::make_unique<GSD3D11Backend>());
@@ -2974,7 +2990,8 @@ extern "C" uint32_t ps2x_frame_vsync_threshold()
         if (const char *v = std::getenv("PS2X_FPS30"); v && *v && *v != '0')
             return 2u;
 #if defined(PS2X_NATIVE_HOST)
-        return ps2host::config().targetFps >= 60u ? 1u : 2u;
+        const uint32_t fps = ps2host::config().targetFps;
+        return (fps == 0u || fps >= 60u) ? 1u : 2u; // 0 = display refresh
 #else
         return 2u;
 #endif

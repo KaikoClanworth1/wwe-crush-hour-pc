@@ -46,6 +46,7 @@ namespace ps2host
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
     }
     double lastFrameMs() { return 0.0; }
+    double displayRefreshHz() { return 60.0; }
 
     void profileCurrentThread() {}
 }

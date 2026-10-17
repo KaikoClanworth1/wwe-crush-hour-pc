@@ -62,7 +62,8 @@ Settings  (GameFiles\ps2x_settings.ini, or in game: mod menu, LB / RB to the SET
   Width / Height   window size (default 1920x1080; up to 3840x2160)
   Fullscreen=1     start in borderless fullscreen at the monitor's resolution (4K on a 4K screen)
   VSync            1 = on
-  TargetFPS=60     60 fps mode; set 30 for the original 30 fps frame pacing
+  TargetFPS=60     60 fps; 30 = the original pacing; 120 / 144 / 165 / 240 for high refresh displays;
+                   0 = the monitor's refresh rate. VSync=0 + a G-Sync / FreeSync display: no tearing
   KeepAspect=1     undistorted picture (4:3 with side bars)
   Widescreen=1     true 16:9 (default): wider 3D view (more of the arena at the sides); HUD, text and menu
                    panels keep their proportions, name tags stay over the cars; movies and loading

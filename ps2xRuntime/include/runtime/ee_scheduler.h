@@ -354,6 +354,15 @@ public:
     void dispatchIrq(bool dmac, uint32_t cause);
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+    // Emulated VBLANK rate (default 60 Hz). Above 60 the game's vsync-paced loop runs at that rate (high refresh
+    // displays); set before reset(). Video pacing (movies, CD streams) uses videoTickQ32, which stays a 60 Hz clock.
+    void setVBlankRate(double hz) noexcept;
+    [[nodiscard]] double vblankRate() const noexcept { return m_vblankHz; }
+    [[nodiscard]] uint64_t videoTickQ32() const noexcept;
+    // EE timers T0-T3 normally count the synthetic cycles charged at checkpoints (they follow how much guest code
+    // ran). Wall-clock mode feeds them the host time elapsed instead, so a timer-based clock (Havok's
+    // hkPs2SystemClock reads T1) measures real time.
+    void setWallClockTimers(bool on) noexcept;
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
@@ -446,6 +455,11 @@ private:
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_unaccountedCycles = 0; // EE cycles not yet fed to the timers / IOP clock (accountCycles)
+    double m_vblankHz = 60.0;
+    bool m_wallClockTimers = false;
+    std::chrono::steady_clock::time_point m_lastTimerFeed{};
+    std::chrono::microseconds m_vblankPeriod{16667};
+    uint64_t m_vblankPeriodCycles = (16667ull * kEeClockHz + 999999ull) / 1000000ull;
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};

@@ -35,7 +35,6 @@ namespace
     constexpr uint32_t WEF_OR = 0x01u;
     constexpr uint32_t WEF_CLEAR = 0x10u;
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
-    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
@@ -54,7 +53,6 @@ namespace
         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
     }
 
-    constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
 
@@ -204,8 +202,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
-                  std::chrono::steady_clock::now() + kVBlankPeriod,
+    scheduleEvent(m_eeCycle + m_vblankPeriodCycles,
+                  std::chrono::steady_clock::now() + m_vblankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
 }
@@ -459,6 +457,28 @@ void EeScheduler::postEvent(EeEvent event)
 // uses it to tell "callee returned without touching pc" (HLE stubs) from "callee suspended".
 uint64_t g_eeTransferSeq = 0;
 
+void EeScheduler::setVBlankRate(double hz) noexcept
+{
+    m_vblankHz = std::clamp(hz, 30.0, 360.0);
+    const auto periodUs = static_cast<uint64_t>(1000000.0 / m_vblankHz + 0.5);
+    m_vblankPeriod = std::chrono::microseconds(periodUs);
+    m_vblankPeriodCycles = microsecondsToEeCycles(periodUs);
+}
+
+void EeScheduler::setWallClockTimers(bool on) noexcept
+{
+    m_wallClockTimers = on;
+    m_lastTimerFeed = std::chrono::steady_clock::now();
+}
+
+uint64_t EeScheduler::videoTickQ32() const noexcept
+{
+    // Q32 vblank ticks rescaled to 60 Hz: tick * 60 / rate, kept exact (integer shift) at the default 60 Hz.
+    if (m_vblankHz == 60.0)
+        return m_vsyncTick << 32u;
+    return static_cast<uint64_t>(static_cast<double>(m_vsyncTick) * (60.0 / m_vblankHz) * 4294967296.0);
+}
+
 bool EeScheduler::checkpointDueSlow(uint32_t cycles) noexcept
 {
     const bool due = checkpointDueImpl(cycles);
@@ -513,7 +533,17 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     {
         const uint64_t batch = m_unaccountedCycles;
         m_unaccountedCycles = 0u;
-        m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(batch);
+        uint64_t timerCycles = batch;
+        if (m_wallClockTimers)
+        {
+            // Host time since the last feed, in EE cycles; a long host stall (> 250 ms) counts as one batch.
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed = now - m_lastTimerFeed;
+            m_lastTimerFeed = now;
+            const double seconds = std::chrono::duration<double>(elapsed).count();
+            timerCycles = seconds > 0.25 ? batch : static_cast<uint64_t>(seconds * static_cast<double>(kEeClockHz));
+        }
+        m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(timerCycles);
         m_runtime.advanceIopEeCycles(batch);
     }
     if (m_pendingEeTimerInterrupts != 0u)
@@ -2022,13 +2052,13 @@ void EeScheduler::processDueDeadlines()
                 // ran the game fast-forward for a moment (game logic keeps real time on its own).
                 auto hostBase = scheduled.hostDeadline;
                 const auto hostNow = std::chrono::steady_clock::now();
-                if (hostNow - hostBase > 2 * kVBlankPeriod)
+                if (hostNow - hostBase > 2 * m_vblankPeriod)
                     hostBase = hostNow;
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               hostBase + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              hostBase + kVBlankPeriod,
+                scheduleEvent(scheduled.deadlineCycle + m_vblankPeriodCycles,
+                              hostBase + m_vblankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

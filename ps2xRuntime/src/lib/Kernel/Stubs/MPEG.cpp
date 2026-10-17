@@ -2688,8 +2688,8 @@ namespace ps2_stubs
 
             if (!playback.decodedFrames.empty())
             {
-                const uint64_t currentTick = runtime->eeScheduler().currentVSyncTick();
-                const uint64_t currentTickQ32 = currentTick << 32u;
+                // Movie frames are timed on a 60 Hz clock, whatever the VBLANK rate (high frame-rate modes).
+                const uint64_t currentTickQ32 = runtime->eeScheduler().videoTickQ32();
                 const MpegDecodedFrame &nextFrame = playback.decodedFrames.front();
                 const uint64_t frameIntervalQ32 = decodedFrameIntervalQ32(playback, nextFrame);
                 uint64_t presentationTargetQ32 = presentationTickForFrame(playback, nextFrame, currentTickQ32);
@@ -2866,7 +2866,7 @@ namespace ps2_stubs
                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
         const uint64_t presentationEnd = playback.presentationEndTickQ32;
         const uint64_t currentTickQ32 = runtime != nullptr
-                                            ? (runtime->eeScheduler().currentVSyncTick() << 32u)
+                                            ? runtime->eeScheduler().videoTickQ32()
                                             : std::numeric_limits<uint64_t>::max();
         const bool presentationComplete =
             presentationEnd == std::numeric_limits<uint64_t>::max() ||

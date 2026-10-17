@@ -659,6 +659,33 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(env.ctx.pc, 0x00123450u, "pc should be where the callee left it");
         });
 
+        tc.Run("wall-clock timers advance with host time, not charged cycles", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            constexpr uint32_t kTimer0Count = 0x10000000u;
+            constexpr uint32_t kTimer0Mode = 0x10000010u;
+            runtime.memory().writeIORegister(kTimer0Count, 0u);
+            runtime.memory().writeIORegister(kTimer0Mode, 0x82u); // counting, BUSCLK / 256 (576 kHz)
+
+            EeScheduler &scheduler = runtime.eeScheduler();
+            scheduler.setWallClockTimers(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            scheduler.accountCycles(1024u); // one batch: 1024 cycles would be 2 ticks; 20 ms is ~11500
+            const uint32_t count = runtime.memory().readIORegister(kTimer0Count);
+            t.IsTrue(count > 5000u, "20 ms of host time should advance the 576 kHz timer by thousands of ticks");
+        });
+
+        tc.Run("video ticks stay a 60 Hz clock at other VBLANK rates", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            EeScheduler &scheduler = runtime.eeScheduler();
+            t.Equals(scheduler.vblankRate(), 60.0, "the default VBLANK rate is 60 Hz");
+            scheduler.setVBlankRate(120.0);
+            t.Equals(scheduler.vblankRate(), 120.0, "the VBLANK rate is configurable");
+            t.Equals(scheduler.videoTickQ32(), 0ull, "no vblank yet: video tick 0");
+        });
+
         tc.Run("CreateThread and CreateSema decode the exact PS2SDK EE layouts", [](TestCase &t)
         {
             TestEnv env;
