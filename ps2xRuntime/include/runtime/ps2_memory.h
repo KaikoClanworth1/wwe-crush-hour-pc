@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <array>
 #include <functional>
 #include <vector>
@@ -258,6 +259,94 @@ struct JumpTable
     std::vector<uint32_t> targets; // Jump targets
 };
 
+
+// EE I/O register storage (timers, DMAC, INTC, GIF/VIF control at 0x10000000-0x1000FFFF): a flat word array
+// instead of a hash map, since the DMAC model and guest MMIO touch these registers on every kick. Keeps the
+// subset of the std::unordered_map interface the memory model uses (operator[], find/end, count, clear);
+// unaligned or out-of-range keys fall back to a map.
+class PS2IoRegisterFile
+{
+public:
+    class iterator
+    {
+    public:
+        struct Entry
+        {
+            uint32_t first;
+            uint32_t &second;
+        };
+        struct Arrow
+        {
+            Entry entry;
+            Entry *operator->() { return &entry; }
+        };
+
+        iterator(uint32_t key, uint32_t *value) : m_key(key), m_value(value) {}
+        Entry operator*() const { return {m_key, *m_value}; }
+        Arrow operator->() const { return Arrow{{m_key, *m_value}}; }
+        bool operator==(const iterator &other) const { return m_value == other.m_value; }
+        bool operator!=(const iterator &other) const { return m_value != other.m_value; }
+
+    private:
+        uint32_t m_key;
+        uint32_t *m_value;
+    };
+
+    PS2IoRegisterFile() : m_values(kWords, 0u), m_present(kWords, 0u) {}
+
+    uint32_t &operator[](uint32_t address)
+    {
+        size_t index;
+        if (!slot(address, index))
+            return m_other[address];
+        m_present[index] = 1u;
+        return m_values[index];
+    }
+
+    iterator find(uint32_t address)
+    {
+        size_t index;
+        if (slot(address, index))
+            return m_present[index] ? iterator(address, &m_values[index]) : end();
+        auto it = m_other.find(address);
+        return it != m_other.end() ? iterator(address, &it->second) : end();
+    }
+
+    iterator end() { return iterator(0u, nullptr); }
+
+    size_t count(uint32_t address) const
+    {
+        size_t index;
+        if (slot(address, index))
+            return m_present[index] ? 1u : 0u;
+        return m_other.count(address);
+    }
+
+    void clear()
+    {
+        std::fill(m_values.begin(), m_values.end(), 0u);
+        std::fill(m_present.begin(), m_present.end(), uint8_t{0});
+        m_other.clear();
+    }
+
+private:
+    static constexpr uint32_t kBase = 0x10000000u;
+    static constexpr size_t kWords = 0x10000u / 4u;
+
+    static bool slot(uint32_t address, size_t &index)
+    {
+        const uint32_t offset = address - kBase;
+        if (offset >= 0x10000u || (offset & 3u) != 0u)
+            return false;
+        index = offset >> 2;
+        return true;
+    }
+
+    std::vector<uint32_t> m_values;
+    std::vector<uint8_t> m_present;
+    std::unordered_map<uint32_t, uint32_t> m_other;
+};
+
 class PS2Memory
 {
 public:
@@ -377,7 +466,7 @@ public:
     std::atomic<uint64_t> m_vu0CodeGeneration{0};
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
-    std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+    PS2IoRegisterFile m_ioRegisters;
 
     // Registers
     GSRegisters gs_regs;

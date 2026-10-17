@@ -572,6 +572,38 @@ void register_ps2_runtime_kernel_tests()
                      "SET_GPR_U32 must preserve the upper 64 bits of the 128-bit GPR");
         });
 
+        tc.Run("guest loads and stores reach the scratchpad directly and through the slow path", [](TestCase &t)
+        {
+            PS2Runtime runtimeObject;
+            t.IsTrue(runtimeObject.memory().initialize(), "runtime memory initialize should succeed");
+            PS2Runtime *runtime = &runtimeObject;
+            uint8_t *rdram = runtimeObject.memory().getRDRAM();
+            R5900Context context{};
+            R5900Context *ctx = &context;
+
+            WRITE32(PS2_SCRATCHPAD_BASE + 0x10u, 0xA1B2C3D4u);
+            WRITE16(PS2_SCRATCHPAD_BASE + 0x14u, 0x5566u);
+            WRITE8(PS2_SCRATCHPAD_BASE + 0x16u, 0x77u);
+            WRITE64(PS2_SCRATCHPAD_BASE + 0x18u, 0x0102030405060708ull);
+            WRITE128(PS2_SCRATCHPAD_BASE + 0x3FF0u, _mm_set_epi64x(0x1111222233334444ll, 0x5555666677778888ll));
+            t.Equals(runtimeObject.memory().read32(PS2_SCRATCHPAD_BASE + 0x10u), 0xA1B2C3D4u,
+                     "WRITE32 should land in the scratchpad PS2Memory reads");
+            t.Equals(runtimeObject.memory().read64(PS2_SCRATCHPAD_BASE + 0x18u), 0x0102030405060708ull,
+                     "WRITE64 should land in the scratchpad");
+            t.Equals(static_cast<uint32_t>(READ8(PS2_SCRATCHPAD_BASE + 0x16u)), 0x77u, "READ8 from the scratchpad");
+            t.Equals(static_cast<uint32_t>(READ16(PS2_SCRATCHPAD_BASE + 0x14u)), 0x5566u, "READ16 from the scratchpad");
+            t.Equals(READ32(PS2_SCRATCHPAD_BASE + 0x10u), 0xA1B2C3D4u, "READ32 from the scratchpad");
+            const __m128i last = READ128(PS2_SCRATCHPAD_BASE + 0x3FF0u);
+            t.Equals(static_cast<uint64_t>(_mm_extract_epi64(last, 1)), 0x1111222233334444ull,
+                     "READ128 of the scratchpad's last quadword");
+
+            // Through the KSEG mirror (slow path) the same bytes are visible.
+            t.Equals(READ32(0xF0000010u), 0xA1B2C3D4u, "the scratchpad mirror should read the same word");
+            // RAM is unaffected and still takes the fast path.
+            WRITE32(0x00100000u, 0xCAFEF00Du);
+            t.Equals(READ32(0x00100000u), 0xCAFEF00Du, "RAM accesses should be unaffected");
+        });
+
         tc.Run("CreateThread and CreateSema decode the exact PS2SDK EE layouts", [](TestCase &t)
         {
             TestEnv env;
