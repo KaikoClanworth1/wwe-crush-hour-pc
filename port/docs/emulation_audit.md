@@ -8,12 +8,12 @@ already native x64 code (static recompilation); the issue is the PS2 machine tha
 
 ---
 
-## Progress (Phases 0–2)
+## Progress
 
 Done (October 2026, branch `claude/busy-clarke-h91u8j`):
 
 - **Phase 0:**
-  - CI builds and the unit tests run again on Linux and Windows (442 tests). They had never run on this fork.
+  - CI builds and the unit tests run again on Linux and Windows (451 tests). They had never run on this fork.
   - `port/tools/apply_patches.py` and `ps2x_paths.py` make the patch pipeline reproducible from `PS2X_PORT_ROOT`;
     diagnostic and already-applied scripts are split out.
   - `regress.ps1` + `compare_shots.py` compare scripted runs against a baseline.
@@ -30,20 +30,60 @@ Done (October 2026, branch `claude/busy-clarke-h91u8j`):
   - `direct_guest_calls`: JAL → `PS2Runtime::callGuest` (table call).
   - Inline checkpoint fast path.
   - Opt-in `restrict_guest_pointers`.
+- **Phase 3:**
+  - The VBLANK rate follows `TargetFPS` (120 / 144 / ... or 0 = display refresh). Movie and CD-stream pacing
+    stay on a 60 Hz video clock (`videoTickQ32`).
+  - `ALLOW_TEARING` presents (VRR) when VSync is off.
+  - `[Timing] WallClockTimers` (opt-in): EE timers fed host time instead of synthetic cycles.
+- **Phase 4:**
+  - SDL3 controllers (DualSense / DS4, Switch, Deck, HID; hot-plug) with XInput as the fallback.
+  - Radial deadzone, analog L2 / R2 pressure, guide button → mod menu, `[Controls]` keyboard bindings.
+- **Phase 5:**
+  - Mipmaps for native raster textures, with alpha-coverage-preserving levels for cut-outs.
+  - Anisotropic filtering (`TextureFiltering`).
+  - Texture replacement packs and dumping (`GameFiles/Textures/<id>.png`).
+- **Phase 6:** CD sector → file resolution is one ordered lookup instead of a scan per read.
 
-Deferred, with the reason:
+Deferred, with the reason. None of these is blocked by missing code knowledge alone. Each one changes what the
+game sees at a specific engine hook, and needs a run of the game to validate frame by frame, which this
+environment cannot do (no disc):
 
 - **1.2 IOP out of the shipping build:** ps2xIOP also hosts SIF RPC binding and the HLE modules (mcserv, dbcman,
-  libsd). It can only go once Phase 6 replaces the SIF RPC transport.
+  libsd). It can only go once 6.2 removes SIF RPC.
 - **2.2 GPR caching in C locals:** this needs a spill protocol at every runtime call, checkpoint and scheduler
-  transfer (exceptions unwind through generated frames). Doing it blind, without a game build to validate
-  against, risks silent corruption. It is the next codegen step after `regress.ps1` baselines exist for the
-  changes above.
+  transfer (exceptions unwind through generated frames). Done blind, it risks silent state corruption. It is
+  the next codegen step once `regress.ps1` baselines exist.
 - **2.6 Fixed host base for RDRAM:** `rdram` already lives in a register and the fast path's mask is one AND, so
   there is little to gain on x64.
-- **Not verified here:** none of this has run against the game (no disc in CI). Regenerate `recomp/output` with
-  the new `config.toml`, run `apply_patches.py`, then compare with `regress.ps1` against a baseline from the
-  previous build.
+- **3.5 Render interpolation:** only needed if a high-rate simulation turns out unstable. Measure first with
+  `TargetFPS=120`.
+- **5.1 FMV straight to D3D11:** this needs a hook on the game's movie player (VidTex / the PSS player) to stop
+  it uploading frames through GIF. That is a game-side change to verify on screen.
+- **5.3–5.6 (native 2D, raster render targets, MSAA, VU1 removal, DMA/VIF/GIF removal):**
+  - Each step replaces a piece of the emulated chain at a RenderWare hook.
+  - The port's own method (`native_rendering_handoff.md`) is verify mode first, then switch over. That needs the
+    game running.
+  - MSAA in particular depends on render targets no longer being read back into VRAM (5.4).
+- **6.1 Path-based loader / async reads:** this hooks `pcpl_cddvd_*`. The 1 GB preload already removed the
+  stutter that motivated it.
+- **6.2 Sound without SIF RPC:** the RPC reaches `NativeSeng` in one call already (`ps2_runtime.cpp`
+  `handleRpc`). Removing the layer means hooking `SoundDevice::Flush` and then dropping ps2xIOP (1.2).
+- **6.3 Memory-card screens:** this needs hooks in the game's season save/load menus.
+- **Phase 7 (fibers):**
+  - It replaces the scheduler's control transfer (exceptions plus resume labels) with one host stack per guest
+    thread. Every generated function's return protocol depends on that, as do the scheduler's fixes (DI hold,
+    nested resume).
+  - It should follow 2.2 and run under `regress.ps1`.
+- **Phase 8 (Linux / Steam Deck):**
+  - Input is already SDL3.
+  - What remains is a window / audio host on SDL3 (or FAudio for XAudio2) and a second renderer
+    (Vulkan / SDL_GPU) for the 3,700-line D3D11 backend. That backend becomes much smaller once phase 5 removes
+    the GS model, so 5.3–5.6 should come first.
+- **Not verified here:**
+  - None of this has run against the game. Regenerate `recomp/output` with the new `config.toml`, run
+    `apply_patches.py`, then compare with `regress.ps1` against a baseline from the previous build.
+  - CI checks that it builds and passes the unit tests on Linux and Windows; `mingw-w64` and DXC were used to
+    check the Windows-only code and the shader.
 
 ## Part 1 — Audit
 
