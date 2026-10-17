@@ -54,6 +54,9 @@ namespace ps2recomp
         void setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables);
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
         void setEmitInstructionComments(bool emitInstructionComments);
+        void setMinimalPcUpdates(bool minimalPcUpdates);
+        void setDirectGuestCalls(bool directGuestCalls);
+        void setRestrictGuestPointers(bool restrictGuestPointers);
         void setReporter(RecompilerReporter *reporter);
 
         AnalysisResult collectInternalBranchTargets(const Function &function,
@@ -69,6 +72,9 @@ namespace ps2recomp
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
         bool m_emitInstructionComments = true;
+        bool m_minimalPcUpdates = false; // RecompilerConfig::minimalPcUpdates (on by default from a config file)
+        bool m_directGuestCalls = false; // RecompilerConfig::directGuestCalls
+        bool m_restrictGuestPointers = false; // RecompilerConfig::restrictGuestPointers
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;
 

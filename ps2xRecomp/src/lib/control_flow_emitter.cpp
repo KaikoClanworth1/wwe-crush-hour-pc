@@ -227,6 +227,16 @@ namespace ps2recomp
     void ControlFlowEmitter::emitExternalJumpDispatch(uint32_t target, StaticBranchKind kind, std::string_view indent)
     {
         const bool isCall = kind == StaticBranchKind::Call;
+        if (isCall && m_gen.m_directGuestCalls)
+        {
+            // Table call without dispatchGuestBranch's lookups and diagnostics; it falls back to the full path
+            // itself for targets outside the table and while call diagnostics are armed.
+            m_ss << fmt::format("{}if (!runtime->callGuest(rdram, ctx, 0x{:X}u, 0x{:X}u, 0x{:X}u)) {{\n", indent, target,
+                                branchPc(), fallthroughPc());
+            m_ss << fmt::format("{}    return;\n", indent);
+            m_ss << fmt::format("{}}}\n", indent);
+            return;
+        }
         emitRuntimeBranchDispatch(fmt::format("0x{:X}u", target),
                                   branchPc(),
                                   isCall ? fallthroughPc() : 0u,

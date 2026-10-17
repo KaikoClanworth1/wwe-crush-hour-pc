@@ -8,6 +8,43 @@ already native x64 code (static recompilation); the issue is the PS2 machine tha
 
 ---
 
+## Progress (Phases 0–2)
+
+Done (October 2026, branch `claude/busy-clarke-h91u8j`):
+
+- **Phase 0:**
+  - CI builds and the unit tests run again on Linux and Windows (442 tests). They had never run on this fork.
+  - `port/tools/apply_patches.py` and `ps2x_paths.py` make the patch pipeline reproducible from `PS2X_PORT_ROOT`;
+    diagnostic and already-applied scripts are split out.
+  - `regress.ps1` + `compare_shots.py` compare scripted runs against a baseline.
+  - `PS2X_DIAG` / `PS2X_SHIPPING` keep developer diagnostics out of player builds.
+- **Phase 1:**
+  - Audio: the sound engine runs silent without a device (the IOP interpreter is no longer reachable by default),
+    survives device loss, pools voices, decodes commentary off the EE thread, and has volume settings. The
+    generic VAG backend and the per-read sniffing are off on the native host.
+  - Saves: Saved Games, atomic writes, wide paths.
+  - Memory: direct scratchpad access from generated code; a flat I/O register file.
+  - Settings: found next to the exe; a SETTINGS page in the mod menu.
+- **Phase 2:**
+  - `minimal_pc_updates`: no `ctx->pc` store before register-only instructions.
+  - `direct_guest_calls`: JAL → `PS2Runtime::callGuest` (table call).
+  - Inline checkpoint fast path.
+  - Opt-in `restrict_guest_pointers`.
+
+Deferred, with the reason:
+
+- **1.2 IOP out of the shipping build:** ps2xIOP also hosts SIF RPC binding and the HLE modules (mcserv, dbcman,
+  libsd). It can only go once Phase 6 replaces the SIF RPC transport.
+- **2.2 GPR caching in C locals:** this needs a spill protocol at every runtime call, checkpoint and scheduler
+  transfer (exceptions unwind through generated frames). Doing it blind, without a game build to validate
+  against, risks silent corruption. It is the next codegen step after `regress.ps1` baselines exist for the
+  changes above.
+- **2.6 Fixed host base for RDRAM:** `rdram` already lives in a register and the fast path's mask is one AND, so
+  there is little to gain on x64.
+- **Not verified here:** none of this has run against the game (no disc in CI). Regenerate `recomp/output` with
+  the new `config.toml`, run `apply_patches.py`, then compare with `regress.ps1` against a baseline from the
+  previous build.
+
 ## Part 1 — Audit
 
 ### Status at a glance

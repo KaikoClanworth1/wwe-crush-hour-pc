@@ -184,6 +184,14 @@ namespace ps2recomp
         bool patchSyscalls = false;
         bool patchCop0 = true;
         bool patchCache = true;
+        // Emit ctx->pc only before instructions that can reach the runtime (memory, syscalls, stubs, traps),
+        // not before every instruction.
+        bool minimalPcUpdates = true;
+        // JAL to a guest function: PS2Runtime::callGuest (table call) instead of dispatchGuestBranch.
+        bool directGuestCalls = true;
+        // Declare rdram and ctx __restrict in generated function definitions, so guest stores do not force the
+        // compiler to reload context fields. Opt-in: validate with port/tools/regress.ps1 before shipping it.
+        bool restrictGuestPointers = false;
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;

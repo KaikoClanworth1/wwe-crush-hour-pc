@@ -64,6 +64,9 @@ namespace ps2recomp
             config.patchSyscalls = toml::find_or<bool>(general, "patch_syscalls", config.patchSyscalls);
             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
+            config.minimalPcUpdates = toml::find_or<bool>(general, "minimal_pc_updates", config.minimalPcUpdates);
+            config.directGuestCalls = toml::find_or<bool>(general, "direct_guest_calls", config.directGuestCalls);
+            config.restrictGuestPointers = toml::find_or<bool>(general, "restrict_guest_pointers", config.restrictGuestPointers);
 
             if (general.contains("stubs") && general.at("stubs").is_array())
             {
@@ -295,6 +298,9 @@ namespace ps2recomp
         general["patch_syscalls"] = config.patchSyscalls;
         general["patch_cop0"] = config.patchCop0;
         general["patch_cache"] = config.patchCache;
+        general["minimal_pc_updates"] = config.minimalPcUpdates;
+        general["direct_guest_calls"] = config.directGuestCalls;
+        general["restrict_guest_pointers"] = config.restrictGuestPointers;
         general["skip"] = config.skipFunctions;
         general["stubs"] = config.stubImplementations;
         general["entry_points"] = config.entryPointHints;

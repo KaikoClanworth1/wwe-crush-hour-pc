@@ -156,6 +156,21 @@ namespace ps2recomp
         m_emitInstructionComments = emitInstructionComments;
     }
 
+    void CodeGenerator::setMinimalPcUpdates(bool minimalPcUpdates)
+    {
+        m_minimalPcUpdates = minimalPcUpdates;
+    }
+
+    void CodeGenerator::setDirectGuestCalls(bool directGuestCalls)
+    {
+        m_directGuestCalls = directGuestCalls;
+    }
+
+    void CodeGenerator::setRestrictGuestPointers(bool restrictGuestPointers)
+    {
+        m_restrictGuestPointers = restrictGuestPointers;
+    }
+
     void CodeGenerator::setReporter(RecompilerReporter *reporter)
     {
         m_reporter = reporter;

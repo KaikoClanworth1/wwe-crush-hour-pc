@@ -19,6 +19,14 @@ patch_syscalls = false
 patch_cop0 = true
 patch_cache = true
 
+# Generated code shape (ps2xRecomp defaults shown)
+# Publish ctx->pc only before instructions that can reach the runtime (memory, syscalls, stubs, traps).
+minimal_pc_updates = true
+# JAL to a guest function calls PS2Runtime::callGuest (function table) instead of dispatchGuestBranch.
+direct_guest_calls = true
+# __restrict rdram / ctx in function definitions; opt-in until validated with port/tools/regress.ps1.
+restrict_guest_pointers = false
+
 # Functions to stub (only names with runtime syscall/stub handlers)
 stubs = [
   "__ieee754_rem_pio2f@0x00103800",

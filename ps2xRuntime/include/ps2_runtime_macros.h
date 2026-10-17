@@ -13,6 +13,7 @@
 #endif
 
 #include "ps2_runtime.h"
+#include "runtime/ee_scheduler.h" // PS2Runtime::eeCheckpointDue (inline) for generated back-edges
 
 static inline int32_t Ps2ExtractEpi32(__m128i v, int index)
 {

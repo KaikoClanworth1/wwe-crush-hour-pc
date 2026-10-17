@@ -843,6 +843,69 @@ void register_code_generator_tests()
         t.IsTrue(generated.find("goto label_") == std::string::npos, "external branch should not use goto");
     });
 
+    tc.Run("minimal pc updates publish pc only before runtime-reaching instructions", [](TestCase &t) {
+        Function func;
+        func.name = "minimal_pc";
+        func.start = 0x6000;
+        func.end = 0x6010;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        const std::vector<Instruction> instructions{
+            makeIType(0x6000, OPCODE_ADDIU, 4, 4, 0x10), // register only
+            makeLui(0x6004, 2, 0x1234),                  // register only
+            makeIType(0x6008, OPCODE_SW, 29, 2, 0x20),   // memory: may take the runtime slow path
+            makeNop(0x600C),
+        };
+
+        CodeGenerator full({}, {});
+        const std::string everyInstruction = full.generateFunction(func, instructions, false);
+        t.IsTrue(everyInstruction.find("ctx->pc = 0x6004u;") != std::string::npos,
+                 "by default every instruction publishes its pc");
+
+        CodeGenerator minimal({}, {});
+        minimal.setMinimalPcUpdates(true);
+        const std::string generated = minimal.generateFunction(func, instructions, false);
+        printGeneratedCode("minimal pc updates", generated);
+        t.IsTrue(generated.find("ctx->pc = 0x6004u;") == std::string::npos, "a register-only instruction needs no pc store");
+        t.IsTrue(generated.find("ctx->pc = 0x600cu;") == std::string::npos, "a nop needs no pc store");
+        t.IsTrue(generated.find("ctx->pc = 0x6008u;") != std::string::npos, "a store keeps its pc store");
+        t.IsTrue(generated.find("ctx->pc = 0x6000u;") != std::string::npos, "the function entry still publishes its pc");
+        t.IsTrue(generated.find("ctx->pc = 0x6010u;") != std::string::npos, "the fallthrough pc is still published");
+    });
+
+    tc.Run("direct guest calls go through callGuest", [](TestCase &t) {
+        Function func;
+        func.name = "direct_call";
+        func.start = 0x6000;
+        func.end = 0x6010;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        Instruction jal{};
+        jal.address = 0x6000;
+        jal.opcode = OPCODE_JAL;
+        jal.target = (0x7000u >> 2) & 0x3FFFFFF;
+        jal.hasDelaySlot = true;
+        jal.raw = 0x0C000000 | jal.target;
+        const std::vector<Instruction> instructions{jal, makeNop(0x6004), makeNop(0x6008), makeNop(0x600C)};
+
+        CodeGenerator dispatch({}, {});
+        const std::string viaDispatch = dispatch.generateFunction(func, instructions, false);
+        t.IsTrue(viaDispatch.find("GuestBranchKind::DirectCall") != std::string::npos,
+                 "by default a JAL goes through dispatchGuestBranch");
+
+        CodeGenerator direct({}, {});
+        direct.setDirectGuestCalls(true);
+        const std::string generated = direct.generateFunction(func, instructions, false);
+        printGeneratedCode("direct guest calls", generated);
+        t.IsTrue(generated.find("runtime->callGuest(rdram, ctx, 0x7000u, 0x6000u, 0x6008u)") != std::string::npos,
+                 "a JAL should call through callGuest with target, source and return address");
+        t.IsTrue(generated.find("GuestBranchKind::DirectCall") == std::string::npos,
+                 "a direct call should not also dispatch");
+        t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, 0x6008u);") != std::string::npos, "the call still links $ra");
+    });
+
     tc.Run("jumps to known symbols call by name", [](TestCase &t) {
         Function func;
         func.name = "call_symbol";

@@ -15,6 +15,22 @@ namespace ps2recomp
 {
     namespace
     {
+        // ctx->pc is read only by the runtime: exception / trap / syscall handlers, the scheduler (resume
+        // addresses) and the memory slow path (address errors). An instruction whose translation reaches none of
+        // these -- register, FPU and VU0 macro ops -- does not need it published first. Everything that touches
+        // memory (READ/WRITE take the runtime path for special addresses) or names the runtime keeps the store.
+        bool instructionNeedsPc(const std::string &code)
+        {
+            for (const char *token : {"runtime", "rdram", "READ", "WRITE", "ctx->pc", "throw", "return"})
+            {
+                if (code.find(token) != std::string::npos)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         Instruction makeSyntheticDelaySlot(uint32_t address)
         {
             Instruction inst{};
@@ -84,7 +100,12 @@ namespace ps2recomp
             sanitizedName = nameBuilder.str();
         }
 
-        ss << "void " << sanitizedName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
+        // Definitions only: __restrict on a parameter is not part of the function type, so declarations,
+        // the function table and callers are unaffected.
+        if (cg.m_restrictGuestPointers)
+            ss << "void " << sanitizedName << "(uint8_t* __restrict rdram, R5900Context* __restrict ctx, PS2Runtime *runtime) {\n";
+        else
+            ss << "void " << sanitizedName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
         ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
         ss << "#endif\n";
@@ -201,10 +222,14 @@ namespace ps2recomp
                         continue;
                     }
 
-                    ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
-                       << std::dec;
                     const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
-                    ss << "    " << cg.translateInstruction(inst, memoryHint);
+                    const std::string code = cg.translateInstruction(inst, memoryHint);
+                    if (!cg.m_minimalPcUpdates || instructionNeedsPc(code))
+                    {
+                        ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
+                           << std::dec;
+                    }
+                    ss << "    " << code;
                     if (inst.isMmio)
                     {
                         ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;

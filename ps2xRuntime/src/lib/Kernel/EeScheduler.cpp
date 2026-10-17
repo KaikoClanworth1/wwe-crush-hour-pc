@@ -459,7 +459,7 @@ void EeScheduler::postEvent(EeEvent event)
 // uses it to tell "callee returned without touching pc" (HLE stubs) from "callee suspended".
 uint64_t g_eeTransferSeq = 0;
 
-bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+bool EeScheduler::checkpointDueSlow(uint32_t cycles) noexcept
 {
     const bool due = checkpointDueImpl(cycles);
     if (due)
@@ -509,7 +509,7 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     // internally (>= 1024 / 8192 EE cycles), so feed them in batches here as well: most checkpoints are
     // then two adds and a compare instead of four nested calls (~8% of the EE thread in a match).
     m_unaccountedCycles += elapsed;
-    if (m_unaccountedCycles >= 1024u)
+    if (m_unaccountedCycles >= kTimerBatchCycles)
     {
         const uint64_t batch = m_unaccountedCycles;
         m_unaccountedCycles = 0u;

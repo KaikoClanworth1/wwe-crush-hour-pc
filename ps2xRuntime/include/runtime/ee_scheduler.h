@@ -267,6 +267,7 @@ public:
     static constexpr uint32_t kGeneratedCheckpointCycles = 32u;
     static constexpr uint32_t kGuestDispatchCycles = 8u;
     static constexpr uint64_t kDefaultTimeSliceCycles = 65536ull;
+    static constexpr uint64_t kTimerBatchCycles = 1024u; // EE cycles fed to the timers / IOP clock at once
 
     explicit EeScheduler(PS2Runtime &runtime);
     ~EeScheduler();
@@ -278,7 +279,25 @@ public:
     void run();
     void requestStop();
     void postEvent(EeEvent event);
-    [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+    // Every generated back-edge and guest call checks in here. Inline fast path: when the slow path would only
+    // add the cycles (no timer batch due, nothing pending, before the slice end and the next deadline), do just
+    // that; otherwise take the full check (checkpointDueSlow).
+    [[nodiscard]] inline bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept
+    {
+        const uint64_t elapsed = cycles != 0u ? cycles : 1u;
+        const uint64_t cycle = m_eeCycle + elapsed;
+        const uint64_t deadline = m_nextDeadlineCycle.load(std::memory_order_acquire);
+        if (m_unaccountedCycles + elapsed < kTimerBatchCycles && m_pendingEeTimerInterrupts == 0u &&
+            cycle < m_sliceEndCycle && (deadline == 0u || cycle < deadline) &&
+            !m_checkpointPending.load(std::memory_order_acquire) && !m_stopRequested.load(std::memory_order_acquire))
+        {
+            m_eeCycle = cycle;
+            m_unaccountedCycles += elapsed;
+            return false;
+        }
+        return checkpointDueSlow(cycles);
+    }
+    bool checkpointDueSlow(uint32_t cycles) noexcept;
     bool checkpointDueImpl(uint32_t cycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
@@ -456,3 +475,36 @@ private:
     EeKernelSnapshot m_snapshot;
     uint64_t m_snapshotSequence = 0;
 };
+
+// Generated code's back-edge check (control_flow_emitter.cpp): inline down to EeScheduler's fast path.
+inline bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+{
+    return m_eeScheduler->checkpointDue(cycles);
+}
+
+extern uint64_t g_eeTransferSeq; // EeScheduler.cpp: bumped whenever control passes to the scheduler
+
+inline bool PS2Runtime::callGuest(uint8_t *rdram, R5900Context *ctx, uint32_t targetPc, uint32_t sourcePc,
+                                  uint32_t fallthroughPc)
+{
+    const uint32_t offset = targetPc - g_ps2RecompiledFunctionTableBase;
+    RecompiledFunction fn = nullptr;
+    if (!m_guestCallHooks && (targetPc & 3u) == 0u && targetPc < g_ps2RecompiledFunctionTableEnd &&
+        (offset >> 2) < g_ps2RecompiledFunctionTableSlotCount)
+        fn = g_ps2RecompiledFunctionTable[offset >> 2];
+    if (!fn) // diagnostics armed, or not in the table: the full path reports it
+        return dispatchGuestBranch(rdram, ctx, targetPc, sourcePc, fallthroughPc, GuestBranchKind::DirectCall, "JAL");
+
+    ctx->pc = targetPc;
+    // Every inter-function transfer is a safe point, as in dispatchGuestBranch.
+    if (m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+        return false;
+    const uint64_t transferSeqBefore = g_eeTransferSeq;
+    fn(rdram, ctx, this);
+    if (isStopRequested() || ctx->pc == 0u)
+        return false;
+    // pc still at the entry and no scheduler transfer in between: an HLE stub that returned without setting pc.
+    if (ctx->pc == targetPc && g_eeTransferSeq == transferSeqBefore)
+        ctx->pc = fallthroughPc;
+    return ctx->pc == fallthroughPc;
+}

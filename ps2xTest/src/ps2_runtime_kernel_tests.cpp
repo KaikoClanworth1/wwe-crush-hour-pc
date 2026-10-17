@@ -604,6 +604,61 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(READ32(0x00100000u), 0xCAFEF00Du, "RAM accesses should be unaffected");
         });
 
+        tc.Run("checkpoint fast path only adds cycles until the slow path has work", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            constexpr uint32_t kTimer0Count = 0x10000000u;
+            constexpr uint32_t kTimer0Mode = 0x10000010u;
+            runtime.memory().writeIORegister(kTimer0Count, 0u);
+            runtime.memory().writeIORegister(kTimer0Mode, 0x80u); // counting, BUSCLK (EE / 2)
+
+            EeScheduler &scheduler = runtime.eeScheduler();
+            bool anyDue = false;
+            for (int i = 0; i < 31; ++i) // 992 cycles: below the 1024-cycle timer batch
+                anyDue |= scheduler.checkpointDue(32u);
+            t.IsFalse(anyDue, "checkpoints with nothing pending should not be due");
+            t.Equals(runtime.memory().readIORegister(kTimer0Count), 0u, "cycles below a batch should not reach the timers yet");
+
+            t.IsFalse(scheduler.checkpointDue(32u), "the batch boundary alone should not make a checkpoint due");
+            t.Equals(runtime.memory().readIORegister(kTimer0Count), 512u, "the 1024-cycle batch should advance the timer");
+
+            scheduler.requestStop();
+            t.IsTrue(scheduler.checkpointDue(32u), "a stop request should make the next checkpoint due");
+        });
+
+        tc.Run("callGuest calls through the function table with dispatchGuestBranch's contract", [](TestCase &t)
+        {
+            constexpr uint32_t kCallee = 0x00300000u;
+            constexpr uint32_t kReturning = 0x00300100u;
+            constexpr uint32_t kElsewhere = 0x00300200u;
+            static int s_calls = 0;
+            s_calls = 0;
+            TestEnv env;
+            // A recompiled function returns by setting pc to $ra; an HLE stub leaves pc at its own entry.
+            env.runtime.registerFunction(kReturning, [](uint8_t *, R5900Context *ctx, PS2Runtime *)
+                                         {
+                                             ++s_calls;
+                                             ctx->pc = GPR_U32(ctx, 31);
+                                         });
+            env.runtime.registerFunction(kCallee, [](uint8_t *, R5900Context *, PS2Runtime *) { ++s_calls; });
+            env.runtime.registerFunction(kElsewhere, [](uint8_t *, R5900Context *ctx, PS2Runtime *) { ctx->pc = 0x00123450u; });
+
+            SET_GPR_U32(&env.ctx, 31, 0x2008u);
+            t.IsTrue(env.runtime.callGuest(env.rdram.data(), &env.ctx, kReturning, 0x2000u, 0x2008u),
+                     "a callee returning to $ra should continue the caller");
+            t.Equals(env.ctx.pc, 0x2008u, "pc should be the return address");
+
+            t.IsTrue(env.runtime.callGuest(env.rdram.data(), &env.ctx, kCallee, 0x2000u, 0x2008u),
+                     "a stub that leaves pc at its entry should continue the caller");
+            t.Equals(env.ctx.pc, 0x2008u, "pc should move on to the return address after a stub");
+            t.Equals(s_calls, 2, "both callees should have run once");
+
+            t.IsFalse(env.runtime.callGuest(env.rdram.data(), &env.ctx, kElsewhere, 0x2000u, 0x2008u),
+                      "a callee that leaves elsewhere should make the caller return");
+            t.Equals(env.ctx.pc, 0x00123450u, "pc should be where the callee left it");
+        });
+
         tc.Run("CreateThread and CreateSema decode the exact PS2SDK EE layouts", [](TestCase &t)
         {
             TestEnv env;

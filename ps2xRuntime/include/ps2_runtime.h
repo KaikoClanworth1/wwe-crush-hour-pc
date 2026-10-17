@@ -388,12 +388,16 @@ public:
     void drainCompletedDmacHandlers(uint8_t *rdram);
 
     void requestStop();
-    bool isStopRequested() const;
+    bool isStopRequested() const { return m_stopRequested.load(std::memory_order_relaxed); }
 
     EeScheduler &eeScheduler();
     const EeScheduler &eeScheduler() const;
     void postEeEvent(EeEvent event);
-    bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
+    inline bool eeCheckpointDue(uint32_t cycles = 32u) noexcept; // defined in runtime/ee_scheduler.h
+    // Generated JAL to a known guest function (PS2_CALL_GUEST): dispatchGuestBranch without its lookups and
+    // diagnostics, through the function table so runtime replacements still apply. Same contract: false = the
+    // caller returns. Defined in runtime/ee_scheduler.h.
+    inline bool callGuest(uint8_t *rdram, R5900Context *ctx, uint32_t targetPc, uint32_t sourcePc, uint32_t fallthroughPc);
     [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
 
     struct EeExitHandlerRegistration
@@ -519,6 +523,9 @@ private:
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};
     std::atomic<bool> m_stopRequested{false};
+    // callGuest takes the full dispatchGuestBranch path: direct calls are off (PS2X_DIRECT_CALLS=0) or a
+    // diagnostic that watches guest calls is armed (autoinput anchors, call / trace-anchor tracing, sp check).
+    bool m_guestCallHooks = false;
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;

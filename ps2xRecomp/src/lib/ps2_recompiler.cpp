@@ -1025,6 +1025,9 @@ namespace ps2recomp
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);
+            m_codeGenerator->setMinimalPcUpdates(m_config.minimalPcUpdates);
+            m_codeGenerator->setDirectGuestCalls(m_config.directGuestCalls);
+            m_codeGenerator->setRestrictGuestPointers(m_config.restrictGuestPointers);
 
             fs::create_directories(m_config.outputPath);
 

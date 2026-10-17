@@ -850,6 +850,20 @@ PS2Runtime::PS2Runtime()
 
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
 
+    m_guestCallHooks = []()
+    {
+        const char *direct = std::getenv("PS2X_DIRECT_CALLS");
+        if (direct && *direct == '0')
+            return true;
+#if PS2X_DIAG
+        for (const char *name : {"PS2X_AUTOINPUT_ANCHOR", "PS2X_AUTOINPUT_WATCH", "PS2X_TRACE_ANCHOR_PC", "PS2X_CALL_TRACE",
+                                 "PS2X_SPCHECK"})
+            if (const char *v = std::getenv(name); v && *v)
+                return true;
+#endif
+        return false;
+    }();
+
     // Assign rather than memset: R5900Context's constructor zeroes itself and
     // then applies the COP0 reset values, which a memset here would discard.
     m_cpuContext = R5900Context{};
@@ -3172,11 +3186,6 @@ void PS2Runtime::requestStop()
     }
 }
 
-bool PS2Runtime::isStopRequested() const
-{
-    return m_stopRequested.load(std::memory_order_relaxed);
-}
-
 EeScheduler &PS2Runtime::eeScheduler()
 {
     return *m_eeScheduler;
@@ -3190,11 +3199,6 @@ const EeScheduler &PS2Runtime::eeScheduler() const
 void PS2Runtime::postEeEvent(EeEvent event)
 {
     m_eeScheduler->postEvent(event);
-}
-
-bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
-{
-    return m_eeScheduler->checkpointDue(cycles);
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
