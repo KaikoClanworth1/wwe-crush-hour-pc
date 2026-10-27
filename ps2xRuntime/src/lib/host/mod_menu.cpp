@@ -570,6 +570,7 @@ namespace
         {ps2host::Setting::TargetFps, "Frame rate", "30 (original pacing), 60, high refresh (120 / 144 / 165 / 240) or DISPLAY (the monitor's rate). Applies on the next start.", SettingItem::kFps},
         {ps2host::Setting::TextureFiltering, "Texture filtering", "PS2 (none), mipmaps, or mipmaps with 2x-16x anisotropic filtering: sharp, stable textures at a distance. Applies on the next start.", SettingItem::kFiltering},
         {ps2host::Setting::Widescreen, "Widescreen", "16:9 3D view with the HUD kept in proportion. Applies on the next start.", SettingItem::kOnOff},
+        {ps2host::Setting::SplitWindows, "Split-screen windows", "Multiplayer: each player gets a window of their own with a full-size view and HUD (player 2's window opens with the match). Off = the original top / bottom split. Applies from the next match.", SettingItem::kOnOff},
     };
     constexpr int kSettingCount = static_cast<int>(sizeof(kSettings) / sizeof(kSettings[0]));
 

@@ -90,6 +90,7 @@ namespace ps2host
         Fullscreen,
         TargetFps,  // applies on restart: 30, 60, 120, 144, 165, 240, 0 = display refresh
         Widescreen, // applies on restart
+        SplitWindows, // two-player matches in two windows; applies from the next match
         TextureFiltering, // applies on restart: 0 (PS2), 1 (mipmaps), 2 / 4 / 8 / 16 (anisotropic)
         MasterVolume,
         EffectsVolume,

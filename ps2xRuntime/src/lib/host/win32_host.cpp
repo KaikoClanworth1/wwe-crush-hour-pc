@@ -878,6 +878,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         case Setting::Fullscreen: return g_config.fullscreen ? 1 : 0;
         case Setting::TargetFps: return static_cast<int>(g_config.targetFps);
         case Setting::Widescreen: return g_config.widescreen ? 1 : 0;
+        case Setting::SplitWindows: return g_config.splitWindows ? 1 : 0;
         case Setting::TextureFiltering: return static_cast<int>(g_config.textureFiltering);
         case Setting::MasterVolume: return static_cast<int>(g_config.masterVolume);
         case Setting::EffectsVolume: return static_cast<int>(g_config.effectsVolume);
@@ -913,6 +914,10 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         case Setting::Widescreen:
             g_config.widescreen = value != 0;
             writeSetting(L"Display", L"Widescreen", value != 0);
+            break;
+        case Setting::SplitWindows:
+            g_config.splitWindows = value != 0;
+            writeSetting(L"Display", L"SplitWindows", value != 0);
             break;
         case Setting::TextureFiltering:
             g_config.textureFiltering = static_cast<uint32_t>(std::clamp(value, 0, 16));
@@ -1278,8 +1283,8 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         factory->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER);
         createBackBufferView();
 
-        // Player 2's window for split-screen matches (split_windows.cpp), hidden until one starts.
-        if (g_config.splitWindows || std::getenv("PS2X_SPLIT_WINDOWS"))
+        // Player 2's window for split-screen matches (split_windows.cpp), hidden until one starts. Made also with
+        // SplitWindows=0: the setting can be turned on in game.
         {
             RECT wr{};
             GetWindowRect(g_hwnd, &wr);

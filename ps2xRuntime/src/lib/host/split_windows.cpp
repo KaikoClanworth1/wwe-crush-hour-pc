@@ -47,15 +47,23 @@ namespace
         return static_cast<double>(t.QuadPart) / static_cast<double>(s_freq.QuadPart);
     }
 
+    // The setting (mod menu SETTINGS page or [Display] SplitWindows; PS2X_SPLIT_WINDOWS overrides) is taken up
+    // between matches only: a match's cameras get their view windows when it starts.
+    std::atomic<bool> g_on{true};
+    std::atomic<bool> g_onRead{false};
+
+    bool settingOn()
+    {
+        if (const char *v = std::getenv("PS2X_SPLIT_WINDOWS"); v && *v)
+            return *v != '0';
+        return ps2host::config().splitWindows;
+    }
+
     bool featureOn()
     {
-        static const bool s_on = []()
-        {
-            if (const char *v = std::getenv("PS2X_SPLIT_WINDOWS"); v && *v)
-                return *v != '0';
-            return ps2host::config().splitWindows;
-        }();
-        return s_on;
+        if (!g_onRead.exchange(true))
+            g_on.store(settingOn());
+        return g_on.load(std::memory_order_relaxed);
     }
 
     bool logOn()
@@ -141,11 +149,14 @@ extern "C" int ps2x_split_hud_owner(int owner)
 // after a two-player HUD was seen.
 extern "C" void ps2x_split_world_cameras(uint32_t count)
 {
-    if (!featureOn())
-        return;
     if (count < 2u)
+    {
         g_matchLatched.store(false, std::memory_order_relaxed);
-    else if (g_matchLatched.load(std::memory_order_relaxed))
+        g_on.store(settingOn(), std::memory_order_relaxed); // not in a two-player match: the setting applies
+        g_onRead.store(true);
+        return;
+    }
+    if (featureOn() && g_matchLatched.load(std::memory_order_relaxed))
         g_splitSeen.store(nowSec(), std::memory_order_relaxed);
 }
 
@@ -230,6 +241,11 @@ extern "C" int ps2x_split_im2d(uint8_t *rdram, uint32_t verts, uint32_t count, u
 // view window twice as tall, so its picture keeps its proportions in the player's window.
 extern "C" void ps2x_split_view_window(uint8_t *rdram, uint32_t camera, uint32_t viewWindow)
 {
+    if (!g_matchLatched.load(std::memory_order_relaxed))
+    {
+        g_on.store(settingOn(), std::memory_order_relaxed); // a match's cameras are being set up: the setting applies
+        g_onRead.store(true);
+    }
     if (!featureOn() || !rdram)
         return;
     const uint32_t raster = rd32(rdram, camera + 0x60u); // RwCamera::frameBuffer
