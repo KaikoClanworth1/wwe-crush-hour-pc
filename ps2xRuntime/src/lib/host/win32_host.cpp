@@ -20,6 +20,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <memory>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -118,6 +119,12 @@ namespace ps2host
         ComPtr<IDXGISwapChain1> g_swap;
         HANDLE g_frameWaitable = nullptr;
         ComPtr<ID3D11RenderTargetView> g_backRtv;
+        // Player 2's window (split_windows.cpp): created hidden with the main one, shown while a two-player match
+        // is split into windows. Its swap chain has no frame-latency waitable (the main window paces the frames).
+        HWND g_hwnd2 = nullptr;
+        ComPtr<IDXGISwapChain1> g_swap2;
+        ComPtr<ID3D11RenderTargetView> g_backRtv2;
+        std::atomic<bool> g_window2Shown{false};
         ComPtr<ID3D11VertexShader> g_blitVs;
         ComPtr<ID3D11PixelShader> g_blitPs;
         ComPtr<ID3D11SamplerState> g_linearSampler;
@@ -189,9 +196,11 @@ namespace ps2host
             return DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
                    (g_tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
         }
+        UINT swapChain2Flags() { return g_tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u; }
         std::wstring g_baseTitle;
         std::atomic<int> g_titleFps{-1}, g_titleGameFps{-1};
         int g_shownTitleFps = -2, g_shownTitleGameFps = -2;
+        bool g_shownTitleSplit = false;
         double g_fpsWindowStart = 0.0;
         uint32_t g_fpsPresents = 0;
         uint64_t g_fpsKickStart = 0;
@@ -253,11 +262,81 @@ float4 ps_main(VsOut i) : SV_Target
             }
         }
 
+        constexpr UINT kMsgSplitWindows = WM_APP + 2; // wParam: player 2's window opens (1) / closes (0)
+        RECT g_preSplitRect{};          // the main window before the split moved it
+        bool g_preSplitFullscreen = false;
+        bool g_splitMovedMain = false;
+
+        // Player 2's window: fullscreen on another monitor when the game runs fullscreen and there is one; else
+        // both players windowed side by side (the main window shrunk to half the monitor's width when needed), put
+        // back as it was when the split ends. Never takes the focus.
+        void applySplitWindows(bool show)
+        {
+            if (!show)
+            {
+                ShowWindow(g_hwnd2, SW_HIDE);
+                if (g_splitMovedMain)
+                {
+                    g_splitMovedMain = false;
+                    if (g_preSplitFullscreen)
+                        applyFullscreen(g_hwnd, true);
+                    else
+                        SetWindowPos(g_hwnd, nullptr, g_preSplitRect.left, g_preSplitRect.top,
+                                     g_preSplitRect.right - g_preSplitRect.left, g_preSplitRect.bottom - g_preSplitRect.top,
+                                     SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                return;
+            }
+            const HMONITOR mon1 = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+            struct Find { HMONITOR skip, other; } find{mon1, nullptr};
+            EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL
+            {
+                auto *f = reinterpret_cast<Find *>(lp);
+                if (m != f->skip && !f->other)
+                    f->other = m;
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&find));
+            MONITORINFO mi{sizeof(mi)};
+            if (g_config.fullscreen && find.other && GetMonitorInfoW(find.other, &mi))
+            {
+                SetWindowLongPtrW(g_hwnd2, GWL_STYLE, WS_POPUP);
+                SetWindowPos(g_hwnd2, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                             mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                ShowWindow(g_hwnd2, SW_SHOWNOACTIVATE);
+                return;
+            }
+            GetWindowRect(g_hwnd, &g_preSplitRect);
+            g_preSplitFullscreen = g_config.fullscreen;
+            if (g_config.fullscreen)
+                applyFullscreen(g_hwnd, false);
+            RECT r1{};
+            GetWindowRect(g_hwnd, &r1);
+            GetMonitorInfoW(mon1, &mi);
+            const RECT &work = mi.rcWork;
+            LONG w = r1.right - r1.left, h = r1.bottom - r1.top;
+            if (2 * w > work.right - work.left)
+            {
+                h = h * ((work.right - work.left) / 2) / std::max<LONG>(1, w);
+                w = (work.right - work.left) / 2;
+            }
+            LONG x = std::clamp<LONG>(r1.left, work.left, std::max(work.left, work.right - 2 * w));
+            LONG y = std::clamp<LONG>(r1.top, work.top, std::max(work.top, work.bottom - h));
+            g_splitMovedMain = true;
+            SetWindowPos(g_hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowLongPtrW(g_hwnd2, GWL_STYLE, WS_OVERLAPPEDWINDOW);
+            SetWindowPos(g_hwnd2, HWND_TOP, x + w, y, w, h, SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            ShowWindow(g_hwnd2, SW_SHOWNOACTIVATE);
+        }
+
         LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             switch (msg)
             {
-            case WM_CLOSE:
+            case kMsgSplitWindows:
+                if (g_hwnd2)
+                    applySplitWindows(wp != 0);
+                return 0;
+            case WM_CLOSE: // either window (player 2's too) closes the game
                 g_quit.store(true);
                 return 0;
             case WM_DESTROY:
@@ -276,7 +355,7 @@ float4 ps_main(VsOut i) : SV_Target
                 }
                 if (wp == VK_F1 && !(lp & (1 << 30)))
                     g_showFps = !g_showFps;
-                if (wp == VK_RETURN && (lp & (1 << 29)))
+                if (wp == VK_RETURN && (lp & (1 << 29)) && hwnd == g_hwnd)
                 {
                     // Alt+Enter toggles borderless fullscreen.
                     applyFullscreen(hwnd, !g_config.fullscreen);
@@ -317,28 +396,45 @@ float4 ps_main(VsOut i) : SV_Target
             return true;
         }
 
-        void createBackBufferView()
+        // Window 0 = the main window, 1 = player 2's.
+        struct OutWindow
         {
-            g_backRtv.Reset();
-            ComPtr<ID3D11Texture2D> back;
-            g_swap->GetBuffer(0, IID_PPV_ARGS(&back));
-            g_device->CreateRenderTargetView(back.Get(), nullptr, &g_backRtv);
+            HWND hwnd;
+            IDXGISwapChain1 *swap;
+            ComPtr<ID3D11RenderTargetView> *rtv;
+            UINT flags;
+        };
+        OutWindow outWindow(int which)
+        {
+            // std::addressof: ComPtr's operator& releases the pointer it guards.
+            return which == 0 ? OutWindow{g_hwnd, g_swap.Get(), std::addressof(g_backRtv), swapChainFlags()}
+                              : OutWindow{g_hwnd2, g_swap2.Get(), std::addressof(g_backRtv2), swapChain2Flags()};
         }
 
-        void resizeIfNeeded()
+        void createBackBufferView(int which = 0)
         {
+            const OutWindow w = outWindow(which);
+            w.rtv->Reset();
+            ComPtr<ID3D11Texture2D> back;
+            w.swap->GetBuffer(0, IID_PPV_ARGS(&back));
+            g_device->CreateRenderTargetView(back.Get(), nullptr, w.rtv->GetAddressOf());
+        }
+
+        void resizeIfNeeded(int which = 0)
+        {
+            const OutWindow ow = outWindow(which);
             RECT rc{};
-            GetClientRect(g_hwnd, &rc);
+            GetClientRect(ow.hwnd, &rc);
             UINT w = std::max<LONG>(1, rc.right - rc.left);
             UINT h = std::max<LONG>(1, rc.bottom - rc.top);
             DXGI_SWAP_CHAIN_DESC1 desc{};
-            g_swap->GetDesc1(&desc);
+            ow.swap->GetDesc1(&desc);
             if (desc.Width == w && desc.Height == h)
                 return;
             g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
-            g_backRtv.Reset();
-            g_swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, swapChainFlags());
-            createBackBufferView();
+            ow.rtv->Reset();
+            ow.swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, ow.flags);
+            createBackBufferView(which);
         }
 
         double nowSeconds()
@@ -374,10 +470,11 @@ float4 ps_main(VsOut i) : SV_Target
 
         double nowSeconds();
 
-        void saveScreenshot()
+        // shot_<n>.bmp; player 2's window (split screen) as shot_<n>_p2.bmp with the main window's number.
+        void saveScreenshot(int which = 0)
         {
             ComPtr<ID3D11Texture2D> back;
-            if (FAILED(g_swap->GetBuffer(0, IID_PPV_ARGS(&back))))
+            if (FAILED(outWindow(which).swap->GetBuffer(0, IID_PPV_ARGS(&back))))
                 return;
             D3D11_TEXTURE2D_DESC td{};
             back->GetDesc(&td);
@@ -401,7 +498,10 @@ float4 ps_main(VsOut i) : SV_Target
                             static_cast<const uint8_t *>(m.pData) + static_cast<size_t>(y) * m.RowPitch, w * 4u);
             g_ctx->Unmap(staging.Get(), 0);
             char path[512];
-            std::snprintf(path, sizeof(path), "%s/shot_%04d.bmp", g_shotDir.c_str(), g_shotIndex++);
+            if (which == 0)
+                std::snprintf(path, sizeof(path), "%s/shot_%04d.bmp", g_shotDir.c_str(), g_shotIndex++);
+            else
+                std::snprintf(path, sizeof(path), "%s/shot_%04d_p2.bmp", g_shotDir.c_str(), std::max(0, g_shotIndex - 1));
             std::thread([pixels = std::move(pixels), w, h, file = std::string(path)]()
             {
                 FILE *f = std::fopen(file.c_str(), "wb");
@@ -634,12 +734,24 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             g_ctx->PSSetShader(g_blitPs.Get(), nullptr, 0);
         }
 
-        void drawBlit(ID3D11ShaderResourceView *srv, uint32_t srcW, uint32_t srcH, float u1, float v1)
+        // Player 2's window opens and closes with the split (from the GS thread: the layout is done by the message
+        // thread, which owns both windows). Hidden test runs keep it hidden but still draw it (screenshots).
+        void showWindow2(bool show)
         {
-            g_d3dEpoch.fetch_add(1, std::memory_order_relaxed); // GS backend state cache must rebind
-            resizeIfNeeded();
+            if (!g_hwnd2 || show == g_window2Shown.load())
+                return;
+            g_window2Shown.store(show);
+            if (!g_background)
+                PostMessageW(g_hwnd, kMsgSplitWindows, show ? 1 : 0, 0);
+        }
+
+        // One window's picture: the source rectangle (uv) scaled into the back buffer, aspect kept.
+        void blitWindow(int which, ID3D11ShaderResourceView *srv, float u0, float v0, float u1, float v1, bool shot)
+        {
+            const OutWindow ow = outWindow(which);
+            resizeIfNeeded(which);
             DXGI_SWAP_CHAIN_DESC1 desc{};
-            g_swap->GetDesc1(&desc);
+            ow.swap->GetDesc1(&desc);
             const float bw = static_cast<float>(desc.Width);
             const float bh = static_cast<float>(desc.Height);
 
@@ -652,14 +764,12 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
                 else
                     vh = bw / aspect;
             }
-            (void)srcW;
-            (void)srcH;
 
             const float clear[4] = {0, 0, 0, 1};
-            g_ctx->ClearRenderTargetView(g_backRtv.Get(), clear);
+            ID3D11RenderTargetView *rtv = ow.rtv->Get();
+            g_ctx->ClearRenderTargetView(rtv, clear);
             D3D11_VIEWPORT vp{(bw - vw) * 0.5f, (bh - vh) * 0.5f, vw, vh, 0.0f, 1.0f};
             g_ctx->RSSetViewports(1, &vp);
-            ID3D11RenderTargetView *rtv = g_backRtv.Get();
             g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
             g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
             g_ctx->OMSetDepthStencilState(nullptr, 0);
@@ -668,7 +778,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             D3D11_MAPPED_SUBRESOURCE m{};
             if (SUCCEEDED(g_ctx->Map(g_blitCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
             {
-                float rect[4] = {0.0f, 0.0f, u1, v1};
+                float rect[4] = {u0, v0, u1 - u0, v1 - v0};
                 std::memcpy(m.pData, rect, sizeof(rect));
                 g_ctx->Unmap(g_blitCb.Get(), 0);
             }
@@ -685,18 +795,40 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             g_ctx->Draw(3, 0);
             ID3D11ShaderResourceView *nullSrv = nullptr;
             g_ctx->PSSetShaderResources(0, 1, &nullSrv);
-            updateAndDrawFps(bh);
-            drawModMenu(bw, bh);
-
-            if (!g_shotDir.empty() && nowSeconds() >= g_nextShot)
+            if (which == 0)
             {
-                g_nextShot = nowSeconds() + g_shotInterval;
-                saveScreenshot();
+                updateAndDrawFps(bh);
+                drawModMenu(bw, bh);
             }
-            if (g_config.vsync)
+            if (shot)
+                saveScreenshot(which);
+            if (which != 0)
+                ow.swap->Present(0, 0); // the main window's present waits for the display
+            else if (g_config.vsync)
                 g_swap->Present(1, 0);
             else
                 g_swap->Present(0, g_tearingSupported ? DXGI_PRESENT_ALLOW_TEARING : 0); // borderless / windowed only
+        }
+
+        // The guest frame (uv 0..u1, 0..v1 of the texture): in a split-screen match the top half (player 1) goes to
+        // the main window and the bottom half (player 2) to player 2's window, else the whole frame to the main one.
+        void drawBlit(ID3D11ShaderResourceView *srv, uint32_t srcW, uint32_t srcH, float u1, float v1)
+        {
+            (void)srcW;
+            (void)srcH;
+            g_d3dEpoch.fetch_add(1, std::memory_order_relaxed); // GS backend state cache must rebind
+            const bool shot = !g_shotDir.empty() && nowSeconds() >= g_nextShot;
+            if (shot)
+                g_nextShot = nowSeconds() + g_shotInterval;
+            const bool split = g_swap2 && splitScreenActive();
+            showWindow2(split);
+            if (!split)
+            {
+                blitWindow(0, srv, 0.0f, 0.0f, u1, v1, shot);
+                return;
+            }
+            blitWindow(0, srv, 0.0f, 0.0f, u1, v1 * 0.5f, shot);
+            blitWindow(1, srv, 0.0f, v1 * 0.5f, u1, v1, shot);
         }
 
         // Called outside the D3D lock: waits for the swap chain (vsync) and applies the FPS cap.
@@ -855,6 +987,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         g_config.targetFps = GetPrivateProfileIntA("Display", "TargetFPS", g_config.targetFps, iniPath);
         g_config.keepAspect = GetPrivateProfileIntA("Display", "KeepAspect", g_config.keepAspect, iniPath) != 0;
         g_config.widescreen = GetPrivateProfileIntA("Display", "Widescreen", g_config.widescreen, iniPath) != 0;
+        g_config.splitWindows = GetPrivateProfileIntA("Display", "SplitWindows", g_config.splitWindows, iniPath) != 0;
         g_config.textureFiltering = std::min(16u, static_cast<uint32_t>(GetPrivateProfileIntA("Display", "TextureFiltering", g_config.textureFiltering, iniPath)));
         g_config.dumpTextures = GetPrivateProfileIntA("Display", "DumpTextures", g_config.dumpTextures, iniPath) != 0;
         g_showFps = GetPrivateProfileIntA("Display", "ShowFPS", g_showFps ? 1 : 0, iniPath) != 0;
@@ -1145,6 +1278,30 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         factory->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER);
         createBackBufferView();
 
+        // Player 2's window for split-screen matches (split_windows.cpp), hidden until one starts.
+        if (g_config.splitWindows || std::getenv("PS2X_SPLIT_WINDOWS"))
+        {
+            RECT wr{};
+            GetWindowRect(g_hwnd, &wr);
+            g_hwnd2 = CreateWindowExW(g_background ? (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) : 0, wc.lpszClassName,
+                                      (g_baseTitle + L"  |  Player 2").c_str(), WS_OVERLAPPEDWINDOW, wr.right, wr.top,
+                                      wr.right - wr.left, wr.bottom - wr.top, nullptr, nullptr, inst, nullptr);
+            DXGI_SWAP_CHAIN_DESC1 sd2 = sd;
+            sd2.Flags = swapChain2Flags();
+            if (g_hwnd2 && SUCCEEDED(factory->CreateSwapChainForHwnd(g_device.Get(), g_hwnd2, &sd2, nullptr, nullptr, &g_swap2)))
+            {
+                factory->MakeWindowAssociation(g_hwnd2, DXGI_MWA_NO_ALT_ENTER);
+                createBackBufferView(1);
+            }
+            else
+            {
+                g_swap2.Reset();
+                if (g_hwnd2)
+                    DestroyWindow(g_hwnd2);
+                g_hwnd2 = nullptr;
+            }
+        }
+
         ComPtr<ID3DBlob> vsb, psb;
         if (!compileShader(kBlitShader, "vs_main", "vs_5_0", vsb) ||
             !compileShader(kBlitShader, "ps_main", "ps_5_0", psb))
@@ -1195,6 +1352,11 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         g_uploadTex.Reset();
         g_backRtv.Reset();
         g_swap.Reset();
+        g_backRtv2.Reset();
+        g_swap2.Reset();
+        if (g_hwnd2)
+            DestroyWindow(g_hwnd2);
+        g_hwnd2 = nullptr;
         g_ctx.Reset();
         g_device.Reset();
         if (g_frameWaitable)
@@ -1222,11 +1384,14 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         pollInput();
         serviceAudio();
         const int fps = g_titleFps.load(), gameFps = g_titleGameFps.load();
-        if (g_hwnd && fps >= 0 && (fps != g_shownTitleFps || gameFps != g_shownTitleGameFps))
+        const bool split = g_window2Shown.load();
+        if (g_hwnd && fps >= 0 && (fps != g_shownTitleFps || gameFps != g_shownTitleGameFps || split != g_shownTitleSplit))
         {
             g_shownTitleFps = fps;
             g_shownTitleGameFps = gameFps;
-            const std::wstring t = g_baseTitle + L"  |  " + std::to_wstring(fps) + L" fps  (game " + std::to_wstring(gameFps) + L")";
+            g_shownTitleSplit = split;
+            const std::wstring t = g_baseTitle + (split ? L"  |  Player 1" : L"") + L"  |  " + std::to_wstring(fps) +
+                                   L" fps  (game " + std::to_wstring(gameFps) + L")";
             SetWindowTextW(g_hwnd, t.c_str());
         }
         return !g_quit.load();
@@ -1298,14 +1463,14 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             const bool anchored = g_autoAnchorAt[0].load() >= 0.0;
             for (const auto &ap : g_autoPress)
             {
+                if (ap.pad > 0)
+                    pads[ap.pad].connected = true; // a scripted pad 2..4 is plugged in from boot
                 if (!ap.anchorHit && s_stopAtAnchor && anchored)
                     continue;
                 const double anchorAt = ap.anchorHit ? g_autoAnchorAt[ap.anchorHit - 1].load() : 0.0;
                 if (ap.anchorHit && anchorAt < 0.0)
                     continue;
                 const double rt = ap.anchorHit ? t - anchorAt : t;
-                if (ap.pad > 0)
-                    pads[ap.pad].connected = true; // a scripted pad 2..4 is plugged in from boot
                 if (rt >= ap.t && rt < ap.until)
                     pads[ap.pad].buttons |= ap.button;
             }

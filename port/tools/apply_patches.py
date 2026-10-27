@@ -38,6 +38,7 @@ BUILD_PATCHES = [
     'patch_60fps.py',
     'patch_widescreen.py',
     'patch_ws_enemyinfo.py',
+    'patch_splitwin.py',
     # native RenderWare renderer hooks
     'patch_nativeworld.py',
     'patch_nativenode.py',

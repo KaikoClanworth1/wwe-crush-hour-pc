@@ -26,6 +26,8 @@ namespace ps2host
         uint32_t targetFps = 60; // 30, 60, or higher (120 / 144 / ...); 0 = the display's refresh rate
         bool keepAspect = true; // 4:3 pillarbox for the PS2 framebuffer
         bool widescreen = false;
+        // [Display] SplitWindows: a two-player match shows each player in a window of their own (split_windows.cpp).
+        bool splitWindows = true;
         // [Display] TextureFiltering: 0 = as on the PS2 (no mipmaps), 1 = mipmaps (trilinear),
         // 2 / 4 / 8 / 16 = mipmaps + that much anisotropic filtering.
         uint32_t textureFiltering = 16;
@@ -125,6 +127,8 @@ namespace ps2host
     ID3D11Device *device();
     ID3D11DeviceContext *context();
     void *windowHandle();
+    // Two-player split screen in separate windows is on for the current frame (split_windows.cpp).
+    bool splitScreenActive();
 
     // Input -------------------------------------------------------------
     void pollInput();

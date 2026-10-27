@@ -417,7 +417,7 @@ add_library(ps2_runtime STATIC
 )
 
 if(PS2X_NATIVE_HOST)
-    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/host/gamepad_input.cpp src/lib/host/mod_menu.cpp src/lib/gs/gs_d3d11_backend.cpp src/lib/gs/texture_pack.cpp src/lib/audio/native_seng.cpp)
+    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/host/gamepad_input.cpp src/lib/host/mod_menu.cpp src/lib/host/split_windows.cpp src/lib/gs/gs_d3d11_backend.cpp src/lib/gs/texture_pack.cpp src/lib/audio/native_seng.cpp)
 
     # Game controllers through SDL3 (DualSense / DualShock 4, Switch, Steam Deck, generic HID; hot-plug). Only
     # the joystick / gamepad / haptic parts are built; without it the host reads XInput pads.

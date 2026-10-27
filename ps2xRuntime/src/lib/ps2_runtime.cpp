@@ -3004,14 +3004,19 @@ extern "C" uint32_t ps2x_frame_vsync_threshold()
 // _aspect_ratio / _view_window, 0x26f740-0x26fa6c) for a camera drawing to a screen-sized camera raster are
 // widened: texture cameras (env maps, the arena screen feed) keep theirs. The 4:3 frame is shown stretched to
 // 16:9, so the picture keeps its proportions and shows more at the sides.
+// Split-screen windows (host/split_windows.cpp) make the split-screen cameras' view windows taller from here too.
+#if defined(PS2X_NATIVE_HOST)
+extern "C" void ps2x_split_view_window(uint8_t *rdram, uint32_t camera, uint32_t viewWindow);
+#endif
 extern "C" void ps2x_widescreen_view_window(uint8_t *rdram, uint32_t camera, uint32_t viewWindow, uint32_t ra)
 {
 #if defined(PS2X_NATIVE_HOST)
     static const bool s_on = ps2host::config().widescreen;
     static const bool s_log = std::getenv("PS2X_WS_LOG") != nullptr;
-    if (!s_on || !rdram)
+    if (!rdram || ra < 0x26f740u || ra >= 0x26fa6cu)
         return;
-    if (ra < 0x26f740u || ra >= 0x26fa6cu)
+    ps2x_split_view_window(rdram, camera, viewWindow);
+    if (!s_on)
         return;
     auto rd32 = [rdram](uint32_t a)
     {

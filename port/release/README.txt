@@ -68,6 +68,11 @@ Settings  (GameFiles\ps2x_settings.ini, or in game: mod menu, LB / RB to the SET
   Widescreen=1     true 16:9 (default): wider 3D view (more of the arena at the sides); HUD, text and menu
                    panels keep their proportions, name tags stay over the cars; movies and loading
                    screens are shown 4:3 with side bars. 0 = original 4:3
+  SplitWindows=1   two-player matches (Multiplayer) in two windows: each player sees a full-size picture
+                   with the one-player HUD; player 2's window opens beside the main one when the match
+                   starts (fullscreen on a second monitor if there is one) and closes after it.
+                   0 = the original top / bottom split screen. The game has 2 controller ports, so
+                   multiplayer is 2 players.
   ShowFPS=1        FPS counter on at start (F1 toggles)
   InternalScale=0  render resolution: 0 = automatic from the window / screen size (1080p -> 3x,
                    1440p -> 4x, 4K -> 6x the PS2's 640x448); 1..6 = fixed (1 = original sharpness)
